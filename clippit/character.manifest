@@ -1,0 +1,247 @@
+# Clippit, the helpful paperclip with a sheet of paper. Sliced from a
+# nine-row sprite sheet of 66px cells on a white JPEG background: the white
+# outside the outline and inside the wire loops is cut to alpha, the eye whites
+# are kept, and every frame is resampled 1.8x onto one 126x124 canvas with the
+# lowest solid row on the floor. Sheet rows, from the top: idle glances, walk
+# left, walk right, wave, surprise, nodding off, eye shifts, sitting, reading.
+
+name = "Clippit"
+render_mode = "smooth"
+scale = 1
+
+[source]
+art = """
+Sliced from a sprite sheet of Clippit, the helpful paperclip."""
+license = """
+MIT for the package — prose, manifest, and the frames as arranged here. The \
+art they adapt is not: a sprite sheet of Clippit, which declares no license."""
+
+# Proactive model calls: Clippit never takes the hint, so the wait never grows.
+# One and one keeps every two minutes.
+
+[director]
+model_base = 1
+model_power = 1
+
+# Cursor reactions: watches the pointer for a chance to help, startles when rushed.
+[cursor]
+near_reaction = "face"
+rush_reaction = "react"
+
+# Mostly a still stand with a blink; glancing around and rereading the
+# document share the rest.
+[animations.idle]
+frames = [
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-2.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-1.png",
+  "frames/idle-1.png",
+  "frames/idle-1.png",
+  "frames/idle-0.png",
+  "frames/idle-0.png",
+  "frames/idle-2.png",
+]
+fps = 4
+weight = 30
+
+[animations.look]
+frames = [
+  "frames/idle-0.png",
+  "frames/look-0.png",
+  "frames/look-1.png",
+  "frames/look-1.png",
+  "frames/look-0.png",
+  "frames/idle-0.png",
+  "frames/look-2.png",
+  "frames/look-2.png",
+  "frames/idle-0.png",
+]
+fps = 3
+variant_of = "idle"
+
+[animations.read]
+frames = [
+  "frames/read-0.png",
+  "frames/read-1.png",
+  "frames/read-2.png",
+  "frames/read-2.png",
+  "frames/read-2.png",
+  "frames/read-2.png",
+  "frames/read-3.png",
+  "frames/read-2.png",
+  "frames/read-2.png",
+  "frames/read-4.png",
+  "frames/read-5.png",
+]
+fps = 2
+variant_of = "idle"
+
+[animations.walk]
+frames = [
+  "frames/walk-0.png",
+  "frames/walk-1.png",
+  "frames/walk-2.png",
+  "frames/walk-3.png",
+  "frames/walk-4.png",
+  "frames/walk-5.png",
+  "frames/walk-6.png",
+  "frames/walk-7.png",
+]
+fps = 8
+
+# The paper stays on Clippit's far side, so a mirror would put it in front.
+[animations.walk-left]
+frames = [
+  "frames/walk-left-0.png",
+  "frames/walk-left-1.png",
+  "frames/walk-left-2.png",
+  "frames/walk-left-3.png",
+  "frames/walk-left-4.png",
+  "frames/walk-left-5.png",
+  "frames/walk-left-6.png",
+  "frames/walk-left-7.png",
+]
+fps = 8
+left_of = "walk"
+
+# No mouth to move, so speech is the eyes and brows shifting.
+[animations.talk]
+frames = ["frames/talk-0.png", "frames/talk-1.png", "frames/talk-2.png", "frames/talk-3.png"]
+fps = 4
+weight = 30
+
+# One talk in four opens with a wave instead.
+[animations.wave]
+frames = [
+  "frames/wave-0.png",
+  "frames/wave-1.png",
+  "frames/wave-2.png",
+  "frames/wave-1.png",
+  "frames/wave-2.png",
+  "frames/wave-1.png",
+  "frames/wave-0.png",
+  "frames/wave-3.png",
+]
+fps = 5
+variant_of = "talk"
+
+# Leans back, then right up to the glass, then settles.
+[animations.react]
+frames = [
+  "frames/react-2.png",
+  "frames/react-1.png",
+  "frames/react-0.png",
+  "frames/react-4.png",
+  "frames/react-3.png",
+]
+fps = 5
+loop = "once"
+
+[animations.fall]
+frames = ["frames/wave-1.png", "frames/wave-2.png"]
+fps = 6
+
+[animations.land]
+frames = ["frames/sleep-3.png", "frames/read-1.png", "frames/idle-0.png"]
+fps = 6
+loop = "once"
+
+[animations.hold]
+frames = ["frames/react-0.png", "frames/react-4.png"]
+fps = 3
+
+[animations.sit]
+frames = [
+  "frames/sit-0.png",
+  "frames/sit-1.png",
+  "frames/sit-2.png",
+  "frames/sit-3.png",
+  "frames/sit-4.png",
+  "frames/sit-5.png",
+]
+fps = 3
+
+# Nods off, folds flat onto the paper for ten seconds, jerks awake, and
+# starts drooping again.
+[animations.sleep]
+frames = [
+  "frames/sleep-0.png",
+  "frames/sleep-1.png",
+  "frames/sleep-2.png",
+  "frames/sleep-3.png",
+  "frames/sleep-4.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-5.png",
+  "frames/sleep-6.png",
+  "frames/sleep-7.png",
+]
+fps = 3
+
+# Hovers while someone types, offering help at the first pause. Sits once
+# the desk goes quiet and dozes off on the paper.
+
+[behaviors.greet]
+play = ["talk"]
+then = "hover"
+weight = 40
+when = "idle under 10s"
+
+[behaviors.hover]
+play = ["idle"]
+weight = 30
+when = "idle under 1m"
+
+[behaviors.pace]
+play = ["walk", "idle"]
+weight = 20
+when = "idle over 30s"
+
+[behaviors.settle]
+play = ["sit"]
+then = "doze"
+weight = 30
+when = "idle over 1m"
+
+[behaviors.doze]
+play = ["sleep"]
+weight = 50
+when = "idle over 5m"
