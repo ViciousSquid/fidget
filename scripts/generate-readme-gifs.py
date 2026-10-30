@@ -28,6 +28,7 @@ SHOWCASES = (
     ("black-mage-talk.gif", "black-mage", "talk", 2, 3),
     ("bmo-sing.gif", "bmo", "sing", 4, 3),
     ("cat-walk.gif", "cat", "walk", 8, 8),
+    ("clippit-wave.gif", "clippit", "wave", 4, 4),
     ("jotaro-kujo-react.gif", "jotaro-kujo", "react", 8, 7),
     ("nim-sleep.gif", "nim", "sleep", 4, 3),
     ("rubber-duck-talk.gif", "rubber-duck", "talk", 4, 6),

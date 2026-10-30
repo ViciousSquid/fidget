@@ -319,6 +319,7 @@ fn shipped_frames_keep_their_authored_floor_clearance() {
         ("bmo", (1, 0..=2)),
         ("buddy-bot", (20, 0..=25)),
         ("cat", (9, 0..=3)),
+        ("clippit", (0, 0..=0)),
         ("jotaro-kujo", (2, 0..=2)),
         ("nim", (1, 0..=1)),
         ("rubber-duck", (0, 0..=0)),

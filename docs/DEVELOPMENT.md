@@ -198,7 +198,7 @@ Search paths, in order. An earlier directory wins when two packages share a name
 
 The user directory is the same per-platform data directory as `settings.json`, with `characters` under it. The Settings window's Character picker shows that path.
 
-Ten characters ship: **Buddy Bot** (default), BMO, Nim, Black Mage, Cat, Jotaro Kujo, Rubber Duck, Timber Wolf, Trump, Tux.
+Eleven characters ship: **Buddy Bot** (default), BMO, Nim, Black Mage, Cat, Clippit, Jotaro Kujo, Rubber Duck, Timber Wolf, Trump, Tux.
 
 ### Writing a Character
 

@@ -519,6 +519,7 @@ mod tests {
             ("black-mage", "Black Mage", "ponder", 40, "meditate"),
             ("bmo", "BMO", "report", 30, "patrol"),
             ("cat", "Cat", "inspect", 40, "nap"),
+            ("clippit", "Clippit", "hover", 30, "doze"),
             ("jotaro-kujo", "Jotaro Kujo", "stand", 50, "rest"),
             ("nim", "Nim", "doze", 50, "doze"),
             ("buddy-bot", "Buddy Bot", "greet", 40, "nap"),
