@@ -530,6 +530,17 @@ impl RevealSlot {
     }
 }
 
+/// Read-only behavior catalogue for Chat and history, including live imports.
+fn live_behavior_names(state: &SettingsState) -> BTreeMap<String, Vec<String>> {
+    let mut names = state.behavior_names.as_ref().clone();
+    if let Ok(imports) = state.live_imports.lock() {
+        for (name, character) in imports.iter() {
+            names.insert(name.clone(), character.behaviors.keys().cloned().collect());
+        }
+    }
+    names
+}
+
 struct SettingsState {
     settings: Arc<Mutex<Settings>>,
     path: PathBuf,
@@ -2889,7 +2900,7 @@ fn restore_history(app: &tauri::AppHandle, restored: harness::Restored) {
             let rows = state.instances.lock().map(|rows| rows.clone());
             declared_behaviors(
                 &rows.unwrap_or_default(),
-                &state.behavior_names,
+                &live_behavior_names(&state),
                 &restored.instance,
             )
         })
@@ -3176,18 +3187,16 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
             state
                 .instances
                 .lock()
-                .map(|rows| declared_behaviors(&rows, &state.behavior_names, &instance))
+                .map(|rows| declared_behaviors(&rows, &live_behavior_names(&state), &instance))
                 .unwrap_or_default(),
             blank,
         ),
         personality: if blank {
             String::new()
         } else {
-            state
-                .personalities
-                .get(&character)
-                .cloned()
-                .unwrap_or_default()
+            state.live_imports.lock().ok().and_then(|imports| {
+                imports.get(&character).map(|character| character.personality.clone())
+            }).or_else(|| state.personalities.get(&character).cloned()).unwrap_or_default()
         },
         name,
         character,
