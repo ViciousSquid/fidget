@@ -128,13 +128,23 @@ fn install(app: &tauri::AppHandle, source: &Path) -> Result<String, String> {
         .find(|(_, character)| character.name == name)
         .map(|(_, character)| character)
         .ok_or("Installed Character could not be loaded")?;
-    let art = app.try_state::<crate::ArtJson>().ok_or("Character art not ready")?;
+    let art = app
+        .try_state::<crate::ArtJson>()
+        .ok_or("Character art not ready")?;
     art.install(&character)?;
-    let state = app.try_state::<SettingsState>().ok_or("Fidget is still starting")?;
+    let state = app
+        .try_state::<SettingsState>()
+        .ok_or("Fidget is still starting")?;
     let (done, applied) = std::sync::mpsc::channel();
-    state.ops.send(SettingsOp::Imported { character: Arc::new(character), done })
+    state
+        .ops
+        .send(SettingsOp::Imported {
+            character: Arc::new(character),
+            done,
+        })
         .map_err(|_| "Character frame loop is unavailable")?;
-    applied.recv_timeout(Duration::from_secs(10))
+    applied
+        .recv_timeout(Duration::from_secs(10))
         .map_err(|_| "Character installed, but live activation did not finish")??;
     Ok(name)
 }
@@ -177,9 +187,15 @@ fn forget_import(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     })?;
     let name = removed_name.ok_or("Removed Character has no name")?;
     let (done, removed) = std::sync::mpsc::channel();
-    state.ops.send(SettingsOp::Removed { name: name.clone(), done })
+    state
+        .ops
+        .send(SettingsOp::Removed {
+            name: name.clone(),
+            done,
+        })
         .map_err(|_| "Character frame loop is unavailable")?;
-    removed.recv_timeout(Duration::from_secs(10))
+    removed
+        .recv_timeout(Duration::from_secs(10))
         .map_err(|_| "Character removed, but the live menus did not update")??;
     if let Some(art) = app.try_state::<crate::ArtJson>() {
         art.remove(&name)?;
