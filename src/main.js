@@ -780,10 +780,11 @@ async function start() {
     { target: overlay.label },
   );
 
+  // The Shell broadcasts this event to every overlay, rather than targeting
+  // a single window. Leave the listener unscoped so it receives that broadcast.
   await window.__TAURI__.event.listen(
     "character-updated",
     () => { reloadCharacterArt(); },
-    { target: overlay.label },
   );
 
   await window.__TAURI__.event.listen(
