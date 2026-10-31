@@ -535,13 +535,9 @@ struct SettingsState {
     path: PathBuf,
     memory_path: PathBuf,
     installed: Vec<String>,
-    /// Each installed Character's Personality Prompt, by Character name. Read
-    /// once at launch, because a package changes only between runs, and shared
-    /// so the Prompt tab asking for it costs no copy of every prompt installed.
+    /// Newly installed packages available without restarting.
+    live_imports: Mutex<BTreeMap<String, Arc<Character>>>,
     personalities: Arc<BTreeMap<String, String>>,
-    /// Declared Behavior names, same key as `personalities`. The Prompt tab
-    /// draws the app-level instructions from these, so the roster it shows is
-    /// the one the opening turn names.
     behavior_names: Arc<BTreeMap<String, Vec<String>>>,
     instances: Arc<Mutex<Vec<InstanceRow>>>,
     inspect: Arc<Mutex<model::DirectorInspect>>,
@@ -837,7 +833,15 @@ fn settings_session(app: &tauri::AppHandle, state: &SettingsState) -> SettingsSe
         rules: Arc::clone(&state.rules),
         inspect: Arc::clone(&state.inspect),
         instances: Arc::clone(&state.instances),
-        installed: state.installed.clone(),
+        installed: {
+            let mut installed = state.installed.clone();
+            if let Ok(live) = state.live_imports.lock() {
+                installed.extend(live.keys().cloned());
+            }
+            installed.sort();
+            installed.dedup();
+            installed
+        },
         ops: state.ops.clone(),
         app: app.clone(),
         on_rebind: bind_hide_hotkey,
@@ -5440,6 +5444,7 @@ fn main() {
                 path: settings_file.clone(),
                 memory_path: memory::shared_path(),
                 installed,
+                live_imports: Mutex::new(BTreeMap::new()),
                 personalities: Arc::new(
                     character_cache
                         .iter()
