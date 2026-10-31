@@ -135,7 +135,7 @@ fn install(app: &tauri::AppHandle, source: &Path) -> Result<String, String> {
     state.ops.send(SettingsOp::Imported { character: Arc::new(character), done })
         .map_err(|_| "Character frame loop is unavailable")?;
     applied.recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "Character installed, but live activation did not finish")?;
+        .map_err(|_| "Character installed, but live activation did not finish")??;
     Ok(name)
 }
 
@@ -176,14 +176,14 @@ fn forget_import(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
         Ok(())
     })?;
     let name = removed_name.ok_or("Removed Character has no name")?;
+    let (done, removed) = std::sync::mpsc::channel();
+    state.ops.send(SettingsOp::Removed { name: name.clone(), done })
+        .map_err(|_| "Character frame loop is unavailable")?;
+    removed.recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "Character removed, but the live menus did not update")??;
     if let Some(art) = app.try_state::<crate::ArtJson>() {
         art.remove(&name)?;
     }
-    let (done, removed) = std::sync::mpsc::channel();
-    state.ops.send(SettingsOp::Removed { name, done })
-        .map_err(|_| "Character frame loop is unavailable")?;
-    removed.recv_timeout(Duration::from_secs(10))
-        .map_err(|_| "Character removed, but the live menus did not update")?;
     Ok(())
 }
 
