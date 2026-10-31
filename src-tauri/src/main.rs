@@ -790,7 +790,7 @@ fn art_urls(character: &Character) -> BTreeMap<String, Vec<String>> {
 
 /// What the webview needs of one Character: the art as `data:` URLs, and
 /// whether to smooth it when scaling (the Character Manifest's `render_mode`).
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CharacterArt {
     art: BTreeMap<String, Vec<String>>,
     smooth: bool,
@@ -798,20 +798,45 @@ struct CharacterArt {
 
 /// Every Character on screen, keyed by Character rather than Instance so two
 /// Instances of one Character share one encoded sheet.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ArtUrls {
     characters: BTreeMap<String, CharacterArt>,
 }
 
-/// Cached `ArtUrls` JSON. A newtype so managed state cannot collide with another String.
-struct ArtJson(String);
+/// Pre-serialized gallery. Imports rebuild it off the frame thread, and
+/// overlays read a copy without re-encoding every PNG on the UI thread.
+struct ArtJson(Mutex<String>);
+
+impl ArtJson {
+    fn edit(&self, change: impl FnOnce(&mut ArtUrls)) -> Result<(), String> {
+        let mut encoded = self.0.lock().map_err(|error| error.to_string())?;
+        let mut art: ArtUrls = serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+        change(&mut art);
+        *encoded = serde_json::to_string(&art).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn install(&self, character: &Character) -> Result<(), String> {
+        self.edit(|gallery| {
+            gallery.characters.insert(character.name.clone(), CharacterArt {
+                art: art_urls(character),
+                smooth: character.smooth,
+            });
+        })
+    }
+
+    fn remove(&self, name: &str) -> Result<(), String> {
+        self.edit(|gallery| { gallery.characters.remove(name); })
+    }
+}
 
 fn encode_art_json(art: &ArtUrls) -> ArtJson {
-    ArtJson(serde_json::to_string(art).expect("ArtUrls always serializes"))
+    ArtJson(Mutex::new(serde_json::to_string(art).expect("ArtUrls always serializes")))
 }
 
 fn character_response(json: &ArtJson) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(json.0.clone())
+    let encoded = json.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    tauri::ipc::Response::new(encoded)
 }
 
 /// The art of every Character on screen, fetched once when the webview
