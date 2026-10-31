@@ -545,7 +545,7 @@ struct SettingsState {
     settings: Arc<Mutex<Settings>>,
     path: PathBuf,
     memory_path: PathBuf,
-    installed: Vec<String>,
+    installed: Mutex<Vec<String>>,
     /// Newly installed packages available without restarting.
     live_imports: Mutex<BTreeMap<String, Arc<Character>>>,
     personalities: Arc<BTreeMap<String, String>>,
@@ -870,7 +870,7 @@ fn settings_session(app: &tauri::AppHandle, state: &SettingsState) -> SettingsSe
         inspect: Arc::clone(&state.inspect),
         instances: Arc::clone(&state.instances),
         installed: {
-            let mut installed = state.installed.clone();
+            let mut installed = state.installed.lock().map(|names| names.clone()).unwrap_or_default();
             if let Ok(live) = state.live_imports.lock() {
                 installed.extend(live.keys().cloned());
             }
@@ -5477,7 +5477,7 @@ fn main() {
                 settings: Arc::clone(&settings),
                 path: settings_file.clone(),
                 memory_path: memory::shared_path(),
-                installed,
+                installed: Mutex::new(installed),
                 live_imports: Mutex::new(BTreeMap::new()),
                 personalities: Arc::new(
                     character_cache
