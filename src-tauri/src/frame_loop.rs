@@ -860,7 +860,12 @@ pub(crate) fn run_frame_loop(
                                 .unwrap_or_else(|| ("minimal".to_string(), ChatAppearance::System));
                             if let Ok(inspect) = inspect.lock() {
                                 push_chat_opening(
-                                    &app, &roster, &id, &inspect, &characters, &chat_ui,
+                                    &app,
+                                    &roster,
+                                    &id,
+                                    &inspect,
+                                    &characters,
+                                    &chat_ui,
                                     chat_appearance,
                                 );
                             }
