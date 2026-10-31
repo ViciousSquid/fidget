@@ -48,7 +48,7 @@ async function settle() {
   await Promise.resolve();
 }
 
-test("import and remove run straight through native commands and say to restart", async () => {
+test("import and remove apply live without restart", async () => {
   const calls = [];
   let characters = [];
   const ui = setup(async (command, args) => {
@@ -75,14 +75,14 @@ test("import and remove run straight through native commands and say to restart"
     assert.equal(ui.list.children[0].textContent, "No imported Characters yet.");
 
     await ui.importButton.click();
-    assert.equal(ui.status.textContent, "Dosidicus Squid installed. Restart Fidget to use it.");
+    assert.equal(ui.status.textContent, "Dosidicus Squid installed and activated.");
     assert.equal(ui.list.children.length, 1);
     const [label, removeButton] = ui.list.children[0].children;
     assert.equal(label.textContent, "Dosidicus Squid");
     assert.equal(removeButton.disabled, false);
 
     await removeButton.click();
-    assert.equal(ui.status.textContent, "Fidget's copy of Dosidicus Squid removed. Restart Fidget to update the Character menu.");
+    assert.equal(ui.status.textContent, "Fidget's copy of Dosidicus Squid removed. Character menus updated.");
     assert.equal(ui.list.children[0].textContent, "No imported Characters yet.");
     assert.deepEqual(calls.map(([name]) => name), [
       "character_import_list",
@@ -96,7 +96,7 @@ test("import and remove run straight through native commands and say to restart"
   }
 });
 
-test("import from folder runs its own native command and says to restart", async () => {
+test("import from folder activates immediately", async () => {
   const calls = [];
   let characters = [];
   const ui = setup(async (command) => {
@@ -111,7 +111,7 @@ test("import from folder runs its own native command and says to restart", async
   try {
     await settle();
     await ui.folderButton.click();
-    assert.equal(ui.status.textContent, "Dosidicus Squid installed. Restart Fidget to use it.");
+    assert.equal(ui.status.textContent, "Dosidicus Squid installed and activated.");
     assert.equal(ui.list.children[0].children[0].textContent, "Dosidicus Squid");
     assert.equal(ui.importButton.disabled, false);
     assert.equal(ui.folderButton.disabled, false);
@@ -141,7 +141,7 @@ test("selected or running Characters cannot be removed from Character Imports", 
   }
 });
 
-test("invalid packages present the actual error and do not show a restart prompt", async () => {
+test("invalid packages present their validation error", async () => {
   const ui = setup(async (command) => {
     if (command === "character_import_list") return [];
     throw new Error("Character package is invalid: missing frame idle-0.png");
@@ -150,7 +150,7 @@ test("invalid packages present the actual error and do not show a restart prompt
     await settle();
     await ui.importButton.click();
     assert.equal(ui.status.textContent, "Character Imports: Character package is invalid: missing frame idle-0.png");
-    assert.doesNotMatch(ui.status.textContent, /Restart/);
+    assert.doesNotMatch(ui.status.textContent, /activated/);
     assert.equal(ui.importButton.disabled, false);
   } finally {
     ui.restore();
