@@ -841,12 +841,12 @@ pub enum SettingsOp {
     /// Published by a validated import; the frame loop alone owns live Instances.
     Imported {
         character: Arc<fidget_core::character::Character>,
-        done: mpsc::Sender<()>,
+        done: mpsc::Sender<Result<(), String>>,
     },
     /// Withdraw an unused managed package from the live menus and catalogue.
     Removed {
         name: String,
-        done: mpsc::Sender<()>,
+        done: mpsc::Sender<Result<(), String>>,
     },
     Spawn {
         character: String,
