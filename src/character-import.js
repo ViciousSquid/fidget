@@ -3,11 +3,11 @@
 // receives read/write access to arbitrary files.
 
 export function importMessage(name) {
-  return `${name} installed. Restart Fidget to use it.`;
+  return `${name} installed and activated.`;
 }
 
 export function removeMessage(name) {
-  return `Fidget's copy of ${name} removed. Restart Fidget to update the Character menu.`;
+  return `Fidget's copy of ${name} removed. Character menus updated.`;
 }
 
 export function mountCharacterImports(panel) {
@@ -71,7 +71,7 @@ export function mountCharacterImports(panel) {
         remove.type = "button";
         remove.textContent = "Remove";
         remove.disabled = !character.removable;
-        if (!character.removable) remove.title = "Selected or running; switch Character and restart Fidget first";
+        if (!character.removable) remove.title = "Selected or running; switch to another Character first";
         remove.addEventListener("click", async () => {
           remove.disabled = true;
           try {

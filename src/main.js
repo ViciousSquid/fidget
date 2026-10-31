@@ -32,6 +32,23 @@ let clickableOffArt = false;
 // Every Character's art as data: URLs, keyed by Character name and fetched
 // once. Art, not state, and one entry however many Instances draw from it.
 let characters = {};
+let artReload = null;
+
+// Importing a new package does not recreate any overlay window. Refresh the
+// cached artwork, then invalidate existing sprite draws so an idle sprite
+// repaints even when its animation frame is unchanged.
+function reloadCharacterArt() {
+  if (artReload) return artReload;
+  artReload = window.__TAURI__.core.invoke("character")
+    .then((gallery) => {
+      characters = gallery.characters;
+      for (const view of views.values()) view.drawn = null;
+      arm();
+    })
+    .catch((error) => console.error("character art refresh", error))
+    .finally(() => { artReload = null; });
+  return artReload;
+}
 
 // A press on the pet, measured from pointerdown. The composer never arms
 // this: a drag in the field is a selection, and it must not grab the pet.
@@ -644,6 +661,13 @@ function drawView(view, now) {
   view.drawn = placement;
 
   const art = characters[latest.character];
+  if (!art) {
+    // An import may race the overlay's initial listener registration. Fetch
+    // the latest gallery rather than leaving the previous Character's image.
+    view.sprite.style.visibility = "hidden";
+    reloadCharacterArt();
+    return;
+  }
   if (view.character !== latest.character) {
     view.character = latest.character;
     // The Character Manifest's render_mode: smooth art asks the compositor to
@@ -754,6 +778,13 @@ async function start() {
       noteQuickOpening(payload);
     },
     { target: overlay.label },
+  );
+
+  // The Shell broadcasts this event to every overlay, rather than targeting
+  // a single window. Leave the listener unscoped so it receives that broadcast.
+  await window.__TAURI__.event.listen(
+    "character-updated",
+    () => { reloadCharacterArt(); },
   );
 
   await window.__TAURI__.event.listen(

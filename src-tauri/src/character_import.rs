@@ -6,12 +6,15 @@
 //! the non-blocking dialog API so it cannot stall Fidget's desktop companion.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 
 use crate::package;
+use crate::settings::SettingsOp;
 use crate::SettingsState;
 
 #[derive(Serialize)]
@@ -117,7 +120,33 @@ fn install(app: &tauri::AppHandle, source: &Path) -> Result<String, String> {
         .ok()
         .map(|dir| dir.join("characters"));
     let installed = package::installed(&package::search_paths(bundled));
-    package::import_package(&package::imported_characters_dir(), &installed, source)
+    let managed = package::imported_characters_dir();
+    let name = package::import_package(&managed, &installed, source)?;
+    // Re-read our atomically saved copy, not the untrusted source path.
+    let character = package::imports(&managed)
+        .into_iter()
+        .find(|(_, character)| character.name == name)
+        .map(|(_, character)| character)
+        .ok_or("Installed Character could not be loaded")?;
+    let art = app
+        .try_state::<crate::ArtJson>()
+        .ok_or("Character art not ready")?;
+    art.install(&character)?;
+    let state = app
+        .try_state::<SettingsState>()
+        .ok_or("Fidget is still starting")?;
+    let (done, applied) = std::sync::mpsc::channel();
+    state
+        .ops
+        .send(SettingsOp::Imported {
+            character: Arc::new(character),
+            done,
+        })
+        .map_err(|_| "Character frame loop is unavailable")?;
+    applied
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "Character installed, but live activation did not finish")??;
+    Ok(name)
 }
 
 /// Refuse to uninstall a selected or running Character, and never take a path
@@ -134,6 +163,7 @@ fn forget_import(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
     let state = app
         .try_state::<SettingsState>()
         .ok_or("Fidget is still starting")?;
+    let mut removed_name = None;
     package::forget_import(&package::imported_characters_dir(), id, |name| {
         let selected = state
             .settings
@@ -149,11 +179,28 @@ fn forget_import(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
             .any(|instance| instance.character == name);
         if selected || running {
             return Err(format!(
-                "{name} is selected or running. Switch to another Character and restart Fidget first."
+                "{name} is selected or running. Switch to another Character first."
             ));
         }
+        removed_name = Some(name.to_string());
         Ok(())
-    })
+    })?;
+    let name = removed_name.ok_or("Removed Character has no name")?;
+    let (done, removed) = std::sync::mpsc::channel();
+    state
+        .ops
+        .send(SettingsOp::Removed {
+            name: name.clone(),
+            done,
+        })
+        .map_err(|_| "Character frame loop is unavailable")?;
+    removed
+        .recv_timeout(Duration::from_secs(10))
+        .map_err(|_| "Character removed, but the live menus did not update")??;
+    if let Some(art) = app.try_state::<crate::ArtJson>() {
+        art.remove(&name)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

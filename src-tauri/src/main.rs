@@ -530,18 +530,25 @@ impl RevealSlot {
     }
 }
 
+/// Read-only behavior catalogue for Chat and history, including live imports.
+fn live_behavior_names(state: &SettingsState) -> BTreeMap<String, Vec<String>> {
+    let mut names = state.behavior_names.as_ref().clone();
+    if let Ok(imports) = state.live_imports.lock() {
+        for (name, character) in imports.iter() {
+            names.insert(name.clone(), character.behaviors.keys().cloned().collect());
+        }
+    }
+    names
+}
+
 struct SettingsState {
     settings: Arc<Mutex<Settings>>,
     path: PathBuf,
     memory_path: PathBuf,
-    installed: Vec<String>,
-    /// Each installed Character's Personality Prompt, by Character name. Read
-    /// once at launch, because a package changes only between runs, and shared
-    /// so the Prompt tab asking for it costs no copy of every prompt installed.
+    installed: Mutex<Vec<String>>,
+    /// Newly installed packages available without restarting.
+    live_imports: Mutex<BTreeMap<String, Arc<Character>>>,
     personalities: Arc<BTreeMap<String, String>>,
-    /// Declared Behavior names, same key as `personalities`. The Prompt tab
-    /// draws the app-level instructions from these, so the roster it shows is
-    /// the one the opening turn names.
     behavior_names: Arc<BTreeMap<String, Vec<String>>>,
     instances: Arc<Mutex<Vec<InstanceRow>>>,
     inspect: Arc<Mutex<model::DirectorInspect>>,
@@ -794,7 +801,7 @@ fn art_urls(character: &Character) -> BTreeMap<String, Vec<String>> {
 
 /// What the webview needs of one Character: the art as `data:` URLs, and
 /// whether to smooth it when scaling (the Character Manifest's `render_mode`).
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct CharacterArt {
     art: BTreeMap<String, Vec<String>>,
     smooth: bool,
@@ -802,20 +809,56 @@ struct CharacterArt {
 
 /// Every Character on screen, keyed by Character rather than Instance so two
 /// Instances of one Character share one encoded sheet.
-#[derive(serde::Serialize)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ArtUrls {
     characters: BTreeMap<String, CharacterArt>,
 }
 
-/// Cached `ArtUrls` JSON. A newtype so managed state cannot collide with another String.
-struct ArtJson(String);
+/// Pre-serialized gallery. Imports rebuild it off the frame thread, and
+/// overlays read a copy without re-encoding every PNG on the UI thread.
+struct ArtJson(Mutex<String>);
+
+impl ArtJson {
+    fn edit(&self, change: impl FnOnce(&mut ArtUrls)) -> Result<(), String> {
+        let mut encoded = self.0.lock().map_err(|error| error.to_string())?;
+        let mut art: ArtUrls = serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+        change(&mut art);
+        *encoded = serde_json::to_string(&art).map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    fn install(&self, character: &Character) -> Result<(), String> {
+        self.edit(|gallery| {
+            gallery.characters.insert(
+                character.name.clone(),
+                CharacterArt {
+                    art: art_urls(character),
+                    smooth: character.smooth,
+                },
+            );
+        })
+    }
+
+    fn remove(&self, name: &str) -> Result<(), String> {
+        self.edit(|gallery| {
+            gallery.characters.remove(name);
+        })
+    }
+}
 
 fn encode_art_json(art: &ArtUrls) -> ArtJson {
-    ArtJson(serde_json::to_string(art).expect("ArtUrls always serializes"))
+    ArtJson(Mutex::new(
+        serde_json::to_string(art).expect("ArtUrls always serializes"),
+    ))
 }
 
 fn character_response(json: &ArtJson) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(json.0.clone())
+    let encoded = json
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    tauri::ipc::Response::new(encoded)
 }
 
 /// The art of every Character on screen, fetched once when the webview
@@ -837,7 +880,19 @@ fn settings_session(app: &tauri::AppHandle, state: &SettingsState) -> SettingsSe
         rules: Arc::clone(&state.rules),
         inspect: Arc::clone(&state.inspect),
         instances: Arc::clone(&state.instances),
-        installed: state.installed.clone(),
+        installed: {
+            let mut installed = state
+                .installed
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default();
+            if let Ok(live) = state.live_imports.lock() {
+                installed.extend(live.keys().cloned());
+            }
+            installed.sort();
+            installed.dedup();
+            installed
+        },
         ops: state.ops.clone(),
         app: app.clone(),
         on_rebind: bind_hide_hotkey,
@@ -2860,7 +2915,7 @@ fn restore_history(app: &tauri::AppHandle, restored: harness::Restored) {
             let rows = state.instances.lock().map(|rows| rows.clone());
             declared_behaviors(
                 &rows.unwrap_or_default(),
-                &state.behavior_names,
+                &live_behavior_names(&state),
                 &restored.instance,
             )
         })
@@ -3147,7 +3202,7 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
             state
                 .instances
                 .lock()
-                .map(|rows| declared_behaviors(&rows, &state.behavior_names, &instance))
+                .map(|rows| declared_behaviors(&rows, &live_behavior_names(&state), &instance))
                 .unwrap_or_default(),
             blank,
         ),
@@ -3155,9 +3210,15 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
             String::new()
         } else {
             state
-                .personalities
-                .get(&character)
-                .cloned()
+                .live_imports
+                .lock()
+                .ok()
+                .and_then(|imports| {
+                    imports
+                        .get(&character)
+                        .map(|character| character.personality.clone())
+                })
+                .or_else(|| state.personalities.get(&character).cloned())
                 .unwrap_or_default()
         },
         name,
@@ -5439,7 +5500,8 @@ fn main() {
                 settings: Arc::clone(&settings),
                 path: settings_file.clone(),
                 memory_path: memory::shared_path(),
-                installed,
+                installed: Mutex::new(installed),
+                live_imports: Mutex::new(BTreeMap::new()),
                 personalities: Arc::new(
                     character_cache
                         .iter()
@@ -6681,6 +6743,27 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_str(&character_json_body(response)).expect("character returns JSON");
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn importing_and_removing_art_refreshes_the_existing_gallery() {
+        let gallery = encode_art_json(&ArtUrls {
+            characters: BTreeMap::new(),
+        });
+        let uploaded = stub_character("Uploaded");
+        gallery.install(&uploaded).expect("imported art is cached");
+        let installed: serde_json::Value =
+            serde_json::from_str(&character_json_body(character_response(&gallery)))
+                .expect("valid gallery JSON");
+        assert!(installed["characters"]["Uploaded"].is_object());
+
+        gallery
+            .remove("Uploaded")
+            .expect("uninstalled art is withdrawn");
+        let removed: serde_json::Value =
+            serde_json::from_str(&character_json_body(character_response(&gallery)))
+                .expect("valid gallery JSON");
+        assert!(removed["characters"]["Uploaded"].is_null());
     }
 
     /// The invariant `art_urls` exists to hold: the webview indexes this list
