@@ -6722,6 +6722,23 @@ mod tests {
         assert_eq!(body, expected);
     }
 
+    #[test]
+    fn importing_and_removing_art_refreshes_the_existing_gallery() {
+        let gallery = encode_art_json(&ArtUrls { characters: BTreeMap::new() });
+        let uploaded = stub_character("Uploaded");
+        gallery.install(&uploaded).expect("imported art is cached");
+        let installed: serde_json::Value = serde_json::from_str(
+            &character_json_body(character_response(&gallery))
+        ).expect("valid gallery JSON");
+        assert!(installed["characters"]["Uploaded"].is_object());
+
+        gallery.remove("Uploaded").expect("uninstalled art is withdrawn");
+        let removed: serde_json::Value = serde_json::from_str(
+            &character_json_body(character_response(&gallery))
+        ).expect("valid gallery JSON");
+        assert!(removed["characters"]["Uploaded"].is_null());
+    }
+
     /// The invariant `art_urls` exists to hold: the webview indexes this list
     /// by the index the frame loop computed over `Animation::frames`, so a
     /// dropped or reordered URL would put a different frame on screen.
