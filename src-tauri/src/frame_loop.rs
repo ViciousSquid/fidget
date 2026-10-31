@@ -208,7 +208,7 @@ pub(crate) fn run_frame_loop(
         let FrameExtras {
             settings,
             settings_path,
-            characters,
+            mut characters,
             instances: instance_rows,
             ops,
             chat,
@@ -826,6 +826,65 @@ pub(crate) fn run_frame_loop(
             while let Ok(op) = ops.try_recv() {
                 settings_ops = true;
                 match op {
+                    SettingsOp::Imported { character, done } => {
+                        // The frame thread is the sole owner of live Instances and
+                        // the package map. Register before retargeting, so Chat,
+                        // menus and new spawns all resolve the imported name.
+                        let name = character.name.clone();
+                        characters.insert(name.clone(), Arc::clone(&character));
+                        if let Some(state) = app.try_state::<super::SettingsState>() {
+                            if let Ok(mut imports) = state.live_imports.lock() {
+                                imports.insert(name.clone(), Arc::clone(&character));
+                            }
+                        }
+                        if let Ok(mut guard) = settings.lock() {
+                            guard.character = name.clone();
+                        }
+                        super::persist_settings(&settings, &settings_path);
+                        let ids: Vec<_> = lives.iter().map(|live| live.id.clone()).collect();
+                        for id in ids {
+                            switch_instance(
+                                &mut roster,
+                                &mut lives,
+                                &mut slots,
+                                &id,
+                                Arc::clone(&character),
+                                &config,
+                                &director,
+                                &app,
+                            );
+                            let (chat_ui, chat_appearance) = settings
+                                .lock()
+                                .ok()
+                                .map(|s| (s.chat_ui.clone(), s.chat_appearance))
+                                .unwrap_or_else(|| ("minimal".to_string(), ChatAppearance::System));
+                            if let Ok(inspect) = inspect.lock() {
+                                push_chat_opening(
+                                    &app, &roster, &id, &inspect, &characters, &chat_ui,
+                                    chat_appearance,
+                                );
+                            }
+                        }
+                        let _ = app.emit("character-updated", ());
+                        let _ = done.send(());
+                    }
+                    SettingsOp::Removed { name, done } => {
+                        // The remove command already checks Settings and the
+                        // published roster; also check the live roster here.
+                        let selected = settings.lock().is_ok_and(|s| s.character == name);
+                        let running = lives.iter().any(|live| live.character.name == name);
+                        if !selected && !running {
+                            characters.remove(&name);
+                            if let Some(state) = app.try_state::<super::SettingsState>() {
+                                if let Ok(mut imports) = state.live_imports.lock() {
+                                    imports.remove(&name);
+                                }
+                            }
+                        } else {
+                            eprintln!("character: {name} remained live after a removal race");
+                        }
+                        let _ = done.send(());
+                    }
                     SettingsOp::Spawn { character, name } => {
                         spawn_live(
                             &mut roster,
