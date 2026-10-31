@@ -866,7 +866,7 @@ pub(crate) fn run_frame_loop(
                             }
                         }
                         let _ = app.emit("character-updated", ());
-                        let _ = done.send(());
+                        let _ = done.send(Ok(()));
                     }
                     SettingsOp::Removed { name, done } => {
                         // The remove command already checks Settings and the
@@ -879,11 +879,16 @@ pub(crate) fn run_frame_loop(
                                 if let Ok(mut imports) = state.live_imports.lock() {
                                     imports.remove(&name);
                                 }
+                                if let Ok(mut installed) = state.installed.lock() {
+                                    installed.retain(|existing| existing != &name);
+                                }
                             }
+                            let _ = done.send(Ok(()));
                         } else {
-                            eprintln!("character: {name} remained live after a removal race");
+                            let _ = done.send(Err(format!(
+                                "{name} became selected or running before removal finished"
+                            )));
                         }
-                        let _ = done.send(());
                     }
                     SettingsOp::Spawn { character, name } => {
                         spawn_live(
