@@ -829,24 +829,35 @@ impl ArtJson {
 
     fn install(&self, character: &Character) -> Result<(), String> {
         self.edit(|gallery| {
-            gallery.characters.insert(character.name.clone(), CharacterArt {
-                art: art_urls(character),
-                smooth: character.smooth,
-            });
+            gallery.characters.insert(
+                character.name.clone(),
+                CharacterArt {
+                    art: art_urls(character),
+                    smooth: character.smooth,
+                },
+            );
         })
     }
 
     fn remove(&self, name: &str) -> Result<(), String> {
-        self.edit(|gallery| { gallery.characters.remove(name); })
+        self.edit(|gallery| {
+            gallery.characters.remove(name);
+        })
     }
 }
 
 fn encode_art_json(art: &ArtUrls) -> ArtJson {
-    ArtJson(Mutex::new(serde_json::to_string(art).expect("ArtUrls always serializes")))
+    ArtJson(Mutex::new(
+        serde_json::to_string(art).expect("ArtUrls always serializes"),
+    ))
 }
 
 fn character_response(json: &ArtJson) -> tauri::ipc::Response {
-    let encoded = json.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).clone();
+    let encoded = json
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
     tauri::ipc::Response::new(encoded)
 }
 
@@ -870,7 +881,11 @@ fn settings_session(app: &tauri::AppHandle, state: &SettingsState) -> SettingsSe
         inspect: Arc::clone(&state.inspect),
         instances: Arc::clone(&state.instances),
         installed: {
-            let mut installed = state.installed.lock().map(|names| names.clone()).unwrap_or_default();
+            let mut installed = state
+                .installed
+                .lock()
+                .map(|names| names.clone())
+                .unwrap_or_default();
             if let Ok(live) = state.live_imports.lock() {
                 installed.extend(live.keys().cloned());
             }
@@ -3194,9 +3209,17 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
         personality: if blank {
             String::new()
         } else {
-            state.live_imports.lock().ok().and_then(|imports| {
-                imports.get(&character).map(|character| character.personality.clone())
-            }).or_else(|| state.personalities.get(&character).cloned()).unwrap_or_default()
+            state
+                .live_imports
+                .lock()
+                .ok()
+                .and_then(|imports| {
+                    imports
+                        .get(&character)
+                        .map(|character| character.personality.clone())
+                })
+                .or_else(|| state.personalities.get(&character).cloned())
+                .unwrap_or_default()
         },
         name,
         character,
@@ -6724,18 +6747,22 @@ mod tests {
 
     #[test]
     fn importing_and_removing_art_refreshes_the_existing_gallery() {
-        let gallery = encode_art_json(&ArtUrls { characters: BTreeMap::new() });
+        let gallery = encode_art_json(&ArtUrls {
+            characters: BTreeMap::new(),
+        });
         let uploaded = stub_character("Uploaded");
         gallery.install(&uploaded).expect("imported art is cached");
-        let installed: serde_json::Value = serde_json::from_str(
-            &character_json_body(character_response(&gallery))
-        ).expect("valid gallery JSON");
+        let installed: serde_json::Value =
+            serde_json::from_str(&character_json_body(character_response(&gallery)))
+                .expect("valid gallery JSON");
         assert!(installed["characters"]["Uploaded"].is_object());
 
-        gallery.remove("Uploaded").expect("uninstalled art is withdrawn");
-        let removed: serde_json::Value = serde_json::from_str(
-            &character_json_body(character_response(&gallery))
-        ).expect("valid gallery JSON");
+        gallery
+            .remove("Uploaded")
+            .expect("uninstalled art is withdrawn");
+        let removed: serde_json::Value =
+            serde_json::from_str(&character_json_body(character_response(&gallery)))
+                .expect("valid gallery JSON");
         assert!(removed["characters"]["Uploaded"].is_null());
     }
 
