@@ -1,4 +1,5 @@
 @import url("./chat-shared.css");
+@import url("./cue-possess.css");
 
 /* The overlay must never paint a backdrop. Anything opaque here is a grey
    sheet over the desktop, the obvious way this window looks broken. */
@@ -340,9 +341,6 @@ body {
      the sprite every display frame, and a transform is composited. */
   top: 0;
   left: 0;
-  /* Center origin so `scaleX(-1)` mirrors the sprite about its midline.
-     The width is always even, so the mirrored pixels stay on the grid. */
-  transform-origin: center;
   /* Pixel art, nearest-neighbour, integer scale only. A Character with
      render_mode smooth overrides this from main.js. */
   image-rendering: pixelated;
@@ -412,10 +410,6 @@ body {
 .cue-ring.in.second {
   animation-delay: 90ms;
   opacity: 0;
-}
-
-.cue-ring.possess {
-  border-color: var(--shared-accent);
 }
 
 @keyframes cue-summon {

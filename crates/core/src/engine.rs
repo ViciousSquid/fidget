@@ -101,6 +101,10 @@ pub enum Cue {
     /// The sprite landed after being let go moving. The Drop cue played harder
     /// rather than a sixth shape and a sixth sound.
     Throw,
+    /// The keyboard took the sprite.
+    Possess,
+    /// The keyboard let it go, by any route. A pause is neither edge.
+    Unpossess,
 }
 
 impl Cue {
@@ -115,6 +119,8 @@ impl Cue {
             Self::Pickup => "pickup",
             Self::Drop => "drop",
             Self::Throw => "throw",
+            Self::Possess => "possess",
+            Self::Unpossess => "unpossess",
         }
     }
 
@@ -452,6 +458,8 @@ pub struct Engine {
     /// still falls and is grabbed the usual way, but never sleeps, climbs only
     /// on Up, and refuses proposals while their Speech still shows.
     possessed: bool,
+    /// The possession edge `set_possessed` saw, cued on the next tick.
+    possession_cue: Option<Cue>,
     /// This fall left the feet while possessed, so a held arrow steers it. A
     /// release from the hand is not one: a throw flies as thrown.
     steering: bool,
@@ -696,6 +704,7 @@ impl Engine {
             since_yank_ref_s: 0.0,
             do_not_disturb: false,
             possessed: false,
+            possession_cue: None,
             steering: false,
             moment_queue: VecDeque::new(),
             moment_holding: false,
@@ -790,6 +799,11 @@ impl Engine {
     /// plays `possessed`.
     pub fn set_possessed(&mut self, possessed: bool) {
         let starting = possessed && !self.possessed;
+        match (self.possessed, possessed) {
+            (false, true) => self.possession_cue = Some(Cue::Possess),
+            (true, false) => self.possession_cue = Some(Cue::Unpossess),
+            _ => {}
+        }
         self.possessed = possessed;
         if matches!(self.on_screen(), Some(Primitive::Walk | Primitive::Chase)) {
             self.stop_playing();
@@ -1330,19 +1344,21 @@ impl Engine {
                 .iter()
                 .any(|verb| matches!(verb, Verb::Summon | Verb::Menu));
 
-        // One cue a tick; a hand transition outranks a click. Two clicks cannot
-        // share a tick, so the first click verb wins. Menu repeats every held
-        // tick like Grab, so it cues on the press edge.
+        // One cue a tick: a hand transition, else the first click verb, else a
+        // possession edge, which waits for a free tick rather than be lost.
+        // Menu repeats every held tick like Grab, so it cues on the press edge.
         let menu_now = snapshot.verbs.iter().any(|verb| matches!(verb, Verb::Menu));
-        let cue = cue.or_else(|| {
-            snapshot
-                .verbs
-                .iter()
-                .find_map(|verb| match Cue::of_verb(verb) {
-                    Some(Cue::Menu) if self.menu_held => None,
-                    other => other,
-                })
-        });
+        let cue = cue
+            .or_else(|| {
+                snapshot
+                    .verbs
+                    .iter()
+                    .find_map(|verb| match Cue::of_verb(verb) {
+                        Some(Cue::Menu) if self.menu_held => None,
+                        other => other,
+                    })
+            })
+            .or_else(|| self.possession_cue.take());
         self.menu_held = menu_now;
 
         // A Behavior is drawn over whatever the sprite is doing, so a Poke
@@ -3289,6 +3305,24 @@ mod tests {
             carried.iter().all(Option::is_none),
             "held, and cued once: {carried:?}"
         );
+    }
+
+    /// A possession edge on the tick of a pickup waits for the next free tick
+    /// rather than take the pickup's place.
+    #[test]
+    fn a_possession_edge_yields_the_tick_to_a_hand_cue() {
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let world = snapshot(100);
+        settle(&mut engine, &world);
+
+        engine.set_possessed(true);
+        let press = WorldSnapshot {
+            cursor: engine.feet(),
+            verbs: vec![Verb::Grab],
+            ..world
+        };
+        let cues: Vec<Option<Cue>> = (0..3).map(|_| engine.tick(&press).cue).collect();
+        assert_eq!(cues, vec![Some(Cue::Pickup), Some(Cue::Possess), None]);
     }
 
     /// Pickup is the edge `on_verbs` reports for the grab that takes hold.
@@ -9770,6 +9804,24 @@ mod tests {
                 assert_eq!(last.velocity.x, 0.0, "stopped at the wall: {last:?}");
                 assert_eq!(last.animation, "idle", "standing, not striding: {last:?}");
             }
+        }
+
+        /// Each edge cues once, on the next tick. A repeat of the same switch,
+        /// which the menu sends to every other Instance, cues nothing.
+        #[test]
+        fn possession_edges_cue_possess_and_unpossess_once() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let cues: Vec<Option<Cue>> = (0..2).map(|_| engine.tick(&world).cue).collect();
+            assert_eq!(cues, vec![Some(Cue::Possess), None]);
+
+            engine.set_possessed(true);
+            assert_eq!(engine.tick(&world).cue, None, "already possessed");
+
+            engine.set_possessed(false);
+            engine.set_possessed(false);
+            let cues: Vec<Option<Cue>> = (0..2).map(|_| engine.tick(&world).cue).collect();
+            assert_eq!(cues, vec![Some(Cue::Unpossess), None]);
         }
 
         /// Possession start plays `possessed`, which a package without that art
