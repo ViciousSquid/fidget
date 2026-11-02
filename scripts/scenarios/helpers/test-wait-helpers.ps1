@@ -79,6 +79,57 @@ try {
     }
     $script:proc = $child
     Check ($closed -and ((Get-NowMs) - $start) -lt 1000) "the log writer closed at end of stream ($((Get-NowMs) - $start) ms)"
+
+    # Scoped to the form's pid and armed once its startup windows exist, so
+    # only the form showing 2 s later can wake the wait.
+    $formStart = New-Object System.Diagnostics.ProcessStartInfo $shell
+    $formStart.Arguments = '-NoProfile -Command "Add-Type -AssemblyName System.Windows.Forms; ' +
+        '$f = New-Object System.Windows.Forms.Form; $null = $f.Handle; [Console]::Out.WriteLine(''ready''); ' +
+        'Start-Sleep 2; $f.Show(); Start-Sleep 2"'
+    $formStart.UseShellExecute = $false
+    $formStart.CreateNoWindow = $true
+    $formStart.RedirectStandardOutput = $true
+    $shown = [System.Diagnostics.Process]::Start($formStart)
+    $ready = $shown.StandardOutput.ReadLineAsync()
+    Check ($ready.Wait(15000) -and $ready.Result -eq "ready") "the form's process is ready"
+    $start = Get-NowMs
+    $signal = [FidgetUiaSignal]::new($shown.Id)
+    Check (((Get-NowMs) - $start) -lt 1000) "the signal registers at once ($((Get-NowMs) - $start) ms)"
+    $woke = $signal.Wait(10000)
+    $took = (Get-NowMs) - $start
+    Check ($woke -and $took -gt 1000) "the watched process's form wakes the signal ($took ms)"
+    $start = Get-NowMs
+    $signal.Dispose()
+    Check (((Get-NowMs) - $start) -lt 1000) "the signal lets go at once ($((Get-NowMs) - $start) ms)"
+    Check ($shown.WaitForExit(20000)) "the window's process exits"
+
+    # A leaf that steps past its stall budget, then blocks: the trail names its
+    # last step, the stand-in Fidget dies, and the leaf ends.
+    $stall = Join-Path $dir "stall.ps1"
+    [System.IO.File]::WriteAllLines($stall, @(
+            ". '$(Join-Path $PSScriptRoot "wait-helpers.win.ps1")'",
+            '$FidgetStallSeconds = 2',
+            "`$p = Start-FidgetPiped '$shell' @('-NoProfile', '-Command', 'Start-Sleep 60') '$dir\stall.out' '$dir\stall.err'",
+            '[Console]::Out.WriteLine($p.Id)',
+            '1..4 | ForEach-Object { [FidgetTrail]::Mark("step $_"); Start-Sleep -Milliseconds 700 }',
+            '[FidgetTrail]::Mark("blocked on nothing")',
+            'Start-Sleep 60'
+        ), $utf8)
+    $leaf = New-Object System.Diagnostics.ProcessStartInfo $shell
+    $leaf.Arguments = "-NoProfile -ExecutionPolicy Bypass -File `"$stall`""
+    $leaf.UseShellExecute = $false
+    $leaf.RedirectStandardOutput = $true
+    $leaf.RedirectStandardError = $true
+    $start = Get-NowMs
+    $leafProc = [System.Diagnostics.Process]::Start($leaf)
+    $errTask = $leafProc.StandardError.ReadToEndAsync()
+    $pidLine = $leafProc.StandardOutput.ReadLineAsync()
+    $standIn = if ($pidLine.Wait(15000)) { [int]$pidLine.Result } else { 0 }
+    $ended = $leafProc.WaitForExit(20000)
+    Check ($ended -and ((Get-NowMs) - $start) -lt 15000) "a stalled leaf ends itself ($((Get-NowMs) - $start) ms)"
+    $said = $errTask.Result
+    Check ($said.Contains("FAIL: the leaf took no step for 2 s") -and $said.Contains("blocked on nothing")) "the stall waits out the steps and names the last: $said"
+    Check ($null -eq (Get-Process -Id $standIn -ErrorAction SilentlyContinue)) "the stall killed Fidget (pid $standIn)"
 } finally {
     if (-not $script:proc.HasExited) { $script:proc.Kill() }
     Remove-Item -Recurse -Force -LiteralPath $dir

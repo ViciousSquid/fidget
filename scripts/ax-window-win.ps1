@@ -74,6 +74,7 @@ public class FidgetWinEnum {
     }
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr SendMessageTimeout(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
     [DllImport("user32.dll")] public static extern int GetMenuItemCount(IntPtr hMenu);
+    [DllImport("user32.dll")] public static extern bool GetMenuItemRect(IntPtr hWnd, IntPtr hMenu, uint item, out RECT rect);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetMenuStringW(IntPtr hMenu, uint item, StringBuilder lpString, int maxCount, uint flags);
     public const uint MN_GETHMENU = 0x01E1;
     public const uint SMTO_ABORTIFHUNG = 0x0002;
@@ -208,6 +209,28 @@ function Get-PopupMenuItems {
     return @()
 }
 
+# The screen rect of Fidget's open menu row that starts with $Prefix, read
+# from the menu itself: UI Automation found the rows only while the signal
+# held root-wide UI Automation handlers, which it no longer does (#1765).
+function Find-MenuRow([uint32]$FidgetPid, [string]$Prefix) {
+    foreach ($menu in [FidgetWinEnum]::OfClass("#32768", $false)) {
+        $owner = 0
+        [FidgetWinEnum]::GetWindowThreadProcessId($menu, [ref]$owner) | Out-Null
+        if ($owner -ne $FidgetPid) { continue }
+        $hmenu = [IntPtr]::Zero
+        [FidgetWinEnum]::SendMessageTimeout($menu, [FidgetWinEnum]::MN_GETHMENU, [IntPtr]::Zero, [IntPtr]::Zero, [FidgetWinEnum]::SMTO_ABORTIFHUNG, 500, [ref]$hmenu) | Out-Null
+        if ($hmenu -eq [IntPtr]::Zero) { continue }
+        for ($i = 0; $i -lt [FidgetWinEnum]::GetMenuItemCount($hmenu); $i++) {
+            $sb = New-Object System.Text.StringBuilder 256
+            [FidgetWinEnum]::GetMenuStringW($hmenu, $i, $sb, $sb.Capacity, [FidgetWinEnum]::MF_BYPOSITION) | Out-Null
+            if (-not ($sb.ToString() -replace '&', '').StartsWith($Prefix)) { continue }
+            $rect = New-Object FidgetWinEnum+RECT
+            if ([FidgetWinEnum]::GetMenuItemRect([IntPtr]::Zero, $hmenu, $i, [ref]$rect)) { return $rect }
+        }
+    }
+    return $null
+}
+
 # Where to click: the sprite's middle once two frame lines in a row put it
 # within 2 px, else -X/-Y.
 function Get-ClickPoint {
@@ -328,12 +351,12 @@ if ($Command -eq "tray") {
         exit 1
     }
     $r = $icon.Current.BoundingRectangle
-    # Fidget's own menu: another process's hidden #32768 can list items too.
-    $findRow = { Get-PopupMenuItems -FidgetPid $ProcessId | Where-Object { $_ -isnot [string] -and $_.Current.Name.StartsWith($Arg3) } | Select-Object -First 1 }
+    $findRow = { Find-MenuRow $ProcessId $Arg3 }
     # The icon is drawn before its click handler settles, so a press can open
-    # no menu or drop the row's Invoke. Each retry waits on the window, not a clock.
+    # no menu or drop the row's click. Each retry waits on the window, not a clock.
     $why = ""
     for ($attempt = 1; $attempt -le 3; $attempt++) {
+        [FidgetTrail]::Mark("tray: click $attempt")
         $signal = [FidgetUiaSignal]::new(0)
         try {
             [FidgetWinEnum]::SetCursorPos([int]($r.X + $r.Width / 2), [int]($r.Y + $r.Height / 2)) | Out-Null
@@ -357,10 +380,15 @@ if ($Command -eq "tray") {
         }
         $signal = [FidgetUiaSignal]::new($ProcessId)
         try {
-            Invoke-Element $row
+            [FidgetTrail]::Mark("tray: click $Arg3")
+            [FidgetWinEnum]::SetCursorPos([int](($row.Left + $row.Right) / 2), [int](($row.Top + $row.Bottom) / 2)) | Out-Null
+            [FidgetWinEnum]::Press()
             $deadline = [DateTime]::UtcNow.AddSeconds(2)
             while ($true) {
-                if ([FidgetWinEnum]::Find([uint32]$ProcessId, $Title) -ne [IntPtr]::Zero) { exit 0 }
+                if ([FidgetWinEnum]::Find([uint32]$ProcessId, $Title) -ne [IntPtr]::Zero) {
+                    [FidgetTrail]::Mark("tray: $Title open, unregister")
+                    exit 0
+                }
                 if (-not $signal.Wait([int]($deadline - [DateTime]::UtcNow).TotalMilliseconds)) { break }
             }
         } finally {
