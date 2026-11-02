@@ -994,10 +994,13 @@ fn contract_line(line: &str) -> Option<(&str, Option<&str>, bool)> {
 }
 
 /// Body after a leading `behavior:` marker, when the line opens with one.
+/// A cut that is not a character boundary cannot be this ASCII marker, and
+/// slicing there panics.
 fn behavior_marker_body(line: &str) -> Option<&str> {
     const MARK: &str = "behavior:";
     let line = line.trim();
-    if line.len() < MARK.len() || !line[..MARK.len()].eq_ignore_ascii_case(MARK) {
+    let prefix = line.get(..MARK.len())?;
+    if !prefix.eq_ignore_ascii_case(MARK) {
         return None;
     }
     Some(line[MARK.len()..].trim_start())
@@ -1948,6 +1951,22 @@ mod tests {
         assert!(
             parse_proposal("---").is_err(),
             "a horizontal rule is punctuation too, and it is a line of Pi's banner"
+        );
+    }
+
+    /// A curly quote on the marker's last byte is prose. Callers see an error,
+    /// not a process panic that leaves the overlays up.
+    #[test]
+    fn a_curly_quote_on_the_marker_boundary_is_an_error() {
+        // `behavior` is 8 bytes. U+201C is the character the Windows console
+        // printed as ΓÇ£, and it occupies bytes 8..11. That is the panic.
+        assert!(
+            parse_proposal("behavior\u{201c}walk").is_err(),
+            "a quote where the colon would be is not a contract"
+        );
+        assert!(
+            parse_proposal("xxxxxxxx\u{201c}still talking").is_err(),
+            "any line with a multibyte character on that byte is still prose"
         );
     }
 
