@@ -1289,11 +1289,13 @@ impl Engine {
 
         // Director proposals stay out while possessed. A digit is the user
         // asking, so it takes the same `permitted` gate.
+        let mut digit_started = false;
         if self.possessed {
             if let Some(name) = self.behavior_for_digit(snapshot.possession.play) {
                 match self.start_behavior(&name) {
                     Some(true) => {
                         started = true;
+                        digit_started = true;
                         behavior = Some(name);
                     }
                     Some(false) => refused = Some(name),
@@ -1349,8 +1351,8 @@ impl Engine {
                 .iter()
                 .any(|verb| matches!(verb, Verb::Summon | Verb::Menu));
 
-        // One cue a tick: a hand transition, else the first click verb, else a
-        // possession edge, which waits for a free tick rather than be lost.
+        // One cue a tick: a hand transition, else a click verb, else a started
+        // digit Behavior, else a possession edge, which waits for a free tick.
         // Menu repeats every held tick like Grab, so it cues on the press edge.
         let menu_now = snapshot.verbs.iter().any(|verb| matches!(verb, Verb::Menu));
         let cue = cue
@@ -1363,6 +1365,7 @@ impl Engine {
                         other => other,
                     })
             })
+            .or(digit_started.then_some(Cue::Poke))
             .or_else(|| self.possession_cue.take());
         self.menu_held = menu_now;
 
@@ -9717,6 +9720,19 @@ mod tests {
             assert_eq!(unbound.playing_behavior.as_deref(), Some("greet"));
         }
 
+        /// The Poke takes the tick, so the pending possession edge slips one.
+        #[test]
+        fn a_digit_that_starts_its_behavior_cues_a_poke() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+
+            let cues: Vec<Option<Cue>> = [playing(1), Intent::default()]
+                .into_iter()
+                .map(|intent| engine.tick(&with_possession(intent, &world)).cue)
+                .collect();
+            assert_eq!(cues, vec![Some(Cue::Poke), Some(Cue::Possess)]);
+        }
+
         #[test]
         fn a_digit_the_state_forbids_is_refused_like_a_proposal() {
             let world = on(one_display());
@@ -9727,6 +9743,7 @@ mod tests {
             let refused = engine.tick(&with_possession(playing(2), &world));
             assert_eq!(refused.behavior, None, "{refused:?}");
             assert_eq!(refused.refused.as_deref(), Some("settle"));
+            assert_eq!(refused.cue, None, "a refusal plays no Poke");
             assert_eq!(
                 refused.animation, "jump",
                 "the refusal does not replace the flight"
