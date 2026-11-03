@@ -3930,6 +3930,7 @@ mod tests {
             rect: [50, 60, 200, 80],
             clickable: false,
             follows: None,
+            see_through: false,
         }];
         assert_eq!(
             decide_region_action(&[], &bubble, true),
