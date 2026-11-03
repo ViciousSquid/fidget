@@ -1021,11 +1021,10 @@ async function start() {
     event.preventDefault();
   });
   const onPossessionKey = (event) => {
-    if (!possessed) return;
     const inField = Boolean(event.target?.closest?.("textarea, input"));
-    const edge = possessionEdge(event.key, event.repeat, event.type === "keydown", event.code, inField);
+    const edge = possessionEdge(event.key, event.repeat, event.type === "keydown", event.code, inField, possessed);
     if (!edge) return;
-    if (!inField) event.preventDefault();
+    if (possessed && !inField) event.preventDefault();
     window.__TAURI__.core.invoke("overlay_possession_key", { key: edge.key, down: edge.down }).catch((err) => {
       console.error("overlay_possession_key", err);
     });
