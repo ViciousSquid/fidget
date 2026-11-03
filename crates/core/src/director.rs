@@ -1188,6 +1188,7 @@ mod tests {
             then: None,
             weight,
             trigger,
+            not_in_manifest: false,
         }
     }
 

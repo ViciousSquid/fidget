@@ -2508,9 +2508,9 @@ pub(crate) fn run_frame_loop(
                     paused,
                     charge: frame.charge,
                     behaviors: if possessed {
-                        digit_behaviors(live.character.behaviors.keys().map(String::as_str))
+                        digit_behaviors(&live.character.behaviors)
                             .into_iter()
-                            .map(str::to_string)
+                            .map(|names| names.join("/"))
                             .collect()
                     } else {
                         Vec::new()
@@ -3571,6 +3571,7 @@ mod tests {
                 then: None,
                 weight: 1,
                 trigger: None,
+                not_in_manifest: false,
             },
         );
         Character {
