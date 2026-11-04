@@ -2504,10 +2504,13 @@ pub(crate) fn run_frame_loop(
                         );
                     }
                 }
-                let dialogue = super::carry_line(
+                let listening =
+                    owner.is_some_and(|index| platform::overlay_listening(&overlay_label(index)));
+                let dialogue = super::draw_response(
                     &mut live.spoken,
                     frame.dialogue.as_deref(),
                     owner,
+                    listening,
                     Instant::now(),
                 );
                 let overlay_drops_the_bubble = !presence.visible && presence.fade_ms == 0;

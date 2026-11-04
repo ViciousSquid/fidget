@@ -157,6 +157,57 @@ static OVERLAY_RECTS: Mutex<Vec<(String, OverlayRect)>> = Mutex::new(Vec::new())
 /// Empty elsewhere, so every overlay is drawn from the frame it asked for.
 static OVERLAY_ORIGINS: Mutex<Vec<(String, (f64, f64))>> = Mutex::new(Vec::new());
 
+/// Overlays whose page has attached its frame listener. Cleared whenever the
+/// page starts loading again.
+static OVERLAYS_LISTENING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Mark whether `label`'s page hears frames.
+pub fn set_overlay_listening(label: &str, listening: bool) {
+    let Ok(mut all) = OVERLAYS_LISTENING.lock() else {
+        return;
+    };
+    all.retain(|owner| owner != label);
+    if listening {
+        all.push(label.to_string());
+    }
+}
+
+/// How many times each overlay's page has started loading.
+static OVERLAY_PAGE_LOADS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+/// `label`'s page started loading again, so it no longer hears frames. WebView2
+/// can send the first Started after the page already listened, so a listen on
+/// load 0 survives it; a later Started (reload) still clears.
+pub fn overlay_page_load_started(label: &str) {
+    let keep = overlay_page_loads(label) == 0 && overlay_listening(label);
+    if !keep {
+        set_overlay_listening(label, false);
+    }
+    let Ok(mut all) = OVERLAY_PAGE_LOADS.lock() else {
+        return;
+    };
+    match all.iter_mut().find(|(owner, _)| owner == label) {
+        Some((_, loads)) => *loads += 1,
+        None => all.push((label.to_string(), 1)),
+    }
+}
+
+/// How many times `label`'s page has started loading.
+pub fn overlay_page_loads(label: &str) -> u32 {
+    OVERLAY_PAGE_LOADS.lock().map_or(0, |all| {
+        all.iter()
+            .find(|(owner, _)| owner == label)
+            .map_or(0, |(_, loads)| *loads)
+    })
+}
+
+/// Whether `label`'s page hears frames yet.
+pub fn overlay_listening(label: &str) -> bool {
+    OVERLAYS_LISTENING
+        .lock()
+        .is_ok_and(|all| all.iter().any(|owner| owner == label))
+}
+
 /// The window manager reported where `label`'s overlay now is.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn set_overlay_origin(label: &str, origin: (f64, f64)) {
