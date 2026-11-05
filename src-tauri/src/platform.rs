@@ -387,6 +387,9 @@ mod x11;
 mod windows;
 
 #[cfg(any(test, not(unix)))]
+mod press_origin;
+
+#[cfg(any(test, not(unix)))]
 mod windows_perch;
 
 #[cfg(any(test, not(unix)))]
@@ -1186,18 +1189,31 @@ pub fn buttons_down() -> ButtonsDown {
     x11::buttons_down().unwrap_or(overlay)
 }
 
-/// Where the latest press began, in the cursor's pixels, when the source
-/// knows: XI2 on X11. A press dragged away before the tick is hit-tested here,
-/// not where the tick finds the cursor.
+/// Where the latest XI2 press began, in the cursor's pixels. A drag before
+/// the tick is hit-tested here, not where the tick finds the cursor.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn press_point() -> Option<(i32, i32)> {
     x11::press_point()
 }
 
-/// Elsewhere the tick's cursor stands in for where the press began.
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+/// Consume the low-level hook's recent button-down point. Without one,
+/// the tick's cursor stands in.
+#[cfg(not(unix))]
+pub fn press_point() -> Option<(i32, i32)> {
+    windows::press_point()
+}
+
+/// macOS wakes on the press, so the tick's cursor is still where it began.
+#[cfg(target_os = "macos")]
 pub fn press_point() -> Option<(i32, i32)> {
     None
+}
+
+/// A button edge wakes the Windows idle wait. `None` when the hook will not
+/// install, and the loop keeps sleeping out its back-off.
+#[cfg(not(unix))]
+pub fn spawn_press_listener() -> Option<std::sync::mpsc::Receiver<()>> {
+    windows::spawn_press_listener()
 }
 
 /// Windows: GetAsyncKeyState for both buttons, or the overlay latch. Both
