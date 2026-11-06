@@ -168,9 +168,9 @@ starts it cold, and that run says to rerun if it misses a step.
 `fidget-verify scenario <name>` prints the leaf for this host. With `--go` it
 runs that leaf, or skips when this host has none.
 
-`possession-displays` has only a `.win.ps1` leaf, since only Windows moves
-possession to the display the sprite walks onto (#2089). It needs a display
-beside the sprite's display at the sprite's height, and skips without one. It
+`possession-displays` has a macOS `.sh` and a Windows `.win.ps1` leaf. It has
+no X11 leaf: Xvfb gives GDK one display (#2147). It needs a display beside the
+sprite's display at the sprite's height, and skips without one. It
 possesses BMO from the menu and holds the arrow toward that display until the
 whole sprite is past the border. It checks that the new display's overlay
 takes the keyboard, that the arrow's keyup lands there and stops the sprite,
@@ -178,7 +178,9 @@ and that an arrow and Space still drive it. It then checks that the card
 follows to that display, that a click into Notepad pauses possession and a
 click on the card resumes it there, and that Escape releases. Both overlays
 are titled Fidget, so it reads the card through the new overlay's own window,
-found by its top-left corner.
+found by its top-left corner. The macOS leaf clicks a fidget-type-target
+window instead of Notepad, and reads the card from every overlay's
+Accessibility dump, keeping the one on the new display.
 
 `tray-taskbar-icons-hidpi` has only a `.win.ps1` leaf. It is the live check
 for the taskbar icon at a HiDPI scale (#2054), and it never changes the scale:
