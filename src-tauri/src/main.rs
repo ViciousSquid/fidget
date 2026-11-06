@@ -480,6 +480,9 @@ struct InstanceState {
     /// falls a millisecond per millisecond and the window subtracts for itself;
     /// only a deadline that *moved* is worth a push.
     status_wake_ms: Option<u64>,
+    /// Whether this Instance's clock waits for its overlay's first draw: an
+    /// Instance that comes up with the app waits, a later Summon runs.
+    first_draw: FirstDraw,
 }
 
 /// One open menu, from the frame loop's side.
@@ -808,6 +811,50 @@ fn draw_response(
     }
     carried.owner = owner;
     Some(carried.line.clone())
+}
+
+/// The longest a launch Instance waits for its first draw. A page whose
+/// `character` load failed never draws, and WebView2 can listen seconds late.
+/// A calibration knob: hold plus fall must fit `wait_for_rest`'s 10 s.
+const FIRST_DRAW_CEILING: Duration = Duration::from_secs(3);
+
+/// Whether an Instance's clock runs yet. A launch Instance waits until the
+/// overlay under its feet has drawn its art, so the user first sees the spawn
+/// pose, not a sprite halfway down its fall. `Running` is terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstDraw {
+    /// Spawned with the app and not yet seen. `held` is wall time spent waiting.
+    Waiting {
+        held: Duration,
+    },
+    Running,
+}
+
+impl FirstDraw {
+    /// Whether this Instance's clocks advance this tick. The releasing tick
+    /// runs on that tick's time only, so the drop starts from rest. The release
+    /// traces why: the owner overlay drew it, nobody can see it, or the ceiling.
+    fn runs(&mut self, id: &str, elapsed: Duration, owner_drew: bool, visible: bool) -> bool {
+        let FirstDraw::Waiting { held } = *self else {
+            return true;
+        };
+        let held = held + elapsed;
+        let why = if owner_drew {
+            "drew"
+        } else if !visible {
+            "hidden"
+        } else if held >= FIRST_DRAW_CEILING {
+            "ceiling"
+        } else {
+            *self = FirstDraw::Waiting { held };
+            return false;
+        };
+        *self = FirstDraw::Running;
+        if dev_flags::TRACE_FRAMES.is_on() {
+            eprintln!("first-draw: {id} {why} after {}ms", held.as_millis());
+        }
+        true
+    }
 }
 
 /// What one Instance's tick decided to draw, in the space every display
@@ -2345,6 +2392,13 @@ fn overlay_rects(window: tauri::Window, rects: Vec<fidget_core::overlay_region::
 #[tauri::command]
 fn overlay_listening(window: tauri::Window) {
     platform::set_overlay_listening(window.label(), true);
+}
+
+/// The overlay's page has put this Instance's art on screen, so a launch
+/// Instance under it may start moving.
+#[tauri::command]
+fn overlay_drew(window: tauri::Window, id: String) {
+    platform::set_overlay_drew(window.label(), &id);
 }
 
 /// A page that starts loading again no longer hears frames until it says so.
@@ -4494,6 +4548,7 @@ fn spawn_live(
         happened_last: None,
         verbs: Vec::new(),
         menu_hold: None,
+        first_draw: FirstDraw::Running,
         character,
     });
 }
@@ -4855,6 +4910,9 @@ fn spawn_instances(
             happened_last: None,
             verbs: Vec::new(),
             menu_hold: None,
+            first_draw: FirstDraw::Waiting {
+                held: Duration::ZERO,
+            },
         });
     }
 
@@ -5362,6 +5420,7 @@ fn main() {
             chat_prompt,
             chat_ready,
             overlay_listening,
+            overlay_drew,
             names_hint_act,
             permission_answer,
             elicitation_answer,
@@ -7581,6 +7640,66 @@ mod tests {
             Some("hello there"),
             "under DND, dialogue still reaches draw_response and the bubble"
         );
+    }
+
+    #[test]
+    fn a_launch_instance_waits_for_its_overlay_to_draw_then_runs_for_good() {
+        let tick = Duration::from_millis(16);
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        assert!(!hold.runs("bmo", tick, false, true), "not drawn: no time");
+        assert!(!hold.runs("bmo", tick, false, true));
+        assert!(
+            hold.runs("bmo", tick, true, true),
+            "the draw releases it on that tick"
+        );
+        assert_eq!(hold, FirstDraw::Running);
+        assert!(
+            hold.runs("bmo", tick, false, true),
+            "a reload's lost witness re-holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_launch_instance_nobody_can_see_does_not_wait() {
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        assert!(hold.runs("bmo", Duration::from_millis(16), false, false));
+        assert_eq!(hold, FirstDraw::Running);
+    }
+
+    #[test]
+    fn a_draw_that_never_comes_releases_at_the_ceiling() {
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        let tick = Duration::from_millis(100);
+        let waited = (0..)
+            .take_while(|_| !hold.runs("bmo", tick, false, true))
+            .count();
+        assert_eq!(tick * waited as u32 + tick, FIRST_DRAW_CEILING);
+        assert_eq!(hold, FirstDraw::Running);
+    }
+
+    #[test]
+    fn a_summoned_instance_never_waits() {
+        assert!(FirstDraw::Running.runs("bmo", Duration::from_millis(16), false, true));
+    }
+
+    /// One overlay drawing one Character does not release another Instance
+    /// whose art it has not decoded yet.
+    #[test]
+    fn a_draw_counts_only_for_the_instance_and_overlay_that_reported_it() {
+        let label = "overlay-drew-test";
+        super::platform::set_overlay_drew(label, "first-drawn");
+        assert!(super::platform::overlay_drew(label, "first-drawn"));
+        assert!(!super::platform::overlay_drew(label, "not-yet-drawn"));
+        assert!(!super::platform::overlay_drew(
+            "overlay-other-test",
+            "first-drawn"
+        ));
     }
 
     /// Every overlay is told about every Instance, and only the

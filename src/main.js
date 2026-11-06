@@ -786,6 +786,10 @@ function drawView(view, now) {
     paintPossession(view.card, view.bar, null, null);
   }
 
+  // Frames arrive before the art does. Drawing now would show an art-less box
+  // and record it as drawn; the redraw after the character load fills it.
+  if (!characters[latest.character]) return;
+
   const placement = `${latest.character} ${latest.animation}#${latest.frame_index} ${latest.width}x${latest.height}`;
   if (placement === view.drawn) {
     return;
@@ -803,12 +807,29 @@ function drawView(view, now) {
   const src = art?.art[latest.animation]?.[latest.frame_index];
   if (src) {
     view.sprite.src = src;
+    tellDrew(view);
   }
   view.sprite.style.width = `${latest.width}px`;
   view.sprite.style.height = `${latest.height}px`;
   view.sprite.dataset.animation = latest.animation;
   view.sprite.dataset.frameIndex = latest.frame_index;
   view.sprite.style.visibility = "visible";
+}
+
+// The Shell holds a launch sprite's drop until the overlay under it shows its
+// spawn pose. Once per view, a frame after its own decode, so the report follows
+// that sprite's paint. A failed decode reports too: it is not worth the ceiling.
+function tellDrew(view) {
+  if (view.toldDrew) return;
+  view.toldDrew = true;
+  view.sprite
+    .decode()
+    .catch(() => {})
+    .then(() =>
+      requestAnimationFrame(() =>
+        window.__TAURI__.core.invoke("overlay_drew", { id: view.sprite.dataset.instance }).catch(console.error),
+      ),
+    );
 }
 
 // Armed rather than looping. A looping overlay keeps a CVDisplayLink running

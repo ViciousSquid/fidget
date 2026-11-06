@@ -1780,6 +1780,7 @@ pub(crate) fn run_frame_loop(
             // Assembled once and handed to every Instance. Asking once per
             // Instance would poll the window server N times for one answer.
             let mut world = assembler.assemble(elapsed_ms, cursor_points, Vec::new());
+            let tick_ms = world.elapsed_ms;
 
             // Whole display frames, not the usable ones physics runs in: the
             // reserved strips are the difference between fullscreen and zoomed.
@@ -1892,6 +1893,21 @@ pub(crate) fn run_frame_loop(
                 let Some(instance) = roster.get_mut(&live.id) else {
                     continue;
                 };
+
+                let feet = (live.last_position.x, live.last_position.y);
+                let owner_drew = bubble_owner(feet, &displays.frames)
+                    .is_some_and(|index| platform::overlay_drew(&overlay_label(index), &live.id));
+                let runs = live
+                    .first_draw
+                    .runs(&live.id, elapsed, owner_drew, presence.visible);
+                // Shadowed for the rest of this turn, so every clock below holds
+                // with the Engine while the spawn pose waits for its first draw.
+                let (elapsed, elapsed_ms) = if runs {
+                    (elapsed, elapsed_ms)
+                } else {
+                    (Duration::ZERO, 0)
+                };
+                world.elapsed_ms = if elapsed_ms == 0 { 0 } else { tick_ms };
 
                 if let Some(moment) = turn_plays
                     .get_mut(&live.id)
@@ -4128,6 +4144,7 @@ mod tests {
             traced_last: None,
             status_last: None,
             status_wake_ms: None,
+            first_draw: crate::FirstDraw::Running,
         }
     }
 
