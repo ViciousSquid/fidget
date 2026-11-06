@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fidget_core::character::IdleBeat;
 use fidget_core::director::{self, Context, Happened, Lately, Wake};
 use fidget_core::dispatch::{
     dispatch, DenyList, DispatchContext, FeetAt, InstanceInfo, PlacementQuery,
@@ -854,10 +855,10 @@ pub(crate) fn run_frame_loop(
                         .filter(|_| visible)
                         .and_then(|last| {
                             let art = live.character.draw(
-                                last.animation,
-                                last.animation_ms,
-                                last.variant_draw,
-                                last.facing,
+                                last.frame.art_name(),
+                                last.frame.animation_ms,
+                                last.frame.ring_choice(),
+                                last.frame.facing,
                             )?;
                             Some((
                                 art.mask
@@ -1402,6 +1403,7 @@ pub(crate) fn run_frame_loop(
                 }
                 live.addressed = true;
                 live.happened = Happened::Chat(line.text);
+                live.chat_said = true;
             }
 
             // A `tools/call` from the attached Harness, here because the `Roster` and
@@ -2099,6 +2101,7 @@ pub(crate) fn run_frame_loop(
                 world.proposal = proposal;
                 live.qm = platform::qm_draft(&live.id);
                 world.locomotion_frozen = walk_held(&live.speech, live.qm.as_ref(), Instant::now());
+                world.chat = std::mem::take(&mut live.chat_said);
                 let ending = match session
                     .as_mut()
                     .filter(|session| session.instance == live.id)
@@ -2201,7 +2204,7 @@ pub(crate) fn run_frame_loop(
                 live.last_position = frame.position;
 
                 // Stay Active while moving, a multi-frame animation still
-                // advancing, or idle_ms accruing toward sleep.
+                // advancing, or awake_ms accruing toward sleep.
                 let behavior_playing = frame.playing_behavior.is_some();
                 let needs_active_for_motion =
                     scheduler::mode(&frame, presence.visible, behavior_playing)
@@ -2209,23 +2212,21 @@ pub(crate) fn run_frame_loop(
 
                 let needs_active_for_animation =
                     if let Some(character) = characters.get(instance.character_name()) {
-                        character
-                            .animations
-                            .get(frame.animation)
-                            .is_some_and(|anim| {
-                                anim.looping || {
-                                    let current_frame = anim.frame_at(frame.animation_ms);
-                                    current_frame + 1 < anim.frames.len()
-                                }
-                            })
+                        character.art_still_advancing(
+                            frame.art_name(),
+                            frame.animation_ms,
+                            frame.idle_beat.as_ref(),
+                        )
                     } else {
                         false
                     };
 
-                // idle_ms accrues when Grounded/Perched but not Asleep.
-                // Keep Active while accruing so sleep-after happens on time.
-                let needs_active_for_sleep_accrual =
-                    matches!(frame.state, State::Grounded | State::Perched);
+                // The awake clock and the sleep timer both run on ticks, so a
+                // sprite left alone still reaches sleep and wakes from it.
+                let needs_active_for_sleep_timers = matches!(
+                    frame.state,
+                    State::Grounded | State::Perched | State::Asleep
+                );
 
                 any_moving |= scheduler::moving(&frame);
                 // Windows hears button edges, not motion, so a press that is
@@ -2234,7 +2235,7 @@ pub(crate) fn run_frame_loop(
                 let resolving_press = cfg!(not(unix)) && live.pointer.gesturing();
                 if needs_active_for_motion
                     || needs_active_for_animation
-                    || needs_active_for_sleep_accrual
+                    || needs_active_for_sleep_timers
                     || resolving_press
                 {
                     any_needs_active = true;
@@ -2492,10 +2493,11 @@ pub(crate) fn run_frame_loop(
                 // The Engine names an Animation and how long it has been
                 // playing. Resolve here, not in the webview, so hit-test and
                 // the frame the user sees stay the same one.
+                let art_name = frame.art_name();
                 let Some(drawn) = live.character.draw(
-                    frame.animation,
+                    art_name,
                     frame.animation_ms,
-                    frame.variant_draw,
+                    frame.ring_choice(),
                     frame.facing,
                 ) else {
                     // No drawable Animation, which a validated package cannot
@@ -2525,6 +2527,11 @@ pub(crate) fn run_frame_loop(
                     // Instance last so everything before it stands where it
                     // did when one character was all there was.
                     // scripts/verify-overlay.sh matches this prefix.
+                    let token = match &frame.idle_beat {
+                        Some(IdleBeat::IdleGesture(_)) => "gesture",
+                        Some(IdleBeat::IdleLoop(_)) => "idle",
+                        None => art_name,
+                    };
                     eprintln!(
                         "frame: {} {:?} pos({:.0},{:.0}) sprite({},{}) {}#{} {}",
                         at_ms,
@@ -2533,7 +2540,7 @@ pub(crate) fn run_frame_loop(
                         frame.position.y,
                         sprite.x,
                         sprite.y,
-                        frame.animation,
+                        token,
                         drawn.index,
                         live.id,
                     );
@@ -2547,10 +2554,7 @@ pub(crate) fn run_frame_loop(
                     .hit(&sprite, cursor_at.0, cursor_at.1, drawn.mirrored);
                 live.drawn_last = Some(Drawn {
                     rect: sprite,
-                    animation: frame.animation,
-                    animation_ms: frame.animation_ms,
-                    variant_draw: frame.variant_draw,
-                    facing: frame.facing,
+                    frame: frame.clone(),
                 });
 
                 let owner = bubble_owner((frame.position.x, frame.position.y), &displays.frames);
@@ -3561,7 +3565,8 @@ mod tests {
     use super::*;
     use fidget_core::character::{
         Animation, Behavior, Character, CursorReaction, GravityScale, Primitive,
-        DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, REQUIRED_ANIMATIONS,
+        DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+        DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, REQUIRED_ANIMATIONS,
     };
     use fidget_core::engine::Point;
     use fidget_core::window_source::{Capabilities, WorldGeometry};
@@ -3643,6 +3648,7 @@ mod tests {
                         fps: 8,
                         looping: true,
                         variants: Vec::new(),
+                        variant_of: None,
                         left_strip: None,
                         // core keeps its own default private, and this test
                         // only needs a Behavior something can pick.
@@ -3656,10 +3662,12 @@ mod tests {
             "wave".to_string(),
             Behavior {
                 primitives: vec![Primitive::React],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
         Character {
@@ -3675,6 +3683,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }
@@ -4127,6 +4138,7 @@ mod tests {
             since_proactive: Duration::ZERO,
             previous_idle: Duration::MAX,
             chat_turn: false,
+            chat_said: false,
             happened_last: None,
             since_state: Duration::ZERO,
             last_state: None,

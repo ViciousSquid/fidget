@@ -163,7 +163,7 @@ Only the window server can answer these. Run the app, then confirm:
 5. **Motion is continuous:** Watch it fall. It slides rather than jumps, and does not judder at a window's edge.
 6. **The art is crisp:** On a Retina display the pixels are hard squares, all the same size. Blur means the integer scale or nearest-neighbour filtering was lost.
 7. **It rests on the Dock, not behind it:** Its feet stand on the Dock's top edge. Turn on Dock auto-hiding: within a poll it falls to the bottom of the screen. Turn it off and it is lifted again.
-8. **Declared cadence is honoured:** Give a copy of Black Mage a faster idle `fps`. The idle is visibly faster than at the declared 1.
+8. **Declared cadence is honoured:** Give a copy of Black Mage a faster idle `fps`. The idle is visibly faster than at the declared 2.
 9. **A click makes it react:** Click once without moving. It plays `react` for about half a second, then resumes.
 10. **Press and drag picks it up:** The pressed point stays under the pointer. Release over a window and it lands on that window's top edge.
 11. **A flick throws it:** Release while moving and it leaves on an arc. Hold still before releasing and it drops straight down.
@@ -241,6 +241,9 @@ A Character Package is a directory or `.zip` holding a `character.manifest`, an 
 | `scale` | No | Whole number from 1 to 4: the factor the art is drawn at. | 4 |
 | `gravity` | No | Number from 0.25 to 2: how hard the Character falls, as a multiple of the default. Below 1, falls are slower and Jumps and Throws go higher. | 1 |
 | `facing` | No | `"left"` or `"right"`: the way the Character's frames face as drawn. See [Which way the art faces](#which-way-the-art-faces). | `"right"` |
+| `idle_gesture_every_s` | No | `[min, max]` in seconds, inclusive, each end from 5 to 60. How long the Engine plays an idle loop before one idle-gesture. | `[10, 30]` |
+| `sleep_after_s` | No | `[min, max]` in seconds, inclusive. Untouched Grounded or Perched time before sleep, plus awake Behavior time off its feet. Unscripted air and being held pause it. A Behavior does not reset it. | `[120, 600]` |
+| `sleep_for_s` | No | `[min, max]` in seconds, inclusive. How long sleep lasts before the sprite wakes into an idle loop. | `[300, 600]` |
 | `[frame_facing]` | No | Frame files that face the other way from `facing`. | |
 | `[source]` | No | Where the art came from. See [Declaring where the art came from](#declaring-where-the-art-came-from). | |
 | `[director]` | No | How proactive model calls space themselves. | |
@@ -261,15 +264,15 @@ Every Character supplies these nine: `idle`, `walk`, `fall`, `land`, `sit`, `sle
 | `jump` | A Behavior plays the `jump` Primitive | `fall` |
 | `possessed` | The user possesses the fidget | `react` |
 
-Any other name draws only as a Variant or a Left Strip of one of these.
+Any other name draws only as a Variant, an idle-gesture, or a Left Strip of one of these.
 
 | Key | Required | Value | Default |
 |---|---|---|---|
 | `frames` | Yes | Frame file paths relative to the package root, in play order. 1 to 256 entries. | |
 | `fps` | No | Whole number from 1 to 60. | 8 |
 | `loop` | No | `"forever"` repeats; `"once"` holds the last frame. | `"forever"` |
-| `variant_of` | No | Another Animation's name. Starting that base draws one member of its ring by weight: the base or any of its Variants. | |
-| `weight` | No | Whole number: this Animation's share of its Variant ring. Read only in a ring. | 10 |
+| `variant_of` | No | Another Animation's name, or the category `"idle-gesture"`. `variant_of = "idle"` is a calm loop of the declared `idle` Animation. `variant_of = "idle-gesture"` marks this Animation as an idle-gesture. That is a category, not a Behavior type, and the Animation keeps its own name. Every other ring draws one member until the Animation changes. | |
+| `weight` | No | Whole number: this Animation's share of its ring, loop or gesture. Read only there. | 10 |
 | `left_of` | No | Another Animation's name. This strip draws in place of the base when the sprite travels left. | |
 
 The loader checks each frame against the art:
@@ -277,6 +280,8 @@ The loader checks each frame against the art:
 - Every frame is an 8-bit RGBA PNG in the package, at most 1024 pixels on either side, and every frame of one Animation is the same size.
 - All of a package's distinct frames add up to at most 256 megapixels (256 × 1024 × 1024 pixels). A frame two Animations share counts once.
 - A `variant_of` base is declared, is not itself a Variant, and both it and the variant loop `"forever"`.
+- Idle loops and idle-gestures share the base `idle` frame size. They swap in the middle of a stretch. A walk or talk ring is drawn once and may differ.
+- The Engine's own idle starts on a weighted idle loop at frame 0, waits a seeded gap inside `idle_gesture_every_s`, plays one weighted idle-gesture for a single pass (`frames / fps`), then picks a loop again. Every idle stretch starts on a loop, including after a landing, a talk, a poke, or a perched idle. A Behavior's `idle` Primitive still draws one loop-ring member and loops it, unless the Behavior sets `type = "idle"`.
 - A `left_of` base is declared and is not itself a Left Strip. The strip has as many frames as its base, at the same size, and only one strip faces each base.
 
 Pixels with alpha below 128 do not catch clicks.
@@ -302,14 +307,15 @@ The loader rejects any other value, and a `[frame_facing]` entry naming a frame 
 
 #### Behaviors
 
-A Behavior is a named sequence of Primitives that the Static Director picks by weight, or that a model proposes. A Character composes Behaviors from Primitives and cannot define new ones. Every Character gets a weight-0 Behavior named after each askable Primitive (`jump`, `sit`, `sleep`, `react`, `chase`, `walk`) unless the package already declares that name or already plays that Primitive. `land` and `hold` stay Engine-owned; `talk` and `idle` are not injected (Engine plays talk while Dialogue shows; idle is ambient).
+A Behavior is a named play list that the Static Director picks by weight, or that a model proposes. `play` is either an ordinary sequence of Primitives, or one named idle-gesture Animation that plays one pass — not a mixed list and not more than one Animation. A Character composes Behaviors from those and cannot define new Primitives. Every Character gets a weight-0 Behavior named after each askable Primitive (`jump`, `sit`, `sleep`, `react`, `chase`, `walk`) unless the package already declares that name or already plays that Primitive. `land` and `hold` stay Engine-owned; `talk` and `idle` are not injected (Engine plays talk while Dialogue shows; idle is ambient).
 
 | Key | Required | Value | Default |
 |---|---|---|---|
-| `play` | No | A list of Primitives, played in order. A Behavior with none plays nothing. | `[]` |
-| `then` | No | The name of the Behavior that follows this one. | |
+| `play` | No | Either a list of Primitives in order, or one idle-gesture Animation name that plays one pass. Mixed lists and multi-Animation lists are refused. A Behavior with none plays nothing. | `[]` |
+| `then` | No | The name of the Behavior that follows this one. A Behavior playing an Animation continues its `then` after one pass. When a Primitive chain reaches a Behavior playing an Animation, or one with a different `type`, that Behavior starts after the Primitives finish. | |
 | `weight` | No | Whole number: how likely the Static Director is to pick this Behavior against its siblings. 0 leaves it reachable only through `then` or a model proposal. | 10 |
 | `when` | No | The condition that must hold before the Behavior is picked. | Any time |
+| `type` | No | `"idle"` makes this Behavior's `idle` Primitives use the Engine's idle loops and idle-gestures. | |
 
 The Primitives, and the Animation each plays:
 
@@ -367,13 +373,18 @@ frames = [
 fps = 5
 weight = 20
 
+[animations.idle-listen]
+frames = ["frames/idle-listen-0.png"]
+fps = 8
+variant_of = "idle-gesture"
+
 [animations.idle-blink]
 frames = [
   "frames/idle-blink-0.png",
   # ... frames/idle-blink-1.png to frames/idle-blink-5.png
 ]
 fps = 8
-variant_of = "idle"
+variant_of = "idle-gesture"
 
 [animations.land]
 frames = [
@@ -408,7 +419,7 @@ weight = 40
 when = "idle over 2m"
 ```
 
-Buddy Bot is drawn art at its own size, so it renders `smooth` at scale 1. Its proactive calls keep their first wait, two minutes by default, instead of backing off. `idle` weighs 20 against 10 for each of its three variants (`idle-blink` is one), so a bare idle draws on two turns in five. `land` plays once and holds its last frame into idle. `greet` hands over to `stroll`, and `settle` hands over to `nap`, which ends the chain. Buddy Bot declares no `grab`, so a drag plays its `fall`.
+Buddy Bot is drawn art at its own size, so it renders `smooth` at scale 1. Its proactive calls keep their first wait, two minutes by default, instead of backing off. `idle-blink`, `idle-breathe`, and `idle-listen` are one idle-gesture family, one pass between calm loops. `land` plays once and holds its last frame into idle. `greet` hands over to `stroll`, and `settle` hands over to `nap`, which ends the chain. Buddy Bot declares no `grab`, so a drag plays its `fall`.
 
 #### Declaring where the art came from
 

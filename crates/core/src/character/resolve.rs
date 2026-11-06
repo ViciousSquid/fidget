@@ -82,6 +82,7 @@ pub(super) fn resolve_animations(
                     fps: declaration.fps,
                     looping: declaration.looping,
                     variants: Vec::new(),
+                    variant_of: declaration.variant_of.clone(),
                     left_strip: None,
                     weight: declaration.weight,
                 },
@@ -148,6 +149,17 @@ pub(super) fn check_variants(
         let Some(base) = &animation.variant_of else {
             continue;
         };
+        if base == super::IDLE_GESTURE {
+            // "idle-gesture" is a category. The Animation keeps its own name.
+            if !animation.looping {
+                errors.push(format!(
+                    "animation {name:?} is a variant_of \"idle-gesture\", and must \
+                     loop \"forever\"; its art loops, while the engine schedules one \
+                     pass per idle gesture"
+                ));
+            }
+            continue;
+        }
         match declared.get(base) {
             _ if base == name => errors.push(format!("animation {name:?} is a variant_of itself")),
             None => errors.push(format!(
@@ -238,9 +250,11 @@ fn ensure_default_behaviors(declared: &mut BTreeMap<String, DeclaredBehavior>) -
             name.to_string(),
             DeclaredBehavior {
                 primitives: vec![primitive],
+                animation: None,
                 then: None,
                 weight: 0,
                 trigger: None,
+                idle_type: false,
             },
         );
         added.insert(name.to_string());
@@ -307,14 +321,49 @@ pub(super) fn resolve_behaviors(
                 name,
                 Behavior {
                     primitives: declaration.primitives,
+                    animation: declaration.animation,
                     then: declaration.then,
                     weight: declaration.weight,
                     trigger: declaration.trigger,
                     not_in_manifest,
+                    idle_type: declaration.idle_type,
                 },
             )
         })
         .collect()
+}
+
+/// A Behavior `animation` must name an idle-gesture Animation. A real gesture
+/// mixed with Primitives is refused as mixed; an unknown token is named as invalid.
+pub(super) fn check_play_animations(
+    behaviors: &BTreeMap<String, Behavior>,
+    animations: &BTreeMap<String, Animation>,
+    errors: &mut Vec<String>,
+) {
+    let gestures: Vec<&str> = animations
+        .iter()
+        .filter(|(_, animation)| animation.is_idle_gesture())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    for (name, behavior) in behaviors {
+        let Some(animation) = behavior.animation.as_deref() else {
+            continue;
+        };
+        let mixed = !behavior.primitives.is_empty();
+        let known = gestures.contains(&animation);
+        if mixed && known {
+            errors.push(format!(
+                "play for behavior {name:?} mixes Primitives and idle-gestures; use one or the other"
+            ));
+            continue;
+        }
+        if !known {
+            errors.push(format!(
+                "behavior {name:?} declares {animation:?}, which is not a Primitive or an idle-gesture"
+            ));
+            continue;
+        }
+    }
 }
 
 /// The loop a chain closes, from where it closes, for the author to read.
@@ -583,6 +632,61 @@ mod tests {
                 (budget as u64 + 1) * pixels
             )],
             "the author is told how much art they declared and how much a Character may hold"
+        );
+    }
+
+    /// Idle swaps members in the middle of a stretch, so a different frame
+    /// size would jump the sprite. A walk ring is drawn once and may differ.
+    #[test]
+    fn an_idle_ring_member_must_share_the_base_frame_size() {
+        let mut idle_package = art();
+        idle_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        idle_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.spin]\nframes = [\"wide-0.png\"]\nvariant_of = \"idle\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            errors(load(&idle_package)),
+            vec![
+                "animation \"spin\" frames are 4x4, and its base \"idle\" is 2x2; \
+                 idle loops and idle-gestures share the base frame size"
+                    .to_string()
+            ]
+        );
+
+        let mut walk_package = art();
+        walk_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        walk_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.ballwalk]\nframes = [\"wide-0.png\"]\nvariant_of = \"walk\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        load(&walk_package).expect("a walk ring is drawn once and may differ in size");
+
+        let mut gesture_package = art();
+        gesture_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        gesture_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.groom]\nframes = [\"wide-0.png\"]\nvariant_of = \"idle-gesture\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            errors(load(&gesture_package)),
+            vec![
+                "animation \"groom\" frames are 4x4, and its base \"idle\" is 2x2; \
+                 idle loops and idle-gestures share the base frame size"
+                    .to_string()
+            ]
         );
     }
 

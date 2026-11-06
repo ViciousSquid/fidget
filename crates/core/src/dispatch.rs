@@ -909,7 +909,8 @@ mod tests {
     fn test_character(name: &str) -> crate::character::Character {
         use crate::character::{
             Animation, Behavior, Character, CursorReaction, GravityScale, Primitive,
-            DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, DEFAULT_WEIGHT,
+            DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+            DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, DEFAULT_WEIGHT,
         };
         use std::collections::BTreeMap;
 
@@ -926,6 +927,7 @@ mod tests {
                     fps: 8,
                     looping: true,
                     variants: Vec::new(),
+                    variant_of: None,
                     left_strip: None,
                     weight: DEFAULT_WEIGHT,
                 },
@@ -937,10 +939,12 @@ mod tests {
             "wave".to_string(),
             Behavior {
                 primitives: vec![Primitive::React],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
 
@@ -957,6 +961,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }
@@ -979,6 +986,7 @@ mod tests {
             elapsed_ms: 16,
             proposal: None,
             poll_generation: 0,
+            chat: false,
             composing: false,
             locomotion_frozen: false,
             possession: Default::default(),
@@ -1227,10 +1235,12 @@ mod tests {
             "walk".to_string(),
             Behavior {
                 primitives: vec![Primitive::Walk],
+                animation: None,
                 then: None,
                 weight: 0,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
         let instance_id = roster.spawn(
@@ -1758,6 +1768,7 @@ mod tests {
                 assert!(climbing, "thrown at the wall, it climbs");
             }),
             ("asleep", |roster, id, world| {
+                roster.get_mut(id).unwrap().set_sleep_after_s((1, 1));
                 let a_second = WorldSnapshot {
                     elapsed_ms: 1000,
                     ..world.clone()
@@ -1959,10 +1970,12 @@ mod tests {
             "hop".to_string(),
             Behavior {
                 primitives: vec![Primitive::Jump],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
         let world = test_snapshot();
@@ -2384,10 +2397,12 @@ mod tests {
             "jump".to_string(),
             Behavior {
                 primitives: vec![Primitive::Jump],
+                animation: None,
                 then: None,
                 weight: 0,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
         let instance_id = roster.spawn(

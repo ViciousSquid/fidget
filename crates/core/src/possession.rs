@@ -29,10 +29,21 @@ pub enum Key {
 pub fn digit_behaviors(behaviors: &BTreeMap<String, Behavior>) -> Vec<Vec<&str>> {
     let mut groups: Vec<(Vec<&str>, Vec<&str>)> = Vec::new();
     for (name, behavior) in behaviors {
-        let own = behavior.primitives.as_slice();
         // Idle between moves is the pause in a stroll, which the arrows
-        // already give. Idle alone is not movement.
-        let moves = own.iter().any(Primitive::owned_by_arrows_and_space);
+        // already give. Idle alone is not movement, nor is a Behavior playing
+        // an Animation.
+        if behavior.animation.is_some() {
+            let drawn = vec![behavior.animation.as_deref().unwrap()];
+            match groups.iter_mut().find(|(played, _)| *played == drawn) {
+                Some((_, names)) => names.push(name),
+                None => groups.push((drawn, vec![name])),
+            }
+            continue;
+        }
+        let own = behavior.primitives.as_slice();
+        let moves = own
+            .iter()
+            .any(|primitive| primitive.owned_by_arrows_and_space());
         let only_moves = moves
             && own.iter().all(|primitive| {
                 *primitive == Primitive::Idle || primitive.owned_by_arrows_and_space()
@@ -371,10 +382,12 @@ mod tests {
             .map(|(name, primitives, then)| {
                 let behavior = Behavior {
                     primitives: primitives.to_vec(),
+                    animation: None,
                     then: then.map(str::to_string),
                     weight: 1,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 };
                 (name.to_string(), behavior)
             })

@@ -1,5 +1,5 @@
 # Source rows are documented in DEVELOPMENT.md; importer indices start at zero.
-# All nine source loops are retained: a seated idle with four idle variants.
+# All nine source loops are retained. Seated fidgets are idle-gestures.
 
 name = "Tuxedo Bean"
 render_mode = "smooth"
@@ -40,7 +40,7 @@ frames = [
   "frames/look-around-5.png",
 ]
 fps = 3
-variant_of = "idle"
+variant_of = "idle-gesture"
 weight = 10
 
 [animations.nod-off]
@@ -55,7 +55,7 @@ frames = [
   "frames/nod-off-7.png",
 ]
 fps = 4
-variant_of = "idle"
+variant_of = "idle-gesture"
 weight = 4
 
 [animations.review]
@@ -68,8 +68,8 @@ frames = [
   "frames/review-5.png",
 ]
 fps = 4
-variant_of = "idle"
 weight = 3
+variant_of = "idle-gesture"
 
 [animations.wave]
 frames = [
@@ -79,7 +79,7 @@ frames = [
   "frames/wave-3.png",
 ]
 fps = 4
-variant_of = "idle"
+variant_of = "idle-gesture"
 weight = 3
 
 [animations.walk]
@@ -228,3 +228,23 @@ weight = 0
 "frames/walk-left-5.png" = "left"
 "frames/walk-left-6.png" = "left"
 "frames/walk-left-7.png" = "left"
+
+[behaviors.review]
+play = ["review"]
+weight = 0
+when = "idle over 10s"
+
+[behaviors.look-around]
+play = ["look-around"]
+weight = 0
+when = "idle over 10s"
+
+[behaviors.nod-off]
+play = ["nod-off"]
+weight = 0
+when = "idle over 10s"
+
+[behaviors.hand-wave]
+play = ["wave"]
+weight = 0
+when = "idle over 10s"

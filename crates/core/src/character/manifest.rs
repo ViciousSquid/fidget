@@ -30,6 +30,9 @@ pub(super) struct Declared {
     pub(super) frame_facing: BTreeMap<String, Facing>,
     pub(super) animations: BTreeMap<String, DeclaredAnimation>,
     pub(super) behaviors: BTreeMap<String, DeclaredBehavior>,
+    pub(super) idle_gesture_every_s: Option<(u32, u32)>,
+    pub(super) sleep_after_s: Option<(u32, u32)>,
+    pub(super) sleep_for_s: Option<(u32, u32)>,
 }
 
 pub(super) struct DeclaredAnimation {
@@ -37,7 +40,7 @@ pub(super) struct DeclaredAnimation {
     pub(super) fps: u32,
     pub(super) looping: bool,
     pub(super) variant_of: Option<String>,
-    /// The Animation this one is the left-facing strip of, when the package
+    /// The Animation this one faces left for, when the package
     /// draws its leftward travel rather than letting the renderer mirror it.
     pub(super) left_of: Option<String>,
     /// This Animation's share of its variant ring, against its fellow
@@ -47,9 +50,12 @@ pub(super) struct DeclaredAnimation {
 
 pub(super) struct DeclaredBehavior {
     pub(super) primitives: Vec<Primitive>,
+    pub(super) animation: Option<String>,
     pub(super) then: Option<String>,
     pub(super) weight: u32,
     pub(super) trigger: Option<Trigger>,
+    /// `type = "idle"`. The Behavior's idle Primitives use the Engine's idle machine.
+    pub(super) idle_type: bool,
 }
 
 /// Read the Character Manifest. `None` means it is not TOML at all: one error,
@@ -161,9 +167,41 @@ pub(super) fn parse(manifest: &str, errors: &mut Vec<String>) -> Option<Declared
             "source" => parse_source(item, manifest, &mut declared, errors),
             "director" => parse_director(item, manifest, &mut declared, errors),
             "cursor" => parse_cursor(item, manifest, &mut declared, errors),
+            "idle_gesture_every_s" => match inclusive_pair(item) {
+                Some((min, max)) if in_gesture_gap(min) && in_gesture_gap(max) => {
+                    declared.idle_gesture_every_s = Some((min, max));
+                }
+                Some(_) => errors.push(format!(
+                    "idle_gesture_every_s is {}, and must be [min, max] \
+                     in seconds from 5 to 60",
+                    wrote(manifest, item.span()).unwrap_or("?")
+                )),
+                None => errors.push(format!(
+                    "idle_gesture_every_s is {}, and must be [min, max] \
+                     in seconds from 5 to 60, with min <= max",
+                    wrote(manifest, item.span()).unwrap_or("?")
+                )),
+            },
+            "sleep_after_s" => match inclusive_pair(item) {
+                Some(pair) => declared.sleep_after_s = Some(pair),
+                None => errors.push(format!(
+                    "sleep_after_s is {}, and must be [min, max] \
+                     in seconds with min <= max",
+                    wrote(manifest, item.span()).unwrap_or("?")
+                )),
+            },
+            "sleep_for_s" => match inclusive_pair(item) {
+                Some(pair) => declared.sleep_for_s = Some(pair),
+                None => errors.push(format!(
+                    "sleep_for_s is {}, and must be [min, max] \
+                     in seconds with min <= max",
+                    wrote(manifest, item.span()).unwrap_or("?")
+                )),
+            },
             other => errors.push(format!(
                 "unknown declaration {other:?}; a Character Manifest declares \
                  name, render_mode, scale, gravity, facing, frame_facing, \
+                 idle_gesture_every_s, sleep_after_s, sleep_for_s, \
                  source, animations, behaviors, director and cursor"
             )),
         }
@@ -445,7 +483,8 @@ fn parse_animation(
             },
             other => errors.push(format!(
                 "animation {name:?} declares unknown {other:?}; \
-                 an Animation declares frames, fps, loop, variant_of, left_of and weight"
+                 an Animation declares frames, fps, loop, variant_of, \
+                 left_of and weight"
             )),
         }
     }
@@ -467,6 +506,24 @@ fn parse_animation(
         left_of,
         weight,
     })
+}
+
+/// An idle-gesture gap is 5 to 60 seconds. Shorter reads as twitching.
+/// Longer is a Character that never gestures.
+fn in_gesture_gap(seconds: u32) -> bool {
+    (5..=60).contains(&seconds)
+}
+
+/// `[min, max]`, inclusive. A single number or a reversed pair is the
+/// author's mistake, not a range the Engine can roll.
+fn inclusive_pair(item: &Item) -> Option<(u32, u32)> {
+    let list = item.as_array()?;
+    if list.len() != 2 {
+        return None;
+    }
+    let min = u32::try_from(list.get(0)?.as_integer()?).ok()?;
+    let max = u32::try_from(list.get(1)?.as_integer()?).ok()?;
+    (min <= max).then_some((min, max))
 }
 
 /// An Animation's `frames` list, counted before the names are copied, so a
@@ -531,13 +588,19 @@ fn parse_behavior(
     };
 
     let mut primitives = Vec::new();
+    let mut animation = None;
     let mut then = None;
     let mut weight = DEFAULT_WEIGHT;
     let mut trigger = None;
+    let mut idle_type = false;
 
     for (key, item) in table.iter() {
         match key {
-            "play" => primitives = play_list(name, item, manifest, errors),
+            "play" => {
+                let parsed = play_list(name, item, manifest, errors);
+                primitives = parsed.0;
+                animation = parsed.1;
+            }
             "then" => match item.as_str() {
                 Some(next) if !next.is_empty() => then = Some(next.to_string()),
                 _ => errors.push(format!(
@@ -561,56 +624,79 @@ fn parse_behavior(
                     wrote(manifest, item.span()).unwrap_or("?")
                 )),
             },
+            "type" => match item.as_str() {
+                Some("idle") => idle_type = true,
+                _ => errors.push(format!(
+                    "type for behavior {name:?} is {}, and must be \"idle\"",
+                    wrote(manifest, item.span()).unwrap_or("?")
+                )),
+            },
             other => errors.push(format!(
                 "behavior {name:?} declares unknown {other:?}; \
-                 a Behavior declares play, then, weight and when"
+                 a Behavior declares play, then, weight, when and type"
             )),
         }
     }
 
     Some(DeclaredBehavior {
         primitives,
+        animation,
         then,
         weight,
         trigger,
+        idle_type,
     })
 }
 
-/// A Behavior's `play` list. A word that is not a Primitive is reported and
-/// dropped rather than abandoning the declaration, so the rest is still
-/// checked.
-fn play_list(name: &str, item: &Item, manifest: &str, errors: &mut Vec<String>) -> Vec<Primitive> {
+/// A Behavior's `play` list: either Primitives in order, or one idle-gesture
+/// Animation name. Mixed lists and multiple Animation names are refused; names
+/// are checked against the idle-gesture category once Animations are known.
+fn play_list(
+    name: &str,
+    item: &Item,
+    manifest: &str,
+    errors: &mut Vec<String>,
+) -> (Vec<Primitive>, Option<String>) {
     let Some(list) = item.as_array() else {
         errors.push(format!(
-            "play for behavior {name:?} is {}, and must be a list of \
-             Primitives, as play = [\"react\", \"talk\"]",
+            "play for behavior {name:?} is {}, and must be a list of Primitives or one idle-gesture, as play = [\"react\", \"talk\"]",
             wrote(manifest, item.span()).unwrap_or("?")
         ));
-        return Vec::new();
+        return (Vec::new(), None);
     };
 
     let mut primitives = Vec::new();
+    let mut animations = Vec::new();
     for word in list.iter() {
-        let primitive = word.as_str().and_then(|word| {
-            PRIMITIVES
-                .iter()
-                .find_map(|(known, primitive)| (*known == word).then_some(*primitive))
-        });
-        match primitive {
-            Some(primitive) => primitives.push(primitive),
-            None => errors.push(format!(
-                "behavior {name:?} declares {}, which is not a Primitive; \
-                 the Primitives are {}",
+        let Some(word) = word.as_str() else {
+            errors.push(format!(
+                "behavior {name:?} declares {}, which is not a Primitive or an idle-gesture; the Primitives are {}",
                 wrote(manifest, word.span()).unwrap_or("?"),
                 PRIMITIVES
                     .iter()
                     .map(|(name, _)| *name)
                     .collect::<Vec<_>>()
                     .join(", ")
-            )),
+            ));
+            continue;
+        };
+        match PRIMITIVES
+            .iter()
+            .find_map(|(known, primitive)| (*known == word).then_some(*primitive))
+        {
+            Some(primitive) => primitives.push(primitive),
+            None => animations.push(word.to_string()),
         }
     }
-    primitives
+    if animations.len() > 1 {
+        errors.push(format!(
+            "play for behavior {name:?} names more than one idle-gesture; a Behavior plays one animation"
+        ));
+        return (Vec::new(), None);
+    }
+    // Mixed Primitive + animation-candidate lists reach resolve so an unknown
+    // token can be named, and a real gesture mixed with Primitives refused.
+    (primitives, animations.pop())
 }
 
 /// The line a byte offset falls on, for a syntax error to name.
@@ -741,11 +827,50 @@ mod tests {
         assert_eq!(
             errors,
             vec![
-                "behavior \"greet\" declares \"pounce\", which is not a Primitive; \
-                 the Primitives are idle, walk, land, sit, sleep, react, talk, hold, chase, jump"
+                "behavior \"greet\" declares \"pounce\", which is not a Primitive or an idle-gesture"
                     .to_string()
             ],
-            "the author is told the offending word and what they may write instead"
+            "an unknown token beside Primitives is named, not reported as a mixed play list"
+        );
+    }
+
+    #[test]
+    fn an_invalid_animation_token_is_named_with_readable_whitespace() {
+        let manifest = format!(
+            "{}[behaviors.greet]\nplay = [\"unknown-animation\"]\n",
+            declaring(&REQUIRED_ANIMATIONS)
+        );
+        let errors = errors(load_manifest(&manifest));
+        assert_eq!(
+            errors,
+            vec![
+                "behavior \"greet\" declares \"unknown-animation\", which is not a Primitive or an idle-gesture"
+                    .to_string()
+            ],
+            "{errors:#?}"
+        );
+        assert!(
+            !errors.iter().any(|e| e.contains("  ")),
+            "no embedded runs of spaces: {errors:#?}"
+        );
+    }
+
+    #[test]
+    fn a_real_mixed_primitive_and_gesture_play_list_is_refused() {
+        let manifest = format!(
+            "{}\
+             [animations.grooming]\nframes = [\"idle-0.png\"]\nvariant_of = \"idle-gesture\"\n\
+             [behaviors.odd]\nplay = [\"walk\", \"grooming\"]\n",
+            declaring(&REQUIRED_ANIMATIONS)
+        );
+        let errors = errors(load_manifest(&manifest));
+        assert_eq!(
+            errors,
+            vec![
+                "play for behavior \"odd\" mixes Primitives and idle-gestures; use one or the other"
+                    .to_string()
+            ],
+            "{errors:#?}"
         );
     }
 
@@ -763,6 +888,7 @@ mod tests {
             vec![
                 "unknown declaration \"capability\"; a Character Manifest declares \
                  name, render_mode, scale, gravity, facing, frame_facing, \
+                 idle_gesture_every_s, sleep_after_s, sleep_for_s, \
                  source, animations, behaviors, director and cursor"
                     .to_string()
             ],
@@ -938,19 +1064,18 @@ mod tests {
                 "animation \"wave\" declares unknown \"mirrored\"; an Animation declares \
                  frames, fps, loop, variant_of, left_of and weight"
                     .to_string(),
-                "play for behavior \"chase\" is \"walk\", and must be a list of Primitives, \
-                 as play = [\"react\", \"talk\"]"
+                "play for behavior \"chase\" is \"walk\", and must be a list of Primitives or one idle-gesture, as play = [\"react\", \"talk\"]"
                     .to_string(),
                 "then for behavior \"chase\" is 3, and must name one Behavior, \
                  as then = \"settle\""
                     .to_string(),
-                "behavior \"pounce\" declares 7, which is not a Primitive; the Primitives \
+                "behavior \"pounce\" declares 7, which is not a Primitive or an idle-gesture; the Primitives \
                  are idle, walk, land, sit, sleep, react, talk, hold, chase, jump"
                     .to_string(),
                 "when for behavior \"pounce\" is 6, which is not a condition; a condition \
                  reads \"idle over 2m\", \"idle under 30s\" or \"app Safari\""
                     .to_string(),
-                "behavior \"фыр\" declares [], which is not a Primitive; the Primitives \
+                "behavior \"фыр\" declares [], which is not a Primitive or an idle-gesture; the Primitives \
                  are idle, walk, land, sit, sleep, react, talk, hold, chase, jump"
                     .to_string(),
             ],

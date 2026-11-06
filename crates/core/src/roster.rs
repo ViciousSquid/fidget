@@ -173,6 +173,11 @@ impl Instance {
         self.engine.stand_at(feet);
     }
 
+    /// A short range so a test can reach sleep without waiting minutes.
+    pub fn set_sleep_after_s(&mut self, range: (u32, u32)) {
+        self.engine.set_sleep_after_s(range);
+    }
+
     /// Switch this Instance to another Character without moving it.
     pub fn retarget(&mut self, character: &Character) {
         self.character_name = character.name.clone();
@@ -181,6 +186,7 @@ impl Instance {
             character.near_reaction,
             character.rush_reaction,
         );
+        self.engine.set_idle_plan(character.idle_plan());
     }
 
     /// The name the user gave, which is what the menu and settings print.
@@ -278,7 +284,8 @@ impl Roster {
             .with_gravity_scale(character.gravity_scale)
             // The id is this Instance's one random number, so two characters of
             // one Character do not draw the same idle variants at the same moments.
-            .with_variant_seed(variant_seed(&id));
+            .with_variant_seed(variant_seed(&id))
+            .with_idle_plan(character.idle_plan());
         let name = if self.instances.is_empty() {
             adopted_name(
                 &name,
@@ -409,7 +416,8 @@ mod tests {
     use super::*;
     use crate::character::{
         Animation, Behavior, Character, CursorReaction, GravityScale, Primitive,
-        DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, DEFAULT_WEIGHT,
+        DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+        DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, DEFAULT_WEIGHT,
     };
     use crate::engine::{Point, Rect, Verb};
     use std::collections::BTreeMap;
@@ -429,6 +437,7 @@ mod tests {
                     fps: 8,
                     looping: true,
                     variants: Vec::new(),
+                    variant_of: None,
                     left_strip: None,
                     weight: DEFAULT_WEIGHT,
                 },
@@ -440,20 +449,24 @@ mod tests {
             "wave".to_string(),
             Behavior {
                 primitives: vec![Primitive::React],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
         behaviors.insert(
             "sleep".to_string(),
             Behavior {
                 primitives: vec![Primitive::Sleep],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
                 not_in_manifest: false,
+                idle_type: false,
             },
         );
 
@@ -470,6 +483,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }
@@ -490,6 +506,7 @@ mod tests {
             elapsed_ms: 16,
             proposal: None,
             poll_generation: 0,
+            chat: false,
             composing: false,
             locomotion_frozen: false,
             possession: Default::default(),

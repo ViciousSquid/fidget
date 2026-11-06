@@ -81,7 +81,7 @@ use fidget_core::character::{Character, Primitive};
 use fidget_core::director::{
     app_instructions, happened_cell, Happened, ModelDirector, Pace, Recency, Seeded, StaticDirector,
 };
-use fidget_core::engine::{Cue, Point, SpriteFootprint, State, Verb};
+use fidget_core::engine::{Cue, Frame, Point, SpriteFootprint, State, Verb};
 use fidget_core::input::Pointer;
 use fidget_core::memory;
 use fidget_core::overlay::{display_index_for, SpriteRect};
@@ -399,15 +399,9 @@ struct DirectorRun {
 /// than the one this tick is about to produce.
 struct Drawn {
     rect: SpriteRect,
-    animation: &'static str,
-    animation_ms: u32,
-    /// The variant draw the art was picked with, so the hit-test measures the
-    /// strip the user saw rather than whatever the next draw lands on.
-    variant_draw: u64,
-    /// Which way the sprite was pointed, so the hit-test resolves the strip
-    /// the art was drawn from and mirrors it the same way — this tick's
-    /// facing may already differ.
-    facing: f64,
+    /// The tick's Frame, so the hit-test resolves the art, variant draw,
+    /// beat and facing the user saw. This tick's may already differ.
+    frame: Frame,
 }
 
 /// What the last `engine:` line said about an Instance. Trace prints on
@@ -442,6 +436,9 @@ struct InstanceState {
     /// told when newest-wins throws that answer away (ADR-0016). `Slots` knows
     /// only that a call is out, and the wake clears `happened` as it sends.
     chat_turn: bool,
+    /// A line the user sent this tick. Taken into the Engine's snapshot so a
+    /// chat resets sleep, then cleared. The chat channel is the signal.
+    chat_said: bool,
     /// The `Happened` that drove the last session wake, as `happened_cell`
     /// names it. `None` until one has: nothing has been asked here yet.
     happened_last: Option<&'static str>,
@@ -4576,6 +4573,7 @@ fn spawn_live(
         addressed: false,
         happened: Happened::Proactive,
         chat_turn: false,
+        chat_said: false,
         pointer: Pointer::with_double_click_ms(platform::double_click_interval_ms()),
         spoken: None,
         speech: SpeechBubble::default(),
@@ -4938,6 +4936,7 @@ fn spawn_instances(
             addressed: false,
             happened: Happened::Proactive,
             chat_turn: false,
+            chat_said: false,
             pointer: Pointer::with_double_click_ms(platform::double_click_interval_ms()),
             spoken: None,
             speech: SpeechBubble::default(),
@@ -6372,7 +6371,8 @@ mod tests {
 
     use fidget_core::character::{
         Character, CursorReaction, GravityScale, PackageBytes, CHARACTER_MANIFEST_FILE,
-        DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, REQUIRED_ANIMATIONS,
+        DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+        DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, REQUIRED_ANIMATIONS,
     };
 
     fn stub_character(name: &str) -> Character {
@@ -6389,6 +6389,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }

@@ -1185,10 +1185,12 @@ mod tests {
     fn behavior(weight: u32, trigger: Option<Trigger>) -> Behavior {
         Behavior {
             primitives: vec![Primitive::Idle],
+            animation: None,
             then: None,
             weight,
             trigger,
             not_in_manifest: false,
+            idle_type: false,
         }
     }
 

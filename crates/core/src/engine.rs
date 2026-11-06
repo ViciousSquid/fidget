@@ -5,7 +5,11 @@
 //! what lets every spatial property be tested by constructing snapshots and
 //! asserting frames, with no windowing system, no model and no waiting.
 
-use crate::character::{animation_of, Behavior, CursorReaction, GravityScale, Primitive};
+use crate::character::{
+    animation_of, Behavior, CursorReaction, GravityScale, IdleBeat, IdleMember, IdlePlan,
+    Primitive, RingChoice, DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_SLEEP_AFTER_S,
+    DEFAULT_SLEEP_FOR_S,
+};
 use crate::director::Seeded;
 use crate::overlay::{display_index_for, stands_on};
 use crate::possession::{digit_behaviors, Charge, Intent, Walk};
@@ -202,6 +206,9 @@ pub struct WorldSnapshot {
     /// A speech bubble or the quick-message pill is showing. Walk and chase
     /// stop and none starts; a sprite on its feet draws `talk` meanwhile.
     pub locomotion_frozen: bool,
+    /// The user sent a line to the AI this tick. Not a sixth verb: the Shell
+    /// already hears that line on the chat channel and sets this for one tick.
+    pub chat: bool,
     /// What the keys ask of a possessed sprite this tick. Read only while
     /// possessed; the default asks for nothing.
     pub possession: Intent,
@@ -222,10 +229,13 @@ pub struct Frame {
     /// frame index: `character::Animation::frame_at` maps it via the Manifest.
     pub animation_ms: u32,
 
-    /// The draw that picks which member of the Animation's variant ring shows.
-    /// Held while the Animation plays, redrawn when it changes, so a Behavior
-    /// stepping through `idle` shows one strip instead of swapping costumes.
+    /// The draw that picks a ring member, held for the whole Animation.
+    /// The Engine's own idle does not use it: `idle_beat` names the loop or
+    /// the gesture, and a weighed draw would play a different animation.
     pub variant_draw: u64,
+    /// Set while the Engine plays its own idle. `None` for a Behavior's idle
+    /// and for every other Animation, which still weigh `variant_draw`.
+    pub idle_beat: Option<IdleBeat>,
     /// A line to speak on this frame only. Dialogue is an event, not a state.
     pub dialogue: Option<String>,
 
@@ -239,8 +249,12 @@ pub struct Frame {
     pub playing_behavior: Option<String>,
 
     /// The Primitive on screen. `None` once a chain has run out, even while
-    /// a walk it started carries on under its own velocity.
+    /// a walk it started carries on under its own velocity, and while a
+    /// named idle-gesture step is the one playing.
     pub playing_primitive: Option<Primitive>,
+    /// The idle-gesture a Behavior step is playing, one pass. `None` for a
+    /// Primitive. `draw` uses this name; the Engine's own idle uses `idle_beat`.
+    pub playing_gesture: Option<String>,
     /// Whether this tick carried the sprite with a moving Perch. The Shell
     /// polls the window list at the frame rate only then.
     pub riding: bool,
@@ -272,16 +286,32 @@ pub struct Frame {
     pub possessed: bool,
 }
 
+impl Frame {
+    /// Animation name `Character::draw` should resolve: the Animation a Behavior
+    /// is playing, otherwise the Engine's animation token.
+    pub fn art_name(&self) -> &str {
+        self.playing_gesture.as_deref().unwrap_or(self.animation)
+    }
+
+    /// What `Character::draw` should weigh this frame with. A Behavior names
+    /// one Animation: the family base's name is also the ring, and weighing it
+    /// would play a sibling.
+    pub fn ring_choice(&self) -> RingChoice<'_> {
+        if let Some(name) = self.playing_gesture.as_deref() {
+            return RingChoice::Named(name);
+        }
+        RingChoice::from_beat(self.idle_beat.as_ref(), self.variant_draw)
+    }
+}
+
 /// How long one Primitive holds the screen.
 ///
-/// ponytail: one duration for every Primitive of every Character. The Engine
-/// deliberately does not know an Animation's length — fps and loop mode are the
-/// Character Manifest's — so it cannot play a Primitive until the art runs out.
-/// Art shorter than the turn costs nothing: `loop = once` holds its last frame
-/// for the remainder, which is what a brief startle looks like. Longer art is
-/// the ceiling, and Blip already sits on it — sleep's `fps = 1` over
-/// two frames is a 2000ms strip the sprite leaves at frame 0. Give a Primitive
-/// its own duration when a Character's art needs to outlast this one.
+/// ponytail: one duration for every Primitive of every Character. A Primitive
+/// is not timed to its art — fps and loop stay the manifest's — so it cannot
+/// play until the art runs out. The Engine's own idle is the exception: it
+/// plays one pass of the member it picked, then rests. Art shorter than the
+/// turn holds its last frame. Longer art is the ceiling; give a Primitive its
+/// own duration when a Character's art needs to outlast this one.
 const PRIMITIVE_MS: u32 = 600;
 
 /// How long a poked sprite stands still after reacting. `PRIMITIVE_MS` is the
@@ -289,14 +319,14 @@ const PRIMITIVE_MS: u32 = 600;
 /// a click ever feeling like a freeze.
 const POKE_COOLDOWN_MS: u32 = 2_500;
 
-/// How long a resting, untouched sprite waits before it goes to sleep. A tuning
-/// knob: long enough not to nod off mid-chat, short enough that a sprite
-/// on an unattended desktop settles down.
-const SLEEP_AFTER_MS: u32 = 60_000;
+/// How long the cursor rests inside the dwell radius before that counts as
+/// the user staying, and resets sleep. Longer than `DWELL_MS`, which only
+/// addresses the Director.
+const SLEEP_DWELL_MS: u32 = 10_000;
 
 /// How long a sprite rests on a Perch before leaving sit and idling in place.
 /// Long enough to read as settling, short of nodding off. It bounds how much of
-/// a long idle strip a perched sprite plays before the next wake.
+/// a long idle animation a perched sprite plays before the next wake.
 const PERCHED_IDLE_AFTER_MS: u32 = 4_000;
 
 /// Points per second the sprite hauls itself up a screen edge. A tuning knob.
@@ -378,8 +408,8 @@ pub struct Engine {
     position: Point,
     velocity: Point,
     state: State,
-    /// Milliseconds the sprite has spent on its feet, untouched.
-    idle_ms: u32,
+    /// Untouched milliseconds on its feet or playing an awake Behavior.
+    awake_ms: u32,
     /// Milliseconds the sprite has been quietly resting while Perched: not
     /// riding, not walking, no Primitive playing.
     perched_rest_ms: u32,
@@ -387,11 +417,31 @@ pub struct Engine {
 
     animation_ms: u32,
 
-    /// The draw the renderer weighs against the variant ring, and its source.
-    /// The Engine knows when an Animation starts, not the art; which strip the
-    /// number lands on is the Character's.
+    /// The draw the renderer weighs against a ring other than the Engine's
+    /// own idle. Idle names its member on `idle_beat` instead of reweighing.
     variant_draw: u64,
     variants: Seeded,
+    /// Calm loops in draw order: base `idle`, then `variant_of` it.
+    idle_loops: Vec<IdleMember>,
+    /// Idle-gestures in name order. Empty stays on the loop and rolls no gap.
+    idle_gestures: Vec<IdleMember>,
+    /// Inclusive seconds. Rolled into milliseconds when a loop starts.
+    idle_gesture_every_s: (u32, u32),
+    /// Inclusive seconds before sleep, and asleep. Rolled per stretch.
+    sleep_after_s: (u32, u32),
+    sleep_for_s: (u32, u32),
+    /// The rolled awake limit for this stretch. `None` until the first check.
+    sleep_after_ms: Option<u32>,
+    /// Milliseconds of sleep left. Rolled when the sprite nods off.
+    asleep_left_ms: u32,
+    own_idle: OwnIdle,
+    /// A proposal that arrived during an idle-gesture. Applied when the pass
+    /// ends. A user interaction clears it.
+    deferred: Option<BehaviorProposal>,
+    /// Set when a deferred proposal starts at the end of a gesture, so this
+    /// frame can name it. Taken on the way out of `tick`.
+    latched_behavior: Option<String>,
+    latched_refusal: Option<String>,
     /// The Behaviors the Character declares, which a proposal names.
     behaviors: BTreeMap<String, Behavior>,
 
@@ -411,9 +461,13 @@ pub struct Engine {
     /// State would mean deciding what it resumes as.
     playing: Vec<Primitive>,
 
-    /// The name of the Behavior `playing` was flattened from. `chain` merges
-    /// linked Behaviors and two Characters may share Primitives, so the list
-    /// cannot name it. Cleared with `playing` so the pair is never half true.
+    /// One pass of a named idle-gesture animation from a starring Behavior.
+    /// Mutually exclusive with a non-empty `playing` list.
+    playing_animation: Option<String>,
+
+    /// The name of the Behavior `playing` / `playing_animation` came from. `walk`
+    /// merges linked Behaviors and two Characters may share Primitives, so the
+    /// list cannot name it. Cleared with them so the pair is never half true.
     playing_behavior: Option<String>,
 
     primitive_ms: u32,
@@ -680,6 +734,46 @@ fn row_clears(xs: &[f64], spans: &[f64], stayers: &[(f64, f64)]) -> bool {
     })
 }
 
+/// Where the Engine's own idle is. `Off` for a Behavior's ordinary idle and
+/// for every other Animation.
+#[derive(Clone)]
+enum OwnIdle {
+    Off,
+    Loop { name: String, gap_left_ms: u32 },
+    Gesture { name: String, pass_ms: u32 },
+}
+
+impl OwnIdle {
+    fn beat(&self) -> Option<IdleBeat> {
+        match self {
+            OwnIdle::Off => None,
+            OwnIdle::Loop { name, .. } => Some(IdleBeat::IdleLoop(name.clone())),
+            OwnIdle::Gesture { name, .. } => Some(IdleBeat::IdleGesture(name.clone())),
+        }
+    }
+
+    fn is_on(&self) -> bool {
+        !matches!(self, OwnIdle::Off)
+    }
+}
+
+/// What `take_proposal` did with one proposal.
+enum Taken {
+    Started(String),
+    Refused(String),
+    Talk,
+    Ignored,
+}
+
+/// The first millisecond at which a looping animation would wrap. The gesture
+/// ends there, so the drawn frame stays inside the one pass.
+fn one_pass_ms(frames: u32, fps: u32) -> u32 {
+    if frames == 0 || fps == 0 {
+        return 1;
+    }
+    frames.saturating_mul(1000).saturating_add(fps - 1) / fps
+}
+
 impl Engine {
     /// A sprite placed at `position`, falling until the world says otherwise.
     pub fn new(position: Point) -> Self {
@@ -687,18 +781,30 @@ impl Engine {
             position,
             velocity: Point::default(),
             state: State::Falling,
-            idle_ms: 0,
+            awake_ms: 0,
             perched_rest_ms: 0,
             animation: animation_for(State::Falling),
             animation_ms: 0,
             variant_draw: 0,
             variants: Seeded::new(0),
+            idle_loops: Vec::new(),
+            idle_gestures: Vec::new(),
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+            sleep_after_ms: None,
+            asleep_left_ms: 0,
+            own_idle: OwnIdle::Off,
+            deferred: None,
+            latched_behavior: None,
+            latched_refusal: None,
             behaviors: BTreeMap::new(),
             sprite_height: None,
             gravity: GRAVITY,
             previous_windows: Vec::new(),
             previous_position: position,
             playing: Vec::new(),
+            playing_animation: None,
             playing_behavior: None,
             primitive_ms: 0,
             facing: 1.0,
@@ -779,6 +885,286 @@ impl Engine {
         self.variants = Seeded::new(seed);
         self.variant_draw = self.variants.draw();
         self
+    }
+
+    /// Loops, idle-gestures, and the gap range. A retarget drops the beat,
+    /// because the previous member may not exist on the new art.
+    pub fn with_idle_plan(mut self, plan: IdlePlan) -> Self {
+        self.set_idle_plan(plan);
+        self
+    }
+
+    /// Replace the idle loops, gestures, and timing ranges; drops the beat.
+    pub fn set_idle_plan(&mut self, plan: IdlePlan) {
+        self.idle_gesture_every_s = plan.idle_gesture_every_s;
+        self.sleep_after_s = plan.sleep_after_s;
+        self.sleep_for_s = plan.sleep_for_s;
+        self.sleep_after_ms = None;
+        self.idle_loops = plan.loops;
+        self.idle_gestures = plan.gestures;
+        self.own_idle = OwnIdle::Off;
+        self.deferred = None;
+    }
+
+    /// A test gap shorter than the loader's 5 second floor. The manifest
+    /// cannot say it. Clears the beat so the next idle rolls this range.
+    pub fn with_idle_gesture_every_s(mut self, range: (u32, u32)) -> Self {
+        self.idle_gesture_every_s = range;
+        self.own_idle = OwnIdle::Off;
+        self
+    }
+
+    /// A short range keeps a test from waiting minutes. Clears the rolled limit.
+    pub fn with_sleep_after_s(mut self, range: (u32, u32)) -> Self {
+        self.set_sleep_after_s(range);
+        self
+    }
+
+    /// Inclusive seconds of quiet rest before sleep; clears the rolled limit.
+    pub fn set_sleep_after_s(&mut self, range: (u32, u32)) {
+        self.sleep_after_s = range;
+        self.sleep_after_ms = None;
+        // The accrued stretch belonged to the previous range.
+        self.awake_ms = 0;
+    }
+
+    /// Builder for the inclusive seconds a sleep lasts once it starts.
+    pub fn with_sleep_for_s(mut self, range: (u32, u32)) -> Self {
+        self.set_sleep_for_s(range);
+        self
+    }
+
+    /// Inclusive seconds a sleep lasts once the sprite has nodded off.
+    pub fn set_sleep_for_s(&mut self, range: (u32, u32)) {
+        self.sleep_for_s = range;
+    }
+
+    /// Inclusive seconds, as milliseconds. A fixed `[n, n]` is exactly `n`.
+    fn roll_seconds(&mut self, range: (u32, u32)) -> u32 {
+        let (min, max) = range;
+        let max = max.max(min);
+        let span = u64::from(max - min);
+        let seconds = if span == 0 {
+            min
+        } else {
+            min + (self.variants.draw() % (span + 1)) as u32
+        };
+        seconds.saturating_mul(1000)
+    }
+
+    /// The rolled awake limit for this stretch.
+    fn sleep_limit_ms(&mut self) -> u32 {
+        if let Some(limit) = self.sleep_after_ms {
+            return limit;
+        }
+        let limit = self.roll_seconds(self.sleep_after_s);
+        self.sleep_after_ms = Some(limit);
+        limit
+    }
+
+    /// True when this tick finishes the sleep the sprite is already in.
+    fn count_sleep(&mut self, elapsed: u32) -> bool {
+        if self.state != State::Asleep {
+            return false;
+        }
+        self.asleep_left_ms = self.asleep_left_ms.saturating_sub(elapsed);
+        self.asleep_left_ms == 0
+    }
+
+    /// The cursor has stayed inside the dwell radius long enough to count as
+    /// the user remaining, which is past the Director's 400ms dwell.
+    fn long_dwell(&self, snapshot: &WorldSnapshot) -> bool {
+        if self.possessed {
+            return false;
+        }
+        let distance =
+            (snapshot.cursor.x - self.position.x).hypot(snapshot.cursor.y - self.position.y);
+        distance < DWELL_RADIUS
+            && self.cursor_dwell_ms.saturating_add(snapshot.elapsed_ms) >= SLEEP_DWELL_MS
+    }
+
+    /// A poke, drag, grab, summon, chat line, possession, or a long dwell.
+    /// A proposal, a Behavior, and a menu do not.
+    fn resets_sleep(&self, snapshot: &WorldSnapshot, long_dwell: bool) -> bool {
+        long_dwell
+            || snapshot.chat
+            || self.possessed
+            || snapshot.verbs.iter().any(|verb| {
+                matches!(
+                    verb,
+                    Verb::Poke | Verb::Grab | Verb::Summon | Verb::Throw { .. }
+                )
+            })
+    }
+
+    /// The awake clock has run out, the sprite is still, and nothing is left
+    /// to finish: no Behavior on screen and no idle-gesture pass.
+    fn ready_to_sleep(&mut self) -> bool {
+        if self.velocity.x != 0.0 || !self.playing.is_empty() {
+            return false;
+        }
+        if self.gesture_mid_pass() {
+            return false;
+        }
+        if !matches!(self.state, State::Grounded | State::Perched) {
+            return false;
+        }
+        self.awake_ms >= self.sleep_limit_ms()
+    }
+
+    /// Index into `weights`. An empty list is nothing to pick. A list whose
+    /// weights sum to zero keeps the first member and does not draw, so an
+    /// idle with no declared weight still has a loop.
+    fn pick_weighted(&mut self, weights: &[u32]) -> Option<usize> {
+        if weights.is_empty() {
+            return None;
+        }
+        self.variants.pick_index(weights).or(Some(0))
+    }
+
+    fn begin_loop(&mut self) {
+        let weights: Vec<u32> = self.idle_loops.iter().map(|member| member.weight).collect();
+        let name = self
+            .pick_weighted(&weights)
+            .and_then(|index| self.idle_loops.get(index))
+            .map(|member| member.name.clone())
+            .unwrap_or_else(|| "idle".to_string());
+        // No gestures: stay on the loop. Rolling an empty gap would burn the seed.
+        let gap_left_ms = if self.idle_gestures.is_empty() {
+            0
+        } else {
+            self.roll_seconds(self.idle_gesture_every_s)
+        };
+        self.animation_ms = 0;
+        self.own_idle = OwnIdle::Loop { name, gap_left_ms };
+    }
+
+    /// The next weighted idle-gesture, from its first frame. False when none
+    /// can be picked, in which case the loop stays up.
+    fn begin_gesture(&mut self) -> bool {
+        let weights: Vec<u32> = self
+            .idle_gestures
+            .iter()
+            .map(|member| member.weight)
+            .collect();
+        let Some(index) = self.pick_weighted(&weights) else {
+            return false;
+        };
+        let Some(member) = self.idle_gestures.get(index) else {
+            return false;
+        };
+        let name = member.name.clone();
+        let pass_ms = one_pass_ms(member.frames, member.fps);
+        self.animation_ms = 0;
+        self.own_idle = OwnIdle::Gesture { name, pass_ms };
+        true
+    }
+
+    /// The gesture pass ended. A deferred proposal plays instead of the next
+    /// loop. True when that proposal took the screen, so leftover time is not
+    /// fed into a loop that is not on screen.
+    fn finish_gesture(&mut self) -> bool {
+        self.own_idle = OwnIdle::Off;
+        if self.apply_deferred() {
+            return true;
+        }
+        self.begin_loop();
+        false
+    }
+
+    /// Start a proposal held through a mid-pass. True when it took the screen.
+    fn apply_deferred(&mut self) -> bool {
+        let Some(proposal) = self.deferred.take() else {
+            return false;
+        };
+        match self.take_proposal(&proposal) {
+            Taken::Started(name) => {
+                self.latched_behavior = Some(name);
+                self.animation_ms = 0;
+                true
+            }
+            Taken::Talk => {
+                self.animation_ms = 0;
+                true
+            }
+            Taken::Refused(name) => {
+                self.latched_refusal = Some(name);
+                false
+            }
+            Taken::Ignored => false,
+        }
+    }
+
+    /// Shared completed-pass boundary: deferred Director proposal first, else
+    /// a `then` that `walk` could not flatten. True when something new started.
+    fn complete_pass(&mut self, finished: Option<String>) -> bool {
+        if self.apply_deferred() {
+            return true;
+        }
+        if let Some(name) = finished {
+            if let Some((_, Some(next))) = self.walk(&name) {
+                if self.start_behavior(&next) == Some(true) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Carry `dt` through the loop's gap and one gesture pass. A tick longer
+    /// than one beat lands in the beat it reached.
+    fn advance_own_idle(&mut self, mut dt: u32) {
+        loop {
+            match self.own_idle.clone() {
+                OwnIdle::Off => self.begin_loop(),
+                OwnIdle::Loop { name, gap_left_ms } => {
+                    if self.idle_gestures.is_empty() {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Loop { name, gap_left_ms };
+                        return;
+                    }
+                    if dt < gap_left_ms {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Loop {
+                            name,
+                            gap_left_ms: gap_left_ms - dt,
+                        };
+                        return;
+                    }
+                    dt -= gap_left_ms;
+                    if !self.begin_gesture() {
+                        self.animation_ms = self.animation_ms.saturating_add(gap_left_ms);
+                        self.own_idle = OwnIdle::Loop {
+                            name,
+                            gap_left_ms: 0,
+                        };
+                        return;
+                    }
+                    if dt == 0 {
+                        return;
+                    }
+                }
+                OwnIdle::Gesture { name, pass_ms } => {
+                    let left = pass_ms.saturating_sub(self.animation_ms);
+                    if left == 0 {
+                        if self.finish_gesture() || dt == 0 {
+                            return;
+                        }
+                        continue;
+                    }
+                    if dt < left {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Gesture { name, pass_ms };
+                        return;
+                    }
+                    dt -= left;
+                    self.animation_ms = pass_ms;
+                    if self.finish_gesture() || dt == 0 {
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     /// The Character's cursor reactions.
@@ -897,7 +1283,10 @@ impl Engine {
         self.state = State::Grounded;
         self.animation = animation_for(State::Grounded);
         self.animation_ms = 0;
-        self.idle_ms = 0;
+        self.own_idle = OwnIdle::Off;
+        self.deferred = None;
+        self.awake_ms = 0;
+        self.sleep_after_ms = None;
         self.perched_rest_ms = 0;
         self.stop_playing();
         self.end_move(self.state);
@@ -928,19 +1317,19 @@ impl Engine {
         let dt = f64::from(snapshot.elapsed_ms) / 1000.0;
         self.feet_held = snapshot.composing || snapshot.locomotion_frozen;
 
-        // Idling is resting untouched. Time spent in the air or in someone's
-        // hand does not count towards nodding off, nor does being possessed.
-        if self.possessed {
-            self.idle_ms = 0;
-        } else if snapshot.verbs.is_empty() {
-            self.idle_ms = match self.state {
-                State::Grounded | State::Perched | State::Asleep => {
-                    self.idle_ms.saturating_add(snapshot.elapsed_ms)
-                }
-                _ => 0,
-            };
-        } else {
-            self.idle_ms = 0;
+        // A Behavior counts as awake time even off its feet. Unscripted air
+        // and a hand pause the clock. A user interaction or timed wake
+        // starts the awake time over.
+        let long_dwell = self.long_dwell(snapshot);
+        let timed_wake = self.count_sleep(snapshot.elapsed_ms);
+        if self.resets_sleep(snapshot, long_dwell) || timed_wake {
+            self.awake_ms = 0;
+            self.sleep_after_ms = None;
+        } else if matches!(self.state, State::Grounded | State::Perched)
+            || (self.playing_behavior.is_some()
+                && !matches!(self.state, State::Asleep | State::Dragged))
+        {
+            self.awake_ms = self.awake_ms.saturating_add(snapshot.elapsed_ms);
         }
 
         let quietly_resting_perched = matches!(self.state, State::Perched)
@@ -952,13 +1341,6 @@ impl Engine {
             self.perched_rest_ms = self.perched_rest_ms.saturating_add(snapshot.elapsed_ms);
         } else {
             self.perched_rest_ms = 0;
-        }
-
-        // A proposal holds off sleep but wakes nobody; only a verb does. Reset
-        // here, before the Behavior plays at tick's end, or a sprite nodding
-        // off first is asleep at the gate. Under DND a proposal does not count.
-        if snapshot.proposal.is_some() && !self.do_not_disturb {
-            self.idle_ms = 0;
         }
 
         // Chase times out on wall time, not Primitive turns, so the clock
@@ -974,8 +1356,8 @@ impl Engine {
 
         // `woke` marks a sprite a verb roused, so the footing it is put back
         // on is not mistaken for one it arrived at. See the landing below.
-        let (state, woke, dragged) =
-            transition::on_verbs(self.state, &snapshot.verbs, self.possessed);
+        let wake = timed_wake || self.resets_sleep(snapshot, long_dwell);
+        let (state, woke, dragged) = transition::on_verbs(self.state, &snapshot.verbs, wake);
 
         // A grab or a release ends the cooldown, or it would refuse the first
         // walk after landing. A fall the world causes clears it a tick late, at
@@ -1137,11 +1519,10 @@ impl Engine {
 
         let contact = self.integrate(state, dt, snapshot);
 
-        // Still moving is still awake. A walk proposed just before the timer
-        // comes due would otherwise leave the sprite gliding along the edge
-        // playing `sleep`.
-        let rested = self.idle_ms >= SLEEP_AFTER_MS && self.velocity.x == 0.0;
-        self.state = transition::on_contact(state, contact, rested);
+        // Sleep waits until after a proposal: one that starts this tick is a
+        // Behavior to finish, not a pose to cut. Physics settles the footing
+        // first, with `rested` false.
+        self.state = transition::on_contact(state, contact, false);
         self.steering = self.possessed
             && self.state == State::Falling
             && (self.steering || matches!(state, State::Grounded | State::Perched));
@@ -1240,13 +1621,15 @@ impl Engine {
         }
 
         // Riding is an event the Director cannot propose in time, the same
-        // as landing. Holding on is not resting, so an Asleep sprite that
-        // has to ride wakes rather than sleeping through the move.
+        // as landing. An awake sprite holds on. An Asleep sprite stays
+        // asleep: window motion is not a user wake, so the sleep
+        // countdown keeps running while the perch carries it.
         if self.riding {
-            self.idle_ms = 0;
-            self.state = State::Perched;
-            if self.on_screen() != Some(Primitive::Hold) {
-                started |= self.play(&[Primitive::Hold]);
+            if self.state != State::Asleep {
+                self.state = State::Perched;
+                if self.on_screen() != Some(Primitive::Hold) {
+                    started |= self.play(&[Primitive::Hold]);
+                }
             }
         } else if self.on_screen() == Some(Primitive::Hold) {
             self.stop_playing();
@@ -1263,34 +1646,27 @@ impl Engine {
         // Possessed, the user is the one deciding. The Speech still shows: the
         // Frame carries the proposal's dialogue whatever happens here.
         if let Some(proposal) = &snapshot.proposal {
-            if !self.do_not_disturb && !self.possessed {
-                match self.start_behavior(&proposal.behavior) {
-                    Some(true) => {
+            if self.state == State::Asleep {
+                // Asleep is a full stop. A declared name is a refusal the
+                // trace can show; an unknown name was already traced at parse.
+                if !proposal.behavior.is_empty() && self.behaviors.contains_key(&proposal.behavior)
+                {
+                    refused = Some(proposal.behavior.clone());
+                }
+            } else if self.gesture_mid_pass() && !self.do_not_disturb && !self.possessed {
+                // One slot. A later proposal in the same pass replaces it.
+                // Covers both the Engine's own-idle gesture and a Behavior
+                // animation mid-pass.
+                self.deferred = Some(proposal.clone());
+            } else if !self.do_not_disturb && !self.possessed {
+                match self.take_proposal(proposal) {
+                    Taken::Started(name) => {
                         started = true;
-                        // The walk's velocity was read before this proposal
-                        // arrived, so the heading has to land now or the next
-                        // tick walks the way the sprite last faced.
-                        if let Some(direction) = proposal.direction {
-                            if self
-                                .chain(&proposal.behavior)
-                                .is_some_and(|primitives| primitives.contains(&Primitive::Walk))
-                            {
-                                self.facing = direction.facing();
-                            }
-                        }
-                        behavior = Some(proposal.behavior.clone());
+                        behavior = Some(name);
                     }
-                    // Mid-cooldown, `play` refuses a moving chain whole,
-                    // greeting included. A lone line or gesture plays. After
-                    // the cooldown the Director calls afresh; nothing resumes.
-                    Some(false) => refused = Some(proposal.behavior.clone()),
-                    None if proposal.behavior.is_empty()
-                        && proposal.dialogue.is_some()
-                        && self.play(&[Primitive::Talk]) =>
-                    {
-                        started = true;
-                    }
-                    None => {}
+                    Taken::Refused(name) => refused = Some(name),
+                    Taken::Talk => started = true,
+                    Taken::Ignored => {}
                 }
             }
         }
@@ -1301,8 +1677,13 @@ impl Engine {
         if self.possessed {
             if let Some(name) = self.behavior_for_digit(snapshot.possession.play) {
                 // The Behavior alone: a digit leaves its `then` off.
-                let primitives = self.behaviors[&name].primitives.clone();
-                if self.play(&primitives) {
+                let behavior_ref = &self.behaviors[&name];
+                let started_digit = if let Some(animation) = behavior_ref.animation.clone() {
+                    self.play_animation(&animation)
+                } else {
+                    self.play(&behavior_ref.primitives.clone())
+                };
+                if started_digit {
                     self.playing_behavior = Some(name.clone());
                     started = true;
                     digit_started = true;
@@ -1320,13 +1701,12 @@ impl Engine {
             let playable = self
                 .moment_queue
                 .iter()
-                .position(|moment| self.permitted(&[moment.primitive()]));
+                .position(|moment| self.permitted_primitive(moment.primitive()));
             if let Some(index) = playable {
                 self.moment_queue.drain(0..index);
                 if let Some(moment) = self.moment_queue.pop_front() {
                     if self.play(&[moment.primitive()]) {
                         started = true;
-                        self.idle_ms = 0;
                     } else {
                         self.moment_queue.push_front(moment);
                     }
@@ -1378,52 +1758,73 @@ impl Engine {
             .or_else(|| self.possession_cue.take());
         self.menu_held = menu_now;
 
+        // Nothing left on screen, and the awake clock has run out. An
+        // idle-gesture still in its pass waits until the pass ends.
+        let was_asleep = self.state == State::Asleep;
+        if self.ready_to_sleep() {
+            self.state = State::Asleep;
+        }
+        if self.state == State::Asleep && !was_asleep {
+            self.asleep_left_ms = self.roll_seconds(self.sleep_for_s);
+        }
+
         // A Behavior is drawn over whatever the sprite is doing, so a Poke
         // shows even mid-fall. It changes nothing about where the sprite is.
-        let animation = match self.on_screen() {
-            // A possessed walk is the user's stride: it shows over a landing or a
-            // startle rather than sliding under them.
-            _ if self.possessed && self.is_walking() => "walk",
-            // So does a move's, over a line or a startle.
-            _ if self.feet_owned() && self.is_walking() => "walk",
-            Some(primitive) => animation_of(primitive),
-            // A walk outlasts the Primitive that starts it: the velocity holds
-            // until the sprite runs out of Perch, so the Animation has to hold
-            // with it rather than dropping back to standing mid-stride.
-            None if self.is_walking() => "walk",
-            // The bubble is the sprite speaking, so its feet held, it says so.
-            None if snapshot.locomotion_frozen
-                && matches!(self.state, State::Grounded | State::Perched) =>
-            {
-                "talk"
+        // Advance the idle machine before the family is published: a gesture
+        // that ends this tick may start the proposal it was holding.
+        let was_own = self.own_idle.is_on();
+        if self.animation_name(snapshot) == "idle" && self.uses_own_idle() {
+            if !was_own {
+                self.begin_loop();
             }
-            // A sprite that rests quietly on a Perch idles in place: still
-            // Perched, same edge, idle art and idle life.
-            None if matches!(self.state, State::Perched)
-                && self.perched_rest_ms >= PERCHED_IDLE_AFTER_MS =>
-            {
-                "idle"
-            }
-            None => animation_for(self.state),
-        };
-        // A fresh variant draw on the Animation, not on the Primitive: `idle`
-        // and a variant of `idle` are one family, and re-drawing every turn of
-        // a 600ms Primitive would flicker between strips mid-Behavior.
+            self.advance_own_idle(snapshot.elapsed_ms);
+        }
+        if let Some(name) = self.latched_behavior.take() {
+            behavior = Some(name);
+            started = true;
+        }
+        if let Some(name) = self.latched_refusal.take() {
+            refused = Some(name);
+        }
+
+        let animation = self.animation_name(snapshot);
+        // One draw per family, not per Primitive turn, or a 600ms Idle would
+        // flicker animations. The Engine's own idle names its member on the beat.
+        let engine_idle = animation == "idle" && self.uses_own_idle();
+        let behavior_idle =
+            animation == "idle" && self.on_screen() == Some(Primitive::Idle) && !self.idle_typed();
         let new_family = animation != self.animation;
         if new_family {
             self.animation = animation;
+            if !engine_idle {
+                self.variant_draw = self.variants.draw();
+            }
+        } else if behavior_idle && was_own {
+            // The machine may be mid-gesture. The Behavior draws once here,
+            // from the loop member's first frame.
             self.variant_draw = self.variants.draw();
+            self.animation_ms = 0;
         }
 
         // `react` is `loop = once`, so a second Poke restarts its clock or
         // shows nothing. `land` re-enters by a fall, a change of name. The rest
-        // keep their clock, or each turn draws only the strip's first 600ms.
+        // keep their clock, or each turn draws only the animation's first 600ms.
         let startled = self.on_screen() == Some(Primitive::React);
         // A paused climb holds one pose rather than climbing in place.
-        if new_family || (started && startled) {
+        // A gesture step starts at its first frame, then the clock runs.
+        if self.playing_gesture().is_some() && started {
+            self.leave_own_idle();
+            self.animation_ms = 0;
+        } else if engine_idle {
+            // `advance_own_idle` already moved `animation_ms`.
+        } else if new_family || (started && startled) {
+            self.leave_own_idle();
             self.animation_ms = 0;
         } else if !(self.climb_paused() && animation == "climb") {
+            self.leave_own_idle();
             self.animation_ms = self.animation_ms.saturating_add(snapshot.elapsed_ms);
+        } else {
+            self.leave_own_idle();
         }
 
         self.previous_windows.clone_from(&snapshot.windows);
@@ -1441,6 +1842,7 @@ impl Engine {
             self.hold_offset_x = 0.0;
         }
 
+        let playing_gesture = self.playing_gesture().map(str::to_string);
         Frame {
             position: self.position,
             velocity: self.velocity,
@@ -1448,6 +1850,7 @@ impl Engine {
             animation: self.animation,
             animation_ms: self.animation_ms,
             variant_draw: self.variant_draw,
+            idle_beat: self.own_idle.beat(),
             dialogue: snapshot
                 .proposal
                 .as_ref()
@@ -1455,6 +1858,7 @@ impl Engine {
             behavior,
             playing_behavior: self.playing_behavior.clone(),
             playing_primitive: self.on_screen(),
+            playing_gesture,
             riding: self.riding,
             facing: self.facing,
             addressed,
@@ -1843,29 +2247,74 @@ impl Engine {
         self.playing.last().copied()
     }
 
+    /// The idle-gesture animation a Behavior is mid-pass on, if any.
+    fn playing_gesture(&self) -> Option<&str> {
+        self.playing_animation.as_deref()
+    }
+
+    /// Own-idle gesture or a Behavior animation still in its one pass.
+    fn gesture_mid_pass(&self) -> bool {
+        matches!(self.own_idle, OwnIdle::Gesture { .. }) || self.playing_animation.is_some()
+    }
+
+    /// How long one pass of `animation` holds the screen.
+    fn animation_duration_ms(&self, animation: &str) -> u32 {
+        self.idle_gestures
+            .iter()
+            .find(|member| member.name == animation)
+            .map(|member| one_pass_ms(member.frames, member.fps))
+            .unwrap_or(PRIMITIVE_MS)
+    }
+
     /// Under way on foot, rather than in the air with the same speed on it.
     fn is_walking(&self) -> bool {
         matches!(self.state, State::Grounded | State::Perched) && self.velocity.x != 0.0
     }
 
-    /// True when the Primitive on screen changed.
+    /// True when the Primitive on screen changed, or an animation pass ended.
     fn advance(&mut self, elapsed_ms: u32) -> bool {
+        if self.playing_animation.is_some() {
+            if elapsed_ms >= self.primitive_ms {
+                self.playing_animation = None;
+                self.primitive_ms = 0;
+                let finished = self.playing_behavior.take();
+                self.moment_holding = false;
+                self.complete_pass(finished);
+                return true;
+            }
+            self.primitive_ms -= elapsed_ms;
+            return false;
+        }
+
+        // An own-idle gesture owns the screen until its pass ends: the
+        // Primitive clock runs, but every boundary it reaches waits for it.
+        if matches!(self.own_idle, OwnIdle::Gesture { .. }) {
+            self.primitive_ms = self.primitive_ms.saturating_sub(elapsed_ms);
+            return false;
+        }
         let mut left = elapsed_ms;
         let mut moved_on = false;
 
         while !self.playing.is_empty() && left >= self.primitive_ms {
             left -= self.primitive_ms;
             self.playing.pop();
-            self.primitive_ms = PRIMITIVE_MS;
+            self.primitive_ms = if self.playing.is_empty() {
+                0
+            } else {
+                PRIMITIVE_MS
+            };
             moved_on = true;
+            if self.playing.is_empty() {
+                break;
+            }
         }
         if self.playing.is_empty() {
-            // Draining is the ordinary end of a Behavior and the only one that
-            // is not an abort, so it drops the name here rather than through
-            // `stop_playing` like every other clear site.
             self.primitive_ms = 0;
-            self.playing_behavior = None;
+            let finished = self.playing_behavior.take();
             self.moment_holding = false;
+            if self.complete_pass(finished) {
+                moved_on = true;
+            }
         } else {
             self.primitive_ms -= left;
         }
@@ -1877,6 +2326,7 @@ impl Engine {
     /// go together, or the Engine reports a Behavior that stopped ticks ago.
     fn stop_playing(&mut self) {
         self.playing.clear();
+        self.playing_animation = None;
         self.playing_behavior = None;
         self.primitive_ms = 0;
         self.moment_holding = false;
@@ -1904,10 +2354,105 @@ impl Engine {
         }
     }
 
+    /// The Animation this tick shows, before the idle machine advances.
+    fn animation_name(&self, snapshot: &WorldSnapshot) -> &'static str {
+        match self.on_screen() {
+            // A possessed walk is the user's stride: it shows over a landing or a
+            // startle rather than sliding under them.
+            _ if self.possessed && self.is_walking() => "walk",
+            // So does a move's, over a line or a startle.
+            _ if self.feet_owned() && self.is_walking() => "walk",
+            Some(primitive) => animation_of(primitive),
+            // A walk outlasts the Primitive that starts it: the velocity holds
+            // until the sprite runs out of Perch, so the Animation has to hold
+            // with it rather than dropping back to standing mid-stride.
+            None if self.is_walking() => "walk",
+            // The bubble is the sprite speaking, so its feet held, it says so.
+            None if snapshot.locomotion_frozen
+                && matches!(self.state, State::Grounded | State::Perched) =>
+            {
+                "talk"
+            }
+            // A sprite that rests quietly on a Perch idles in place: still
+            // Perched, same edge, idle art and idle life.
+            None if matches!(self.state, State::Perched)
+                && self.perched_rest_ms >= PERCHED_IDLE_AFTER_MS =>
+            {
+                "idle"
+            }
+            None => animation_for(self.state),
+        }
+    }
+
+    /// Engine idle, or a Behavior declared `type = "idle"` on an idle Primitive.
+    /// A named gesture plays its own animation and does not enter this.
+    fn uses_own_idle(&self) -> bool {
+        if self.playing_gesture().is_some() {
+            return false;
+        }
+        self.on_screen() != Some(Primitive::Idle) || self.idle_typed()
+    }
+
+    fn idle_typed(&self) -> bool {
+        self.on_screen() == Some(Primitive::Idle)
+            && self.playing_behavior.as_ref().is_some_and(|name| {
+                self.behaviors
+                    .get(name)
+                    .is_some_and(|behavior| behavior.idle_type)
+            })
+    }
+
+    /// Left the Engine's idle. A proposal held for an own-idle gesture dies with
+    /// the cut, since what took the screen is what plays. A Behavior animation
+    /// mid-pass keeps the deferred slot until its pass ends or is cleared.
+    fn leave_own_idle(&mut self) {
+        if self.playing_animation.is_none() {
+            self.deferred = None;
+        }
+        self.own_idle = OwnIdle::Off;
+    }
+
+    /// Play `proposal` the way a tick does. The heading lands now: the walk's
+    /// velocity was read before the proposal arrived.
+    fn take_proposal(&mut self, proposal: &BehaviorProposal) -> Taken {
+        match self.start_behavior(&proposal.behavior) {
+            Some(true) => {
+                if let Some(direction) = proposal.direction {
+                    if self
+                        .walk(&proposal.behavior)
+                        .is_some_and(|(primitives, _)| primitives.contains(&Primitive::Walk))
+                    {
+                        self.facing = direction.facing();
+                    }
+                }
+                Taken::Started(proposal.behavior.clone())
+            }
+            // Mid-cooldown, `play` refuses a moving chain whole, greeting
+            // included. A lone line or gesture plays. After the cooldown the
+            // Director calls afresh; nothing resumes.
+            Some(false) => Taken::Refused(proposal.behavior.clone()),
+            None if proposal.behavior.is_empty()
+                && proposal.dialogue.is_some()
+                && self.play(&[Primitive::Talk]) =>
+            {
+                Taken::Talk
+            }
+            None => Taken::Ignored,
+        }
+    }
+
     /// Start `name` through `permitted`. `None` means the Character does not
     /// declare it. `play` clears the Behavior name, so only this puts it back.
     fn start_behavior(&mut self, name: &str) -> Option<bool> {
-        let primitives = self.chain(name)?;
+        let behavior = self.behaviors.get(name)?;
+        if let Some(animation) = behavior.animation.clone() {
+            let started = self.play_animation(&animation);
+            if started {
+                self.playing_behavior = Some(name.to_string());
+            }
+            return Some(started);
+        }
+        let (primitives, _) = self.walk(name)?;
         let started = self.play(&primitives);
         if started {
             self.playing_behavior = Some(name.to_string());
@@ -1931,6 +2476,7 @@ impl Engine {
             return false;
         }
 
+        self.playing_animation = None;
         self.playing = primitives.iter().rev().copied().collect();
         // Nameless until a caller says otherwise. Most callers are the Engine
         // playing a moment of its own — a Land, a Hold, a startle — and the
@@ -1944,20 +2490,38 @@ impl Engine {
         }
         self.primitive_ms = PRIMITIVE_MS;
         // A chain is a Behavior. Holding that would make the next turn beat
-        // wait out every Primitive in it, not the one-shot it replaced.
+        // wait out every step in it, not the one-shot it replaced.
         self.moment_holding = primitives.len() == 1;
         true
     }
 
-    /// Whether the sprite's State permits every one of `primitives`. Motion
-    /// waits out the post-Poke cooldown. Walk and chase also wait out a
-    /// quick message or a bubble; a jump still may.
-    fn permitted(&self, primitives: &[Primitive]) -> bool {
+    /// One pass of a named idle-gesture animation. True when it started.
+    fn play_animation(&mut self, animation: &str) -> bool {
         let on_feet = matches!(self.state, State::Grounded | State::Perched);
-        primitives.iter().all(|primitive| match primitive {
+        if !(on_feet && !self.feet_owned()) {
+            return false;
+        }
+        self.playing.clear();
+        self.playing_animation = Some(animation.to_string());
+        self.playing_behavior = None;
+        self.primitive_ms = self.animation_duration_ms(animation);
+        self.moment_holding = true;
+        true
+    }
+
+    /// Whether the sprite's State permits every Primitive. Motion waits out
+    /// the post-Poke cooldown. Walk and chase also wait out a quick message or
+    /// a bubble; a jump still may.
+    fn permitted(&self, primitives: &[Primitive]) -> bool {
+        primitives
+            .iter()
+            .all(|primitive| self.permitted_primitive(*primitive))
+    }
+
+    fn permitted_primitive(&self, primitive: Primitive) -> bool {
+        let on_feet = matches!(self.state, State::Grounded | State::Perched);
+        match primitive {
             Primitive::React | Primitive::Talk | Primitive::Possessed => true,
-            // A move holds the feet, so nothing that would walk, stop or launch
-            // them starts under it.
             _ if self.feet_owned() => false,
             Primitive::Walk | Primitive::Chase => {
                 footing_refusal(self.state, self.poke_cooldown_ms).is_none() && !self.feet_held
@@ -1967,30 +2531,41 @@ impl Engine {
                 (on_feet || off_a_wall) && self.poke_cooldown_ms == 0
             }
             _ => on_feet,
-        })
+        }
     }
 
-    /// Every Primitive a named Behavior plays, chained ones included, or `None`
-    /// when undeclared. It stops cycles: Behaviors arrive unvalidated, and
-    /// ADR-0002 promises no package can hang the frame loop.
-    fn chain(&self, behavior: &str) -> Option<Vec<Primitive>> {
+    /// A named Behavior's `then` chain, or `None` when undeclared: the Primitives
+    /// that play as one queue, and the first non-flattened Behavior after that
+    /// pass. Stops at cycles: ADR-0002 promises no package can hang the frame loop.
+    fn walk(&self, behavior: &str) -> Option<(Vec<Primitive>, Option<String>)> {
         let mut primitives = Vec::new();
         let mut walked: BTreeSet<&str> = BTreeSet::new();
         let mut current = self.behaviors.get_key_value(behavior)?;
-
         while walked.insert(current.0.as_str()) {
-            primitives.extend(current.1.primitives.iter().copied());
-            match current.1.then.as_deref() {
-                Some(next) => match self.behaviors.get_key_value(next) {
-                    Some(next) => current = next,
-                    None => break,
-                },
-                None => break,
+            if current.1.animation.is_none() {
+                primitives.extend(current.1.primitives.iter().copied());
             }
+            let Some(next) = current
+                .1
+                .then
+                .as_deref()
+                .and_then(|next| self.behaviors.get_key_value(next))
+            else {
+                break;
+            };
+            if !flattens(current.1, next.1) {
+                return Some((primitives, Some(next.0.clone())));
+            }
+            current = next;
         }
-
-        Some(primitives)
+        Some((primitives, None))
     }
+}
+
+/// Whether `next` joins `current`'s Primitive queue. An Animation, or a change
+/// of `type`, waits for the pass boundary so the right Behavior owns its idle.
+fn flattens(current: &Behavior, next: &Behavior) -> bool {
+    current.animation.is_none() && next.animation.is_none() && current.idle_type == next.idle_type
 }
 
 /// Where a Poke stops the sprite for the cooldown: on its feet or on a wall.
@@ -2188,7 +2763,9 @@ mod tests {
     }
 
     fn play(script: &[WorldSnapshot]) -> Vec<Frame> {
-        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 })
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((600, 600));
         script.iter().map(|s| engine.tick(s)).collect()
     }
 
@@ -2230,40 +2807,48 @@ mod tests {
                 "walk".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Walk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "greet".to_string(),
                 Behavior {
                     primitives: vec![Primitive::React, Primitive::Talk],
+                    animation: None,
                     then: Some("settle".to_string()),
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "settle".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Sit, Primitive::Sleep],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "jump".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Jump],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
         ])
@@ -2540,8 +3125,8 @@ mod tests {
     /// than a fall. `settle` opens on `sit`, which neither draws.
     #[test]
     fn a_behavior_that_settles_is_refused_asleep_and_mid_climb() {
-        let mut engine = a_resting_sprite();
-        assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
         let asleep = engine.tick(&proposing("settle"));
         assert_eq!(asleep.state, State::Asleep);
@@ -2580,10 +3165,12 @@ mod tests {
                 "chatter".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Talk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             )]));
 
@@ -2599,10 +3186,12 @@ mod tests {
     fn a_behavior_that_chains_back_to_itself_still_ends() {
         let pacing = |then: &str| Behavior {
             primitives: vec![Primitive::Idle],
+            animation: None,
             then: Some(then.to_string()),
             weight: DEFAULT_WEIGHT,
             trigger: None,
             not_in_manifest: false,
+            idle_type: false,
         };
         let mut engine = Engine::new(Point { x: 100.0, y: 0.0 }).with_behaviors(BTreeMap::from([
             ("here".to_string(), pacing("there")),
@@ -2989,9 +3578,9 @@ mod tests {
         );
     }
 
-    /// `PRIMITIVE_MS` is how long the Engine gives a Primitive, not how long
-    /// the art runs. Every base `idle` is longer (750ms to twelve seconds), so
-    /// a restarted clock would draw only the opening of the strip.
+    /// `PRIMITIVE_MS` is the Primitive's turn, not the art's length, so the
+    /// clock runs across Idle turns instead of restarting on each. Landing
+    /// rests at 0, and the Engine's own idle after the Behavior rests again.
     #[test]
     fn a_behaviors_idle_keeps_one_clock_across_its_primitive_turns() {
         let mut engine =
@@ -2999,14 +3588,16 @@ mod tests {
                 "ponder".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Idle, Primitive::Idle, Primitive::Idle],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             )]));
         let base = settle(&mut engine, &snapshot(100)).animation_ms;
-        assert!(base > 0, "the sprite has been idling since it landed");
+        assert!(base > 0, "the idle loop's clock runs, landed at {base}ms");
 
         let started = engine.tick(&proposing("ponder"));
         assert_eq!(started.behavior.as_deref(), Some("ponder"), "it plays");
@@ -3019,10 +3610,16 @@ mod tests {
         }
 
         assert_eq!(
-            clock,
-            (1..=19).map(|tick| base + tick * 100).collect::<Vec<u32>>(),
-            "three Primitive turns of the same Animation are one loop, and the \
-             idle it interrupted was already that Animation"
+            &clock[..18],
+            (1..=18)
+                .map(|tick| tick * 100)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "three Primitive turns of the same Animation are one loop"
+        );
+        assert_eq!(
+            clock[18], 100,
+            "once the Behavior ends, the next idle loop starts its own clock"
         );
     }
 
@@ -3168,7 +3765,9 @@ mod tests {
         ] {
             // Replay the day only as far as the first tick in this State, so
             // the Grab lands on a sprite that is genuinely in it.
-            let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+            let mut engine = Engine::new(Point { x: 100.0, y: 0.0 })
+                .with_sleep_after_s((1, 1))
+                .with_sleep_for_s((600, 600));
             assert!(
                 day.iter().any(|s| engine.tick(s).state == state),
                 "{state:?} is never reached, so the Grab is untested from it"
@@ -3192,18 +3791,18 @@ mod tests {
         }
     }
 
-    /// Summon opens the chat surface and Menu opens the tray's menu; neither
-    /// moves the sprite. They are still the user reaching for it, so a sleeping
-    /// one wakes, and the Director hears it.
+    /// Summon opens chat and Menu opens the tray. Neither moves the sprite.
+    /// Summon wakes a sleeper. Menu does not. Both address the Director.
     #[test]
-    fn a_summon_or_a_menu_wakes_the_sprite_and_addresses_the_director() {
+    fn a_summon_wakes_a_sleeper_and_a_menu_does_not() {
         for verb in [Verb::Summon, Verb::Menu] {
             let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
             let resting = settle(&mut engine, &snapshot(100));
             assert_eq!(resting.state, State::Grounded);
+            engine.set_sleep_after_s((1, 1));
+            engine.set_sleep_for_s((600, 600));
 
-            // A full minute of nobody touching it.
-            assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+            assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
             let addressed = engine.tick(&WorldSnapshot {
                 cursor: Point { x: 900.0, y: 700.0 },
@@ -3211,7 +3810,8 @@ mod tests {
                 ..snapshot(100)
             });
 
-            assert_eq!(addressed.state, State::Grounded, "awake, after {verb:?}");
+            let awake = verb == Verb::Summon;
+            assert_eq!(addressed.state == State::Grounded, awake, "after {verb:?}");
             assert_eq!(
                 addressed.position, resting.position,
                 "{verb:?} does not walk the sprite to the cursor"
@@ -4314,10 +4914,12 @@ mod tests {
         };
         let mut engine = Engine::new(Point { x: 500.0, y: 0.0 });
         assert_eq!(settle(&mut engine, &resting).state, State::Perched);
+        engine.set_sleep_after_s((1, 1));
+        engine.set_sleep_for_s((600, 600));
         assert_eq!(
             engine
                 .tick(&WorldSnapshot {
-                    elapsed_ms: 60_000,
+                    elapsed_ms: 1_000,
                     ..resting
                 })
                 .state,
@@ -4738,9 +5340,9 @@ mod tests {
     fn a_sprite_left_alone_falls_asleep_and_a_poke_wakes_it() {
         let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
         assert_eq!(settle(&mut engine, &snapshot(100)).state, State::Grounded);
+        engine.set_sleep_after_s((1, 1));
 
-        // A full minute of nobody touching it.
-        let asleep = engine.tick(&snapshot(60_000));
+        let asleep = engine.tick(&snapshot(1_000));
         assert_eq!(asleep.state, State::Asleep);
 
         let woken = engine.tick(&WorldSnapshot {
@@ -4957,10 +5559,12 @@ mod tests {
                 "amble".to_string(),
                 Behavior {
                     primitives: vec![Primitive::React, Primitive::Walk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
@@ -4970,10 +5574,12 @@ mod tests {
                 "walk".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Sit],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
                     not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
         ]));
@@ -5019,8 +5625,8 @@ mod tests {
     /// standing on the floor whether it is in mid-air.
     #[test]
     fn a_proposal_is_gated_on_the_state_the_tick_ends_in() {
-        let mut engine = a_resting_sprite();
-        assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
         let woken = engine.tick(&WorldSnapshot {
             verbs: vec![Verb::Summon],
@@ -5502,14 +6108,16 @@ mod tests {
     fn a_walking_sprite_does_not_nod_off_mid_stride() {
         let mut engine = a_character_at(Point { x: 200.0, y: 0.0 });
         settle(&mut engine, &a_long_perch());
+        engine.set_sleep_after_s((3, 3));
 
         // Poked, then left alone until it is one tick short of nodding off.
+        // The wait also outlasts the post-poke cooldown, so the walk may start.
         engine.tick(&WorldSnapshot {
             verbs: vec![Verb::Poke],
             ..a_long_perch()
         });
         let nearly_asleep = engine.tick(&WorldSnapshot {
-            elapsed_ms: SLEEP_AFTER_MS - 100,
+            elapsed_ms: 2_900,
             ..a_long_perch()
         });
         assert_eq!(nearly_asleep.state, State::Perched, "not asleep yet");
@@ -5885,6 +6493,370 @@ mod tests {
         assert_eq!(idling_again.animation, "idle", "idle after rest again");
     }
 
+    /// Ticks through the rest of `groom`'s one `grooming` pass (6 frames at
+    /// 6 fps), then asserts `behavior` starts on `primitive`, drawn as `drawn`, the
+    /// tick it ends.
+    fn groom_pass_then(
+        engine: &mut Engine,
+        mut ms: u32,
+        behavior: &str,
+        primitive: Primitive,
+        drawn: &str,
+        proposed: bool,
+    ) {
+        loop {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_gesture.is_some() {
+                ms += 100;
+                assert_eq!(frame.playing_gesture.as_deref(), Some("grooming"));
+                assert_eq!(frame.playing_behavior.as_deref(), Some("groom"));
+                assert_eq!(frame.playing_primitive, None);
+                assert_eq!(frame.art_name(), "grooming");
+                assert_eq!(frame.animation_ms, ms, "one unbroken pass: {frame:?}");
+                assert!(ms < 1_000, "the pass ends at 1000 ms: {frame:?}");
+                continue;
+            }
+            assert_eq!(ms, 900, "the whole pass played first: {frame:?}");
+            assert_eq!(frame.playing_behavior.as_deref(), Some(behavior));
+            assert_eq!(frame.behavior.as_deref(), proposed.then_some(behavior));
+            assert_eq!(frame.playing_primitive, Some(primitive));
+            assert_eq!(frame.art_name(), drawn, "{frame:?}");
+            assert_eq!(frame.animation_ms, 0, "{frame:?}");
+            return;
+        }
+    }
+
+    /// A Director proposal waits out a Behavior animation mid-pass and starts when
+    /// the pass ends — the same deferred slot own-idle gestures use. A poke
+    /// cancels the hold; asleep refuses; a later proposal replaces the slot.
+    #[test]
+    fn director_proposal_defers_during_behavior_animation_mid_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let animation_behaviors = || {
+            let mut behaviors = BTreeMap::new();
+            behaviors.insert(
+                "groom".to_string(),
+                Behavior {
+                    primitives: vec![],
+                    animation: Some("grooming".to_string()),
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors.insert(
+                "greet".to_string(),
+                Behavior {
+                    primitives: vec![Primitive::React],
+                    animation: None,
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors.insert(
+                "wave".to_string(),
+                Behavior {
+                    primitives: vec![Primitive::Talk],
+                    animation: None,
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors
+        };
+        let plan = IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        };
+
+        // Mid-pass proposal is held, then greet actually starts and draws.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        let started = engine.tick(&proposing("groom"));
+        assert_eq!(
+            started.playing_gesture.as_deref(),
+            Some("grooming"),
+            "{started:?}"
+        );
+        let mid = engine.tick(&proposing("greet"));
+        assert_eq!(
+            mid.playing_gesture.as_deref(),
+            Some("grooming"),
+            "animation continues: {mid:?}"
+        );
+        assert_ne!(
+            mid.playing_behavior.as_deref(),
+            Some("greet"),
+            "greet not yet: {mid:?}"
+        );
+        // One pass of 6 frames at 6 fps is 1000 ms; greet starts on the tick it ends.
+        groom_pass_then(
+            &mut engine,
+            mid.animation_ms,
+            "greet",
+            Primitive::React,
+            "react",
+            true,
+        );
+
+        // One-slot: a later mid-pass proposal replaces the held one.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        engine.tick(&proposing("groom"));
+        engine.tick(&proposing("greet"));
+        let latest = engine.tick(&proposing("wave"));
+        groom_pass_then(
+            &mut engine,
+            latest.animation_ms,
+            "wave",
+            Primitive::Talk,
+            "talk",
+            true,
+        );
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            assert_ne!(
+                frame.playing_behavior.as_deref(),
+                Some("greet"),
+                "replaced greet must not start after wave won: {frame:?}"
+            );
+        }
+
+        // User poke cancels the held proposal and wins the screen.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        engine.tick(&proposing("groom"));
+        engine.tick(&proposing("greet"));
+        let poked = engine.tick(&WorldSnapshot {
+            verbs: vec![Verb::Poke],
+            ..snapshot(100)
+        });
+        assert_eq!(
+            poked.animation, "react",
+            "poke cuts the animation: {poked:?}"
+        );
+        let mut saw_greet_after_poke = false;
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_behavior.as_deref() == Some("greet")
+                || frame.behavior.as_deref() == Some("greet")
+            {
+                saw_greet_after_poke = true;
+                break;
+            }
+        }
+        assert!(
+            !saw_greet_after_poke,
+            "poke must cancel the held greet proposal"
+        );
+
+        // Asleep refuses rather than deferring into a later wake.
+        let mut engine = a_resting_sprite()
+            .with_behaviors(animation_behaviors())
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((30, 30));
+        engine.set_idle_plan(IdlePlan {
+            sleep_after_s: (1, 1),
+            sleep_for_s: (30, 30),
+            ..plan.clone()
+        });
+        settle(&mut engine, &snapshot(100));
+        let asleep = engine.tick(&WorldSnapshot {
+            elapsed_ms: 1_000,
+            ..snapshot(100)
+        });
+        assert_eq!(asleep.state, State::Asleep, "asleep first: {asleep:?}");
+        let refused = engine.tick(&proposing("greet"));
+        assert_eq!(
+            refused.refused.as_deref(),
+            Some("greet"),
+            "asleep refuses greet: {refused:?}"
+        );
+        assert_ne!(refused.animation, "react", "greet must not start asleep");
+    }
+
+    /// A Primitive Behavior continues into a Behavior playing an Animation
+    /// after its Primitives finish (shipped cat prowl → groom).
+    #[test]
+    fn primitive_then_animation_starts_the_animation_after_the_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let mut behaviors = BTreeMap::new();
+        behaviors.insert(
+            "prowl".to_string(),
+            Behavior {
+                primitives: vec![Primitive::Walk],
+                animation: None,
+                then: Some("groom".to_string()),
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        behaviors.insert(
+            "groom".to_string(),
+            Behavior {
+                primitives: vec![],
+                animation: Some("grooming".to_string()),
+                then: None,
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        let mut engine = a_resting_sprite().with_behaviors(behaviors);
+        engine.set_idle_plan(IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        });
+        let started = engine.tick(&proposing("prowl"));
+        assert_eq!(
+            started.playing_behavior.as_deref(),
+            Some("prowl"),
+            "{started:?}"
+        );
+        // Walk is PRIMITIVE_MS (600). Drain it and the following ticks.
+        let mut saw_groom = false;
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_gesture.as_deref() == Some("grooming")
+                || frame.playing_behavior.as_deref() == Some("groom")
+            {
+                saw_groom = true;
+                break;
+            }
+        }
+        assert!(
+            saw_groom,
+            "prowl then=groom must start the grooming animation"
+        );
+    }
+
+    /// A Behavior playing an Animation continues into Primitives after one pass.
+    #[test]
+    fn animation_then_primitive_starts_after_the_animation_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let mut behaviors = BTreeMap::new();
+        behaviors.insert(
+            "groom".to_string(),
+            Behavior {
+                primitives: vec![],
+                animation: Some("grooming".to_string()),
+                then: Some("greet".to_string()),
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        behaviors.insert(
+            "greet".to_string(),
+            Behavior {
+                primitives: vec![Primitive::React],
+                animation: None,
+                then: None,
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        let mut engine = a_resting_sprite().with_behaviors(behaviors);
+        engine.set_idle_plan(IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        });
+        let started = engine.tick(&proposing("groom"));
+        assert_eq!(
+            started.playing_gesture.as_deref(),
+            Some("grooming"),
+            "{started:?}"
+        );
+        // A `then` start is not a proposal, so the frame reports no new Behavior.
+        groom_pass_then(
+            &mut engine,
+            started.animation_ms,
+            "greet",
+            Primitive::React,
+            "react",
+            false,
+        );
+    }
+
+    /// A moving perch under an asleep sprite does not wake it. Sleep
+    /// countdown keeps running; window motion is not a user interaction.
+    #[test]
+    fn asleep_sprite_stays_asleep_while_its_perch_moves() {
+        let mut engine = a_resting_sprite()
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((30, 30));
+        settle(&mut engine, &perch(50.0, 400.0));
+        let asleep = engine.tick(&WorldSnapshot {
+            elapsed_ms: 1_000,
+            ..perch(50.0, 400.0)
+        });
+        assert_eq!(asleep.state, State::Asleep, "asleep first: {asleep:?}");
+        let riding = engine.tick(&WorldSnapshot {
+            elapsed_ms: 100,
+            poll_generation: 1,
+            ..perch(90.0, 400.0)
+        });
+        assert_eq!(
+            riding.state,
+            State::Asleep,
+            "window motion must not wake: {riding:?}"
+        );
+        assert_ne!(riding.animation, "hold", "no Hold over sleep: {riding:?}");
+    }
+
     /// The timer resets when riding a moving Perch, so a sprite that
     /// lands from a ride shows sit first.
     #[test]
@@ -5972,7 +6944,7 @@ mod tests {
     /// and sleeps later.
     #[test]
     fn a_perched_sprite_idles_then_sleeps_if_left_alone() {
-        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 }).with_sleep_after_s((10, 10));
         settle(&mut engine, &perch(50.0, 400.0));
 
         let idling = engine.tick(&WorldSnapshot {
@@ -5983,7 +6955,7 @@ mod tests {
         assert_eq!(idling.animation, "idle", "idle before sleep");
 
         let asleep = engine.tick(&WorldSnapshot {
-            elapsed_ms: SLEEP_AFTER_MS,
+            elapsed_ms: 10_000,
             ..perch(50.0, 400.0)
         });
         assert_eq!(asleep.state, State::Asleep, "then sleep");
@@ -7891,7 +8863,7 @@ mod tests {
 
     #[test]
     fn idle_behaviors_do_not_start_and_the_buddy_settles_to_sleep() {
-        let mut engine = a_resting_sprite();
+        let mut engine = a_resting_sprite().with_sleep_after_s((5, 5));
         engine.set_do_not_disturb(true);
 
         let quietening: Vec<Frame> = (0..20)
@@ -8845,8 +9817,8 @@ mod tests {
     /// The Frame reports the refusal instead of dropping it.
     #[test]
     fn a_jump_is_refused_while_asleep_and_says_it_was() {
-        let mut engine = a_resting_sprite();
-        let asleep = engine.tick(&snapshot(SLEEP_AFTER_MS));
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        let asleep = engine.tick(&snapshot(1_000));
         assert_eq!(asleep.state, State::Asleep, "asleep to begin with");
         let resting_at = engine.position;
 
@@ -9811,11 +10783,15 @@ mod tests {
                     (
                         (*name).to_string(),
                         Behavior {
-                            primitives: vec![Primitive::Sit; sits],
+                            primitives: std::iter::repeat_with(|| Primitive::Sit)
+                                .take(sits)
+                                .collect(),
+                            animation: None,
                             then: None,
                             weight: DEFAULT_WEIGHT,
                             trigger: None,
                             not_in_manifest: false,
+                            idle_type: false,
                         },
                     )
                 })
@@ -9844,10 +10820,10 @@ mod tests {
         #[test]
         fn a_possessed_sprite_never_falls_asleep() {
             let world = on(one_display());
-            let mut engine = possessed_at(500.0, &world);
+            let mut engine = possessed_at(500.0, &world).with_sleep_after_s((1, 1));
 
             let frame = engine.tick(&WorldSnapshot {
-                elapsed_ms: SLEEP_AFTER_MS * 2,
+                elapsed_ms: 5_000,
                 ..world.clone()
             });
             assert_eq!(frame.state, State::Grounded, "{frame:?}");
@@ -9858,9 +10834,9 @@ mod tests {
         #[test]
         fn possessing_a_sleeping_sprite_wakes_it() {
             let world = on(one_display());
-            let mut engine = resting_at(500.0, &world);
+            let mut engine = resting_at(500.0, &world).with_sleep_after_s((1, 1));
             let asleep = engine.tick(&WorldSnapshot {
-                elapsed_ms: SLEEP_AFTER_MS,
+                elapsed_ms: 1_000,
                 ..world.clone()
             });
             assert_eq!(asleep.state, State::Asleep);
