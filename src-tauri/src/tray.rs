@@ -6,7 +6,7 @@
 
 use crate::menu::{self, MenuDescription};
 use tauri::image::Image;
-use tauri::tray::TrayIconBuilder;
+use tauri::tray::{MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::AppHandle;
 
 /// Pixels decoded at compile time. The path is relative to `src-tauri`.
@@ -27,7 +27,20 @@ pub fn install(
         .icon(TRAY_ICON)
         .show_menu_on_left_click(true)
         .tooltip("fidget")
+        // Both this and `tray: menu set` print on the main thread, so the
+        // log orders a press against any rebuild of the menu under it.
+        .on_tray_icon_event(|_, event| {
+            if let TrayIconEvent::Click {
+                button,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                eprintln!("tray: {button:?} click");
+            }
+        })
         .build(app)?;
+    log_menu_set(quit_generation);
 
     #[cfg(target_os = "macos")]
     if let Err(why) = crate::platform::tune_tray_icon(&icon) {
@@ -45,7 +58,13 @@ pub fn refresh(
     quit_generation: u64,
 ) -> Result<(), tauri::Error> {
     let menu = menu::build(app, description, quit_generation)?;
-    tray.set_menu(Some(menu))
+    tray.set_menu(Some(menu))?;
+    log_menu_set(quit_generation);
+    Ok(())
+}
+
+fn log_menu_set(quit_generation: u64) {
+    eprintln!("tray: menu set, generation {quit_generation}");
 }
 
 #[cfg(test)]

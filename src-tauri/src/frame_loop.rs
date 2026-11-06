@@ -1013,6 +1013,10 @@ pub(crate) fn run_frame_loop(
                             &displays.frames,
                         );
                         menu_acted = true;
+                    } else {
+                        // A stale Quit, or a row of a tray menu replaced
+                        // since it opened.
+                        eprintln!("menu: {id} is on no open menu");
                     }
                 }
             }
