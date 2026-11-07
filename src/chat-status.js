@@ -30,7 +30,7 @@ export function statusCells(status, msLeft) {
   return {
     behavior: status?.behavior ?? NONE,
     primitive: status?.primitive ?? NONE,
-    animation: status?.animation ?? NONE,
+    animation: animationCell(status),
     state: status?.state ?? NONE,
     // Nothing rather than an arrow before the first push. A guessed arrow is a lie.
     facing: status ? (status.facing < 0 ? "←" : "→") : "",
@@ -39,6 +39,15 @@ export function statusCells(status, msLeft) {
     director: status?.thinking ? "thinking" : `wake ${untilWake(status ? msLeft : null)}`,
     happened: status?.happened ?? NONE,
   };
+}
+
+// The art on screen, then the name the Engine asked with when a variant, a
+// fallback or a Left Strip drew something else: `walk (climb)`.
+function animationCell(status) {
+  const drawn = status?.animation;
+  if (!drawn) return NONE;
+  const asked = status.asked_animation;
+  return asked && asked !== drawn ? `${drawn} (${asked})` : drawn;
 }
 
 // What the fidget is doing right now, without Primitive or State vocabulary.
@@ -79,8 +88,11 @@ function humanizeActivity(status) {
     }
   }
 
-  if (status.animation) {
-    const readable = humanizeAnimation(status.animation);
+  // The name asked for, not the strip drawn: the plain line says what the
+  // Character is doing, and a variant or a Left Strip is how it looks doing it.
+  const asked = status.asked_animation ?? status.animation;
+  if (asked) {
+    const readable = humanizeAnimation(asked);
     if (readable) {
       return readable;
     }
