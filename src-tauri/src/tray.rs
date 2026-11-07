@@ -1,8 +1,8 @@
-//! The menu bar icon. Same menu as the sprite's right-click.
+//! The menu bar icon. Same menu as the sprite's right-click, plus Bring to this display.
 //!
-//! One definition (`menu::describe`) and two entry points, so a row cannot
-//! exist on the sprite and not here. WindowPet's tray is the reference for
-//! putting settings and quit on a menu bar icon; this is our menu, not theirs.
+//! One definition (`menu::describe`) and two entry points.
+//! WindowPet's tray is the reference for putting settings and quit on a menu
+//! bar icon; this is our menu, not theirs.
 
 use crate::menu::{self, MenuDescription};
 use tauri::image::Image;

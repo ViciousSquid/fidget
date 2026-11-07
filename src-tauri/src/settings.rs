@@ -1503,6 +1503,11 @@ impl SettingsSession {
         crate::platform::open_path(&self.memory_path)
     }
 
+    /// Hand the current Action Log to the desktop's opener.
+    pub fn open_action_log(&self) -> Result<(), String> {
+        crate::platform::open_path(&crate::action_log::current_path())
+    }
+
     pub fn wipe_memory(&self) -> Result<(), String> {
         MemoryManifest::new(&self.memory_path)
             .wipe()
