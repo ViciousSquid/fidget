@@ -34,6 +34,17 @@ pub(crate) fn character_layers(
     blank: bool,
     tools: bool,
 ) -> String {
+    character_layers_in_language(context, behaviors, blank, tools, None)
+}
+
+/// The same layers with an explicit spoken-language preference.
+pub(crate) fn character_layers_in_language(
+    context: &Context,
+    behaviors: impl IntoIterator<Item = impl AsRef<str>>,
+    blank: bool,
+    tools: bool,
+    reply_language: Option<&str>,
+) -> String {
     // Empty, not `(no personality)`: that placeholder is a Character with an
     // empty file, which still gets the voice rules. Blank AI is the emptied
     // built-in layer sitting in the same seat.
@@ -54,7 +65,7 @@ pub(crate) fn character_layers(
         written => format!("{personality}\n\n{written}"),
     };
 
-    let instructions = app_instructions(behaviors, blank, tools);
+    let instructions = app_instructions(behaviors, blank, tools, reply_language);
 
     match (authored.is_empty(), instructions.is_empty()) {
         (true, true) => String::new(),
@@ -82,6 +93,7 @@ pub fn app_instructions(
     behaviors: impl IntoIterator<Item = impl AsRef<str>>,
     blank: bool,
     tools: bool,
+    reply_language: Option<&str>,
 ) -> String {
     if blank {
         return String::new();
@@ -104,6 +116,13 @@ pub fn app_instructions(
     } else {
         ""
     };
+    let language_rule = match reply_language {
+        None | Some("") | Some("English") => String::new(),
+        Some(language) => format!(
+            "\n\nPrefer to speak in {language}. If the user addresses you in another \
+             language, follow their language instead. Keep Behavior names exactly as listed."
+        ),
+    };
     format!(
         "You may propose one of these behaviors: {declared}\n\
          \n\
@@ -117,7 +136,7 @@ pub fn app_instructions(
          have not used yet, though a signature phrase may recur, and \
          lean away from the behaviors listed as recently played. React to \
          this moment when there is something worth remarking on: what just \
-         happened to you, and what you are standing on.{invite}"
+         happened to you, and what you are standing on.{invite}{language_rule}"
     )
 }
 

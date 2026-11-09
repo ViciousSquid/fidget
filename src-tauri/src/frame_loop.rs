@@ -2299,7 +2299,7 @@ pub(crate) fn run_frame_loop(
                         // The panel shows this copy. The worker appends `line`
                         // after `request`, so an in-flight reply can still open
                         // the session before this wake is sent.
-                        let mut payload = model.prompt(&context);
+                        let mut payload = model.prompt_in_language(&context, crate::i18n::reply_language());
                         if !payload.ends_with('\n') {
                             payload.push('\n');
                         }
@@ -2311,7 +2311,7 @@ pub(crate) fn run_frame_loop(
                         let touched =
                             director::claim(&context.happened) == director::Claim::Interaction;
                         let cell = director::happened_cell(&context.happened);
-                        match slots.wake_with_prompt(&live.id, Arc::clone(model), context, line) {
+                        match slots.wake_with_prompt(&live.id, Arc::clone(model), context, line, crate::i18n::reply_language()) {
                             // The call on the wire is the truer one
                             // (ADR-0016). This wake is dropped, not queued:
                             // the bookkeeping above has already spent it.
@@ -3464,6 +3464,7 @@ fn answer_tool_call(
                     blank,
                     // Only a Harness can call this tool, and it has tools.
                     true,
+                    crate::i18n::reply_language(),
                 ),
                 personality_prompt: match blank {
                     true => String::new(),
@@ -3803,7 +3804,7 @@ mod tests {
         assert_eq!(pip["id"], json!(id));
         assert_eq!(
             pip["app_instructions"],
-            json!(director::app_instructions(["wave"], false, true))
+            json!(director::app_instructions(["wave"], false, true, None))
         );
         assert_eq!(pip["personality_prompt"], json!("a shy robot."));
         assert_eq!(pip["instance_prompt"], json!("Answer in haiku."));
