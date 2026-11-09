@@ -28,6 +28,7 @@ pub(crate) fn with_layers(layers: &str, moment: &str) -> String {
 }
 
 /// Layers a replacement conversation needs before its current moment.
+#[cfg(test)]
 pub(crate) fn character_layers(
     context: &Context,
     behaviors: impl IntoIterator<Item = impl AsRef<str>>,

@@ -27,11 +27,13 @@ use crate::sensing::Activity;
 mod prompt;
 mod recency;
 #[cfg(test)]
+pub(crate) use prompt::character_layers;
+#[cfg(test)]
 pub(crate) use prompt::character_prompt;
 #[cfg(test)]
 use prompt::follow_up;
 pub use prompt::{app_instructions, happened_word, typed_line};
-pub(crate) use prompt::{character_layers, character_layers_in_language, named_moment, with_layers};
+pub(crate) use prompt::{character_layers_in_language, named_moment, with_layers};
 pub use recency::{Doing, Lately, Recency, Step};
 
 /// How long the Static Director goes unwoken when nothing notable happens.
@@ -394,7 +396,8 @@ impl<C: Completer> ModelDirector<C> {
 
     /// Show the same language preference used by an outgoing request.
     pub fn prompt_in_language(&self, context: &Context, reply_language: Option<&str>) -> String {
-        self.request_in_language(context, reply_language).text(false)
+        self.request_in_language(context, reply_language)
+            .text(false)
     }
 
     /// This wake as the Completer receives it (English by default).
@@ -2485,7 +2488,10 @@ mod tests {
         assert!(!french.contains("Spanish"));
         assert!(spanish.contains("Prefer to speak in Spanish"));
         assert!(!english.contains("Prefer to speak in"));
-        assert_eq!(english, app_instructions(["wave"], false, true, Some("English")));
+        assert_eq!(
+            english,
+            app_instructions(["wave"], false, true, Some("English"))
+        );
         assert_eq!(app_instructions(["wave"], true, true, Some("French")), "");
     }
 

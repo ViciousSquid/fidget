@@ -3360,7 +3360,12 @@ fn chat_opening_layers(
             .harness
             .as_ref()
             .map(|attached| attached.name.clone()),
-        instructions: app_instructions(behaviors, blank, inspect.harness.is_some(), i18n::reply_language()),
+        instructions: app_instructions(
+            behaviors,
+            blank,
+            inspect.harness.is_some(),
+            i18n::reply_language(),
+        ),
         personality: if blank {
             String::new()
         } else {
@@ -3427,6 +3432,7 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
                 .unwrap_or_default(),
             blank,
             inspect.as_ref().is_some_and(|read| read.harness.is_some()),
+            i18n::reply_language(),
         ),
         personality: if blank {
             String::new()
