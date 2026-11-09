@@ -2299,7 +2299,8 @@ pub(crate) fn run_frame_loop(
                         // The panel shows this copy. The worker appends `line`
                         // after `request`, so an in-flight reply can still open
                         // the session before this wake is sent.
-                        let mut payload = model.prompt_in_language(&context, crate::i18n::reply_language());
+                        let reply_language = crate::i18n::reply_language();
+                        let mut payload = model.prompt_in_language(&context, reply_language);
                         if !payload.ends_with('\n') {
                             payload.push('\n');
                         }
@@ -2311,7 +2312,7 @@ pub(crate) fn run_frame_loop(
                         let touched =
                             director::claim(&context.happened) == director::Claim::Interaction;
                         let cell = director::happened_cell(&context.happened);
-                        match slots.wake_with_prompt(&live.id, Arc::clone(model), context, line, crate::i18n::reply_language()) {
+                        match slots.wake_with_prompt(&live.id, Arc::clone(model), context, line, reply_language) {
                             // The call on the wire is the truer one
                             // (ADR-0016). This wake is dropped, not queued:
                             // the bookkeeping above has already spent it.
