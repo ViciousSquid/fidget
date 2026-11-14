@@ -39,6 +39,7 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Find what this run changed
@@ -109,6 +110,7 @@ jobs:
             | sudo xargs -r rm -vf
           sudo apt-get update
           read -r -a packages <<< "$APT_PACKAGES"
+          # shellcheck disable=SC2024 # sudo does not apply to the redirect; the URI list should stay the runner's file
           sudo apt-get install --print-uris -y "${packages[@]}" >"$RUNNER_TEMP/apt-uris"
           uris=$(grep "^'" "$RUNNER_TEMP/apt-uris" || true)
           if [ -z "$uris" ]; then
@@ -178,6 +180,7 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         run: |
           if [ "$RUNNER_OS" = Linux ]; then
+            # shellcheck disable=SC2016 # $ must expand in the inner bash -lc, not here
             dbus-run-session -- bash -lc '
               set -euo pipefail
               echo "" | gnome-keyring-daemon --unlock || true
@@ -204,6 +207,7 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Find what this run changed
@@ -272,6 +276,8 @@ jobs:
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
@@ -295,6 +301,7 @@ jobs:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
           fetch-depth: 0
 
       - name: Find what this run changed
