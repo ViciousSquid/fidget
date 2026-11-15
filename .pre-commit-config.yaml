@@ -102,9 +102,8 @@ repos:
       - id: zizmor
         # args replaces the hook default, so --no-progress stays.
         # --offline so CI's GITHUB_TOKEN cannot enable online audits.
-        # Workflows only: the hook's default also collects Dependabot config.
+        # The default file set adds dependabot.yaml (cooldowns) and this file.
         args: [--no-progress, --offline]
-        files: ^\.github/workflows/
 
     # PowerShell linting
   - repo: local
