@@ -1,11 +1,12 @@
-//! The shell's reply-language preference, separate from UI translation.
-//! --lang overrides the saved setting; System uses the machine's locale.
+//! The language the character is asked to speak in. The interface stays in
+//! English. `--lang` overrides the saved setting; System uses the machine's locale.
 
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::OnceLock;
 
-pub const FLAG: &str = "--lang";
+const FLAG: &str = "--lang";
 
+/// A language Settings offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lang {
     En,
@@ -16,6 +17,7 @@ pub enum Lang {
 impl Lang {
     pub const ALL: [Lang; 3] = [Lang::En, Lang::Fr, Lang::Es];
 
+    /// The tag saved in settings and taken by `--lang`.
     pub fn code(self) -> &'static str {
         match self {
             Lang::En => "en",
@@ -24,6 +26,7 @@ impl Lang {
         }
     }
 
+    /// The name Settings shows, in the language itself.
     pub fn endonym(self) -> &'static str {
         match self {
             Lang::En => "English",
@@ -32,6 +35,7 @@ impl Lang {
         }
     }
 
+    /// The name the Director prompt uses.
     pub fn english_name(self) -> &'static str {
         match self {
             Lang::En => "English",
@@ -40,6 +44,7 @@ impl Lang {
         }
     }
 
+    /// The language of a locale tag such as `fr-CA` or `es_ES.UTF-8`.
     pub fn parse(tag: &str) -> Option<Self> {
         let primary = tag
             .trim()
@@ -57,7 +62,7 @@ impl Lang {
 
 static CURRENT: AtomicU8 = AtomicU8::new(0);
 
-pub fn current() -> Lang {
+fn current() -> Lang {
     let index = CURRENT.load(Ordering::Relaxed);
     Lang::ALL
         .into_iter()
@@ -65,7 +70,7 @@ pub fn current() -> Lang {
         .unwrap_or(Lang::En)
 }
 
-/// The language currently requested by the shell, as a per-wake core argument.
+/// The language a wake asks for, `None` for English, which needs no rule.
 pub fn reply_language() -> Option<&'static str> {
     match current() {
         Lang::En => None,
@@ -73,6 +78,7 @@ pub fn reply_language() -> Option<&'static str> {
     }
 }
 
+/// The `--lang` this process was launched with, if it names a language.
 pub fn flag() -> Option<Lang> {
     static FLAG_LANG: OnceLock<Option<Lang>> = OnceLock::new();
     *FLAG_LANG.get_or_init(|| match flag_value(std::env::args().skip(1)) {
@@ -106,13 +112,14 @@ fn system() -> Lang {
         .unwrap_or(Lang::En)
 }
 
-pub fn resolve(setting: &str) -> Lang {
+fn resolve(setting: &str) -> Lang {
     flag()
         .or_else(|| Lang::parse(setting))
         .unwrap_or_else(system)
 }
 
-/// The only mutable language selection lives in the Shell, never fidget-core.
+/// Make `setting`, under `--lang` and over the system locale, the language
+/// every later wake reads.
 pub fn apply(setting: &str) {
     CURRENT.store(resolve(setting).index(), Ordering::Relaxed);
 }
