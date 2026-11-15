@@ -2370,7 +2370,7 @@ pub(crate) mod tests {
         let heard = std::cell::RefCell::new(Vec::new());
 
         let woken = director.wake_request(
-            director.request(&crate::completer::tests::wake_context()),
+            director.request(&crate::completer::tests::wake_context(), None),
             &|line| heard.borrow_mut().push(line),
         );
 
@@ -4586,12 +4586,15 @@ pub(crate) mod tests {
         let personality =
             "Cat claimed the desktop. It has been heard to say: \"Show me that one.\"";
         let director = ModelDirector::new(Silent, ["stroll", "nap"], "fidget", "Cat", false);
-        let today = director.prompt(&Context {
-            personality: personality.to_string(),
-            happened: Happened::Poke,
-            standing: "the display floor".to_string(),
-            ..crate::completer::tests::wake_context()
-        });
+        let today = director.prompt(
+            &Context {
+                personality: personality.to_string(),
+                happened: Happened::Poke,
+                standing: "the display floor".to_string(),
+                ..crate::completer::tests::wake_context()
+            },
+            None,
+        );
 
         assert_eq!(reframed(&today, personality, Framing::Today), today);
 

@@ -27,13 +27,11 @@ use crate::sensing::Activity;
 mod prompt;
 mod recency;
 #[cfg(test)]
-pub(crate) use prompt::character_layers;
-#[cfg(test)]
 pub(crate) use prompt::character_prompt;
 #[cfg(test)]
 use prompt::follow_up;
 pub use prompt::{app_instructions, happened_word, typed_line};
-pub(crate) use prompt::{character_layers_in_language, named_moment, with_layers};
+pub(crate) use prompt::{character_layers, named_moment, with_layers};
 pub use recency::{Doing, Lately, Recency, Step};
 
 /// How long the Static Director goes unwoken when nothing notable happens.
@@ -390,30 +388,16 @@ impl<C: Completer> ModelDirector<C> {
     }
 
     /// The user turn for this wake. Settings shows this string.
-    pub fn prompt(&self, context: &Context) -> String {
-        self.prompt_in_language(context, None)
+    pub fn prompt(&self, context: &Context, reply_language: Option<&str>) -> String {
+        self.request(context, reply_language).text(false)
     }
 
-    /// Show the same language preference used by an outgoing request.
-    pub fn prompt_in_language(&self, context: &Context, reply_language: Option<&str>) -> String {
-        self.request_in_language(context, reply_language)
-            .text(false)
-    }
-
-    /// This wake as the Completer receives it (English by default).
-    pub fn request(&self, context: &Context) -> WakeRequest {
-        self.request_in_language(context, None)
-    }
-
-    /// Build a wake with an explicit preference, without mutable core globals.
-    pub fn request_in_language(
-        &self,
-        context: &Context,
-        reply_language: Option<&str>,
-    ) -> WakeRequest {
+    /// This wake as the Completer receives it. `reply_language` is the
+    /// language the Shell resolved for this wake, `None` for English.
+    pub fn request(&self, context: &Context, reply_language: Option<&str>) -> WakeRequest {
         WakeRequest {
             prompt: named_moment(context, &self.instance),
-            layers: character_layers_in_language(
+            layers: character_layers(
                 context,
                 self.behaviors.iter(),
                 self.blank,
@@ -436,7 +420,7 @@ impl<C: Completer> ModelDirector<C> {
     /// declares none of. A near miss arrives as dialogue, so without this it is
     /// invisible. Reported, never corrected: guessing a fix is ruled out.
     pub fn wake_and_near_miss(&self, context: &Context) -> Woken {
-        self.wake_request(self.request(context), &|_| {})
+        self.wake_request(self.request(context, None), &|_| {})
     }
 
     /// Run a wake whose prompt the caller already finished. `speaking` hears
@@ -1766,7 +1750,7 @@ mod tests {
         let director = directing(Scripted::says("wave"), ["wave"]);
 
         let moment = context(working(), &[]);
-        let expected = director.prompt(&moment);
+        let expected = director.prompt(&moment, None);
         director.wake(&moment);
         let asked = director.completer.seen().expect("a request was sent");
         assert_eq!(asked.instance, "buddy-1");
@@ -2404,7 +2388,7 @@ mod tests {
     fn a_request_invites_the_tools_without_naming_them() {
         let moment = context(working(), &["nap"]);
         let opening = with_layers(
-            &character_layers(&moment, ["wave"], false, true),
+            &character_layers(&moment, ["wave"], false, true, None),
             &named_moment(&moment, "buddy-1"),
         );
 
@@ -2533,7 +2517,7 @@ mod tests {
         // carries the id too.
         let director = directing(Scripted::says("wave"), ["wave"]);
         director.wake(&moment);
-        let later = director.prompt(&moment);
+        let later = director.prompt(&moment, None);
         assert!(
             later.starts_with(
                 "Your instance_id is buddy-1. Pass it to every Fidget tool you call.\n\n"
@@ -2617,7 +2601,7 @@ mod tests {
         let moment = context(working(), &["nap"]);
         director.wake(&moment);
 
-        let later = director.request(&moment);
+        let later = director.request(&moment, None);
         assert_eq!(later.text(false), named_moment(&moment, "buddy-1"));
         assert_eq!(
             later.text(true),
@@ -2634,7 +2618,7 @@ mod tests {
         first.wake(&moment);
 
         let next = directing(Scripted::says("wave"), ["stroll"]);
-        let payload = next.prompt(&moment);
+        let payload = next.prompt(&moment, None);
         assert!(
             payload.contains("You may propose"),
             "switch is a new opening: {payload}"
@@ -3183,7 +3167,7 @@ mod tests {
     #[test]
     fn a_chat_turn_is_the_opening_turn_when_it_is_the_first_thing_that_happens() {
         let director = directing(Scripted::says("wave"), ["wave", "greet"]);
-        let payload = director.prompt(&typed("hello?"));
+        let payload = director.prompt(&typed("hello?"), None);
 
         assert!(
             payload.contains("You may propose") && payload.contains("greet"),
@@ -3336,9 +3320,10 @@ mod tests {
     fn streamed(reply: &str) -> (Vec<String>, Option<String>) {
         let director = directing(Scripted::says(reply), ["prowl", "wave", "stroll", "nap"]);
         let heard = std::cell::RefCell::new(Vec::new());
-        let woken = director.wake_request(director.request(&context(working(), &[])), &|line| {
-            heard.borrow_mut().push(line)
-        });
+        let woken = director
+            .wake_request(director.request(&context(working(), &[]), None), &|line| {
+                heard.borrow_mut().push(line)
+            });
         let parsed = match woken.wake {
             Wake::Proposed(proposal) => proposal.dialogue,
             Wake::Failed => None,

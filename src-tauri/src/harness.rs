@@ -6967,7 +6967,7 @@ mod tests {
         let completer = crate::completer::AnyCompleter::Harness(Arc::new(session));
         let director = ModelDirector::new(completer, ["wave"], "buddy-1", "bmo", false);
 
-        let request = director.request(&crate::completer::tests::wake_context());
+        let request = director.request(&crate::completer::tests::wake_context(), None);
 
         assert!(
             request.layers.contains("use the tools you have"),
@@ -7043,7 +7043,7 @@ mod tests {
                     }
                     _ => session.drop_conversation("buddy-1"),
                 }
-                let mut request = director.request(&context);
+                let mut request = director.request(&context, None);
                 request.prompt.push_str("\nextra chat context");
                 let woken = director.wake_request(request.clone(), &|_| {});
                 if matches!(replacement, "refused-fresh" | "cancelled-fresh") {

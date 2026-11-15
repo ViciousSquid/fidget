@@ -253,7 +253,7 @@ impl Slots {
                 });
             };
             let woken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut request = director.request_in_language(&context, reply_language);
+                let mut request = director.request(&context, reply_language);
                 if let Some(line) = line {
                     if !request.prompt.ends_with('\n') {
                         request.prompt.push('\n');

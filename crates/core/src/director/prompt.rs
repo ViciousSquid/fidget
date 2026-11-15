@@ -12,7 +12,7 @@ pub(crate) fn character_prompt(
     blank: bool,
 ) -> String {
     with_layers(
-        &character_layers(context, behaviors, blank, false),
+        &character_layers(context, behaviors, blank, false, None),
         &named_moment(context, instance),
     )
 }
@@ -28,18 +28,7 @@ pub(crate) fn with_layers(layers: &str, moment: &str) -> String {
 }
 
 /// Layers a replacement conversation needs before its current moment.
-#[cfg(test)]
 pub(crate) fn character_layers(
-    context: &Context,
-    behaviors: impl IntoIterator<Item = impl AsRef<str>>,
-    blank: bool,
-    tools: bool,
-) -> String {
-    character_layers_in_language(context, behaviors, blank, tools, None)
-}
-
-/// The same layers with an explicit spoken-language preference.
-pub(crate) fn character_layers_in_language(
     context: &Context,
     behaviors: impl IntoIterator<Item = impl AsRef<str>>,
     blank: bool,
