@@ -24,6 +24,19 @@ export function untilWake(ms) {
   return mins < 60 ? `${mins}m` : `${Math.ceil(mins / 60)}h`;
 }
 
+// The Shell's key for who owns the art on screen, as the label the bar
+// shows. Exact and case-sensitive, since the labels are the vocabulary.
+const SOURCE_LABELS = {
+  idle_loop: "Idle Loop",
+  engine: "Engine",
+  local_director: "Local Director",
+  ai_requested: "AI Requested",
+  ai_mcp: "AI MCP",
+  user_invoked: "User Invoked",
+  ai_feedback: "AI Feedback",
+  onboarding: "Onboarding",
+};
+
 // One push, plus how much of its countdown is left, as each cell's text.
 // `status` is null until the first arrives, and every cell says so.
 export function statusCells(status, msLeft) {
@@ -38,6 +51,8 @@ export function statusCells(status, msLeft) {
     // the countdown, so under a turn on the wire it is always the full wait.
     director: status?.thinking ? "thinking" : `wake ${untilWake(status ? msLeft : null)}`,
     happened: status?.happened ?? NONE,
+    // A dash until a push names a source this window knows. Never a guess.
+    source: SOURCE_LABELS[status?.source] ?? NONE,
   };
 }
 
@@ -81,16 +96,18 @@ export function plainStatus(status, msLeft) {
 }
 
 function humanizeActivity(status) {
-  if (status.behavior) {
-    const readable = humanizeBehavior(status.behavior);
-    if (readable) {
-      return readable;
-    }
-  }
-
   // The name asked for, not the strip drawn: the plain line says what the
   // Character is doing, and a variant or a Left Strip is how it looks doing it.
   const asked = status.asked_animation ?? status.animation;
+  if (status.behavior) {
+    const readable = humanizeBehavior(status.behavior);
+    if (readable) {
+      // In parentheses, so the Animation never reads as a second Behavior.
+      const art = asked && asked !== NONE ? asked.replace(/[_-]/g, " ") : null;
+      return art && art.toLowerCase() !== readable.toLowerCase() ? `${readable} (${art})` : readable;
+    }
+  }
+
   if (asked) {
     const readable = humanizeAnimation(asked);
     if (readable) {

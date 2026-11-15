@@ -18,7 +18,7 @@ use fidget_core::overlay::{
     bubble_owner, display_index_for, drawn_frame, place_sprite, usable_in_overlay,
 };
 use fidget_core::possession::{digit_animations, Intent};
-use fidget_core::quick_message::walk_held;
+use fidget_core::quick_message::speaking_for;
 use fidget_core::roster::{InstanceId, Roster};
 use fidget_core::scheduler;
 use fidget_core::sensing::{Activity, DesktopSense, SystemClock};
@@ -1738,15 +1738,7 @@ pub(crate) fn run_frame_loop(
 
                         if !already_opened {
                             if let Some(instance) = roster.get_mut(&first_live.id) {
-                                let tour_message = "Double-click me any time to open Chat.\n\n\
-                                     Click once to Poke and get a reaction.\n\n\
-                                     Right-click to open the menu.";
-
-                                instance.enqueue(BehaviorProposal {
-                                    behavior: String::new(),
-                                    dialogue: Some(tour_message.to_string()),
-                                    direction: None,
-                                });
+                                instance.enqueue(tour_proposal());
                             }
 
                             if let Ok(mut settings_guard) = settings.lock() {
@@ -1945,11 +1937,7 @@ pub(crate) fn run_frame_loop(
                     // The reply's own Behavior is applied when it lands. The same
                     // dialogue updates the Chat row so both surfaces stream together.
                     Some(completer::Arrived::Dialogue(line)) => {
-                        proposal = Some(BehaviorProposal {
-                            behavior: String::new(),
-                            dialogue: Some(line.clone()),
-                            direction: None,
-                        });
+                        proposal = Some(streamed_line(line.clone()));
                         let _ = app.emit_to(
                             chat_label(&live.id),
                             CHAT_EVENT,
@@ -2109,7 +2097,7 @@ pub(crate) fn run_frame_loop(
                 world.poke_settled = live.pointer.poke_settled();
                 world.proposal = proposal;
                 live.qm = platform::qm_draft(&live.id);
-                world.locomotion_frozen = walk_held(&live.speech, live.qm.as_ref(), Instant::now());
+                world.speaking_for = speaking_for(&live.speech, live.qm.as_ref(), Instant::now());
                 world.chat = std::mem::take(&mut live.chat_said);
                 let ending = match session
                     .as_mut()
@@ -2165,8 +2153,10 @@ pub(crate) fn run_frame_loop(
                     // The mark goes into the logged line once, here:
                     // the Chat surface draws the record. The bubble keeps
                     // the model's words; the parser has already read them.
-                    let dialogue =
-                        chat_dialogue(parsed_dialogue.as_deref(), frame.dialogue.as_deref());
+                    let dialogue = chat_dialogue(
+                        parsed_dialogue.as_deref(),
+                        frame.dialogue.as_ref().map(|line| line.text.as_str()),
+                    );
                     let logged = dialogue.map(|line| director::marked(line, truncated));
                     session_log::log_reply(
                         &app,
@@ -2577,7 +2567,7 @@ pub(crate) fn run_frame_loop(
                     owner.is_some_and(|index| platform::overlay_listening(&overlay_label(index)));
                 let dialogue = super::draw_response(
                     &mut live.spoken,
-                    frame.dialogue.as_deref(),
+                    frame.dialogue.as_ref(),
                     owner,
                     listening,
                     Instant::now(),
@@ -2586,7 +2576,7 @@ pub(crate) fn run_frame_loop(
                 speech::note_dialogue(
                     &mut live.speech,
                     Instant::now(),
-                    dialogue.as_deref(),
+                    dialogue.as_ref(),
                     asking,
                     presence.visible,
                     overlay_drops_the_bubble,
@@ -2608,7 +2598,9 @@ pub(crate) fn run_frame_loop(
                     animation: drawn.animation.to_string(),
                     frame_index: drawn.index,
                     mirror: if drawn.mirrored { -1 } else { 1 },
-                    dialogue,
+                    // Overlay payloads stay text-only: the source is the
+                    // Chat status's, never the bubble's.
+                    dialogue: dialogue.map(|line| line.text),
                     thinking,
                     asking,
                     // A pressed or held sprite crossing a seam reaches an
@@ -3515,6 +3507,7 @@ fn answer_tool_call(
             instances: &spots,
         },
         caffeinate,
+        animation_source: fidget_core::engine::AnimationSource::AiMcp,
     };
     let _ = call
         .reply
@@ -3574,6 +3567,33 @@ fn trace_schedule_switch(was: scheduler::ScheduleMode, now: scheduler::ScheduleM
     eprintln!("click-trace: {name} t={:.1}", platform::trace_ms());
 }
 
+/// The first-run gesture tips: app-authored Talk, so no AI call or named
+/// Behavior supplies it. The empty name is what asks the Engine for Talk.
+fn tour_proposal() -> BehaviorProposal {
+    BehaviorProposal {
+        behavior: String::new(),
+        dialogue: Some(
+            "Double-click me any time to open Chat.\n\n\
+             Click once to Poke and get a reaction.\n\n\
+             Right-click to open the menu."
+                .to_string(),
+        ),
+        direction: None,
+        source: fidget_core::engine::AnimationSource::Onboarding,
+    }
+}
+
+/// A reply line still growing. `slots` hands over only the current epoch's
+/// delivery, so a superseded stream never reaches this.
+fn streamed_line(line: String) -> BehaviorProposal {
+    BehaviorProposal {
+        behavior: String::new(),
+        dialogue: Some(line),
+        direction: None,
+        source: fidget_core::engine::AnimationSource::AiRequested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3586,6 +3606,116 @@ mod tests {
     use fidget_core::window_source::{Capabilities, WorldGeometry};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_first_run_tour_is_onboarding_talk_with_no_behavior() {
+        let tour = super::tour_proposal();
+        assert_eq!(tour.behavior, "", "an empty name asks for Talk");
+        assert!(tour
+            .dialogue
+            .is_some_and(|line| line.contains("Double-click")));
+        assert_eq!(
+            tour.source,
+            fidget_core::engine::AnimationSource::Onboarding
+        );
+    }
+
+    /// A streamed line is the reply arriving, so it reads as the reply will
+    /// once it lands: no source change between streaming and the final.
+    #[test]
+    fn a_streamed_reply_line_is_ai_requested() {
+        let streamed = super::streamed_line("he".to_string());
+        assert_eq!(
+            (streamed.behavior.as_str(), streamed.dialogue.as_deref()),
+            ("", Some("he"))
+        );
+        assert_eq!(
+            streamed.source,
+            fidget_core::engine::AnimationSource::AiRequested
+        );
+    }
+
+    /// A wake superseded on the wire delivers neither its words nor its
+    /// reply, so no Frame ever reports the source of a moment the fidget left.
+    #[test]
+    fn a_superseded_delivery_never_reaches_the_animation_source() {
+        use fidget_core::engine::AnimationSource;
+
+        let mut character = character();
+        for name in ["stroll", "nap"] {
+            let mut behavior = character.behaviors["wave"].clone();
+            behavior.primitives = vec![Primitive::Walk];
+            character.behaviors.insert(name.to_string(), behavior);
+        }
+        let mut roster = Roster::new();
+        let id = roster.spawn(&character, "Pip".to_string(), Point { x: 100.0, y: 0.0 });
+        // A floor to stand on: a falling sprite defers every proposal.
+        let floor = || fidget_core::engine::WorldSnapshot {
+            displays: vec![fidget_core::window_source::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            }],
+            elapsed_ms: 16,
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            roster.get_mut(&id).expect("spawned").tick(&floor());
+        }
+
+        let mut slots = completer::Slots::new();
+        slots.wake(
+            &id,
+            completer::tests::answering("stroll\nstale words", 60),
+            completer::tests::wake_context(),
+        );
+        slots.wake(
+            &id,
+            completer::tests::answering("nap\nfresh words", 0),
+            Context {
+                happened: Happened::Poke,
+                ..completer::tests::wake_context()
+            },
+        );
+
+        let mut seen = Vec::new();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            let proposal = match slots.take(&id) {
+                Some(completer::Arrived::Dialogue(line)) => Some(super::streamed_line(line)),
+                Some(completer::Arrived::Answered(answered)) => match answered.wake {
+                    Wake::Proposed(proposal) => Some(proposal),
+                    Wake::Failed => None,
+                },
+                None => None,
+            };
+            let world = fidget_core::engine::WorldSnapshot {
+                proposal,
+                ..floor()
+            };
+            let frame = roster.get_mut(&id).expect("spawned").tick(&world);
+            seen.push((
+                frame.behavior.clone(),
+                frame.dialogue.as_ref().map(|said| said.text.clone()),
+                frame.animation_source,
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            seen.iter().any(|(behavior, _, source)| {
+                behavior.as_deref() == Some("nap") && *source == AnimationSource::AiRequested
+            }),
+            "the winning reply plays as AI Requested: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(behavior, said, _)| {
+                behavior.as_deref() == Some("stroll") || said.as_deref() == Some("stale words")
+            }),
+            "the superseded call reached a Frame: {seen:?}"
+        );
+    }
 
     fn activity(frontmost: Option<&str>) -> Activity {
         Activity {

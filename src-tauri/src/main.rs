@@ -81,7 +81,9 @@ use fidget_core::character::{Character, Primitive};
 use fidget_core::director::{
     app_instructions, happened_cell, Happened, ModelDirector, Pace, Recency, Seeded, StaticDirector,
 };
-use fidget_core::engine::{Cue, Frame, Point, SpriteFootprint, State, Verb};
+use fidget_core::engine::{
+    AnimationSource, Cue, Dialogue, Frame, Point, SpriteFootprint, State, Verb,
+};
 use fidget_core::input::Pointer;
 use fidget_core::memory;
 use fidget_core::overlay::{display_index_for, SpriteRect};
@@ -780,7 +782,9 @@ struct WorkArea {
 }
 
 struct Spoken {
-    line: String,
+    /// The line and its producer, so a replay speaks for whoever said it and
+    /// not for whatever the current Frame or proposal holds.
+    line: Dialogue,
     at: Instant,
     owner: Option<usize>,
 }
@@ -795,20 +799,20 @@ const CARRY_WINDOW: Duration = Duration::from_secs(8);
 /// Only the bubble owner latches the one-tick pulse, so either would lose it.
 fn draw_response(
     spoken: &mut Option<Spoken>,
-    said: Option<&str>,
+    said: Option<&Dialogue>,
     owner: Option<usize>,
     listening: bool,
     now: Instant,
-) -> Option<String> {
+) -> Option<Dialogue> {
     let unheard = owner.is_some() && !listening;
     let owner = owner.filter(|_| listening);
     if let Some(line) = said {
         *spoken = Some(Spoken {
-            line: line.to_string(),
+            line: line.clone(),
             at: now,
             owner,
         });
-        return (!unheard).then(|| line.to_string());
+        return (!unheard).then(|| line.clone());
     }
     let carried = spoken.as_mut()?;
     if carried.owner == owner || now.duration_since(carried.at) > CARRY_WINDOW {
@@ -3801,6 +3805,24 @@ struct ChatStatus {
     /// A turn is on the wire, and the character is not waiting on the user.
     /// The thinking ellipsis draws from this.
     thinking: bool,
+    /// Who owns the art on screen, as `source_key` spells it. Part of the
+    /// equality, so a change of owner over the same art still pushes.
+    source: &'static str,
+}
+
+/// The wire spelling of an Animation source. The core type stays free of a
+/// JSON shape; `chat-status.js` maps these keys to the labels the bar shows.
+fn source_key(source: AnimationSource) -> &'static str {
+    match source {
+        AnimationSource::IdleLoop => "idle_loop",
+        AnimationSource::Engine => "engine",
+        AnimationSource::LocalDirector => "local_director",
+        AnimationSource::AiRequested => "ai_requested",
+        AnimationSource::AiMcp => "ai_mcp",
+        AnimationSource::UserInvoked => "user_invoked",
+        AnimationSource::AiFeedback => "ai_feedback",
+        AnimationSource::Onboarding => "onboarding",
+    }
 }
 
 /// One tick's status for the bar, from the Engine's frame and the Animation
@@ -3820,6 +3842,7 @@ fn chat_status(
         happened,
         facing: frame.facing as i8,
         thinking,
+        source: source_key(frame.animation_source),
     }
 }
 
@@ -7556,6 +7579,87 @@ mod tests {
         );
     }
 
+    /// The bar's push rides on status equality, so a source-only change is
+    /// one push, and its key is the stable spelling the renderer maps.
+    #[test]
+    fn the_status_names_the_animation_source_by_a_stable_key() {
+        let mut frame =
+            fidget_core::engine::Engine::new(Point { x: 0.0, y: 0.0 }).tick(&Default::default());
+        let keys = [
+            (AnimationSource::IdleLoop, "idle_loop"),
+            (AnimationSource::Engine, "engine"),
+            (AnimationSource::LocalDirector, "local_director"),
+            (AnimationSource::AiRequested, "ai_requested"),
+            (AnimationSource::AiMcp, "ai_mcp"),
+            (AnimationSource::UserInvoked, "user_invoked"),
+            (AnimationSource::AiFeedback, "ai_feedback"),
+            (AnimationSource::Onboarding, "onboarding"),
+        ];
+        let mut seen = Vec::new();
+        for (source, key) in keys {
+            frame.animation_source = source;
+            // A variant or a Left Strip draws another name than the one asked.
+            let status = chat_status(&frame, "fall-left", None, false);
+            let pushed = serde_json::to_value(ChatStatusPush {
+                status: &status,
+                wake_ms: None,
+            })
+            .expect("a status serializes");
+            assert_eq!(pushed["source"], key, "{source:?}");
+            assert!(
+                !seen.contains(&status),
+                "{source:?} must differ from every other source's status"
+            );
+            seen.push(status);
+        }
+        frame.animation_source = AnimationSource::Engine;
+        assert!(
+            chat_status(&frame, "fall", None, false) == chat_status(&frame, "fall", None, false),
+            "an unchanged status is no new push"
+        );
+    }
+
+    fn said(text: &str) -> Dialogue {
+        Dialogue {
+            text: text.to_string(),
+            source: AnimationSource::AiRequested,
+        }
+    }
+
+    /// The carried line keeps the source it was said with. The same words
+    /// from another producer are a new pulse, since nothing deduplicates text.
+    #[test]
+    fn a_carried_line_replays_with_the_source_it_was_said_with() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let toured = Dialogue {
+            text: "hi".to_string(),
+            source: AnimationSource::Onboarding,
+        };
+        let mut spoken = None;
+        draw_response(&mut spoken, Some(&said("hi")), Some(0), true, t0);
+        assert_eq!(
+            draw_response(&mut spoken, Some(&toured), Some(0), true, at(1)),
+            Some(toured.clone()),
+            "the same text again is a new pulse, and replaces the source"
+        );
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(1), true, at(2)),
+            Some(toured.clone()),
+            "the new owner hears the stored line with its stored source"
+        );
+
+        let mut spoken = None;
+        draw_response(&mut spoken, Some(&toured), Some(0), false, t0);
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(0), true, at(1)),
+            Some(toured),
+            "an unheard line keeps its source until the page listens"
+        );
+        let late = t0 + CARRY_WINDOW + Duration::from_secs(1);
+        assert_eq!(draw_response(&mut spoken, None, Some(1), true, late), None);
+    }
+
     /// A line said on one display and carried across the seam is said
     /// again to the new owner, once, while it could still be showing — and
     /// never to the owner that already heard it.
@@ -7565,7 +7669,15 @@ mod tests {
         let mut spoken = None;
 
         assert_eq!(
-            draw_response(&mut spoken, Some("Yare yare daze."), Some(0), true, t0).as_deref(),
+            draw_response(
+                &mut spoken,
+                Some(&said("Yare yare daze.")),
+                Some(0),
+                true,
+                t0
+            )
+            .map(|line| line.text)
+            .as_deref(),
             Some("Yare yare daze."),
             "the pulse itself goes to the owner of the tick"
         );
@@ -7588,6 +7700,7 @@ mod tests {
                 true,
                 t0 + Duration::from_secs(2)
             )
+            .map(|line| line.text)
             .as_deref(),
             Some("Yare yare daze."),
             "mid-reading, the new owner is told the line"
@@ -7616,15 +7729,16 @@ mod tests {
         );
 
         let mut spoken = None;
-        draw_response(&mut spoken, Some("first"), Some(0), true, t0);
+        draw_response(&mut spoken, Some(&said("first")), Some(0), true, t0);
         assert_eq!(
             draw_response(
                 &mut spoken,
-                Some("second"),
+                Some(&said("second")),
                 Some(0),
                 true,
                 t0 + Duration::from_secs(1)
             )
+            .map(|line| line.text)
             .as_deref(),
             Some("second"),
             "a new line replaces the remembered one"
@@ -7637,6 +7751,7 @@ mod tests {
                 true,
                 t0 + Duration::from_secs(2)
             )
+            .map(|line| line.text)
             .as_deref(),
             Some("second"),
             "and it is the new line that crosses"
@@ -7651,7 +7766,7 @@ mod tests {
         let at = |secs| t0 + Duration::from_secs(secs);
         let mut spoken = None;
         assert_eq!(
-            draw_response(&mut spoken, Some("hi"), Some(0), false, t0),
+            draw_response(&mut spoken, Some(&said("hi")), Some(0), false, t0),
             None
         );
         assert_eq!(
@@ -7659,13 +7774,15 @@ mod tests {
             None
         );
         assert_eq!(
-            draw_response(&mut spoken, None, Some(0), true, at(2)).as_deref(),
+            draw_response(&mut spoken, None, Some(0), true, at(2))
+                .map(|line| line.text)
+                .as_deref(),
             Some("hi")
         );
         assert_eq!(draw_response(&mut spoken, None, Some(0), true, at(3)), None);
 
         let mut spoken = None;
-        draw_response(&mut spoken, Some("hi"), Some(0), false, t0);
+        draw_response(&mut spoken, Some(&said("hi")), Some(0), false, t0);
         let late = t0 + CARRY_WINDOW + Duration::from_secs(1);
         assert_eq!(
             draw_response(&mut spoken, None, Some(0), true, late),
@@ -7679,10 +7796,10 @@ mod tests {
         let t0 = Instant::now();
         let mut spoken = None;
 
-        let dialogue = draw_response(&mut spoken, Some("hello there"), Some(0), true, t0);
+        let dialogue = draw_response(&mut spoken, Some(&said("hello there")), Some(0), true, t0);
 
         assert_eq!(
-            dialogue.as_deref(),
+            dialogue.map(|line| line.text).as_deref(),
             Some("hello there"),
             "under DND, dialogue still reaches draw_response and the bubble"
         );

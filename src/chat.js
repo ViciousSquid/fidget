@@ -55,7 +55,7 @@ const promptConfirm = document.getElementById("prompt-confirm");
 const promptCancel = document.getElementById("prompt-cancel");
 
 const cells = Object.fromEntries(
-  ["behavior", "primitive", "animation", "state", "facing", "director", "happened"].map(
+  ["behavior", "primitive", "animation", "state", "facing", "director", "happened", "source"].map(
     (name) => [name, document.getElementById(`s-${name}`)],
   ),
 );
@@ -81,6 +81,8 @@ function paint() {
   const drawn = statusCells(status, left);
   for (const [name, node] of Object.entries(cells)) {
     node.textContent = drawn[name];
+    // A narrow Chat ellipsizes a long value; hovering reads it whole.
+    node.title = drawn[name];
   }
   plainEl.textContent = plainStatus(status, left);
 }

@@ -3193,6 +3193,7 @@ fn answer_probe_calls(calls: std::sync::mpsc::Receiver<crate::mcp_http::Call>) {
             expression: None,
             placement: PlacementQuery::empty(),
             caffeinate: None,
+            animation_source: fidget_core::engine::AnimationSource::AiMcp,
         };
         let _ = call
             .reply
@@ -6985,6 +6986,7 @@ mod tests {
                 behavior: "wave".to_string(),
                 dialogue: Some("Good morning".to_string()),
                 direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             })
         );
     }
@@ -7583,6 +7585,7 @@ mod tests {
                 behavior: String::new(),
                 dialogue: Some(line.to_string()),
                 direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             })
         };
 
@@ -7592,6 +7595,7 @@ mod tests {
                 behavior: "prowl".to_string(),
                 dialogue: Some("mine now".to_string()),
                 direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             }),
             true,
             None,
