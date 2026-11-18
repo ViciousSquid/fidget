@@ -120,7 +120,10 @@ fn resolve(flag: Option<Lang>, setting: &str, system: Lang) -> Lang {
 /// Make `setting`, under `--lang` and over the system locale, the language
 /// every later wake reads.
 pub fn apply(setting: &str) {
-    CURRENT.store(resolve(flag(), setting, system()).index(), Ordering::Relaxed);
+    CURRENT.store(
+        resolve(flag(), setting, system()).index(),
+        Ordering::Relaxed,
+    );
 }
 
 #[cfg(test)]
