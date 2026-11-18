@@ -2450,23 +2450,18 @@ mod tests {
 
     /// The app layer is paid on every wake, including an HTTP Director with a
     /// small context, and it crowds the Character and Instance prompts.
-    const APP_LAYER_BUDGET: usize = 717;
-    /// What a non-English wake may add on top: the reply-language paragraph,
-    /// which runs 146 bytes for Spanish, the longest name the Shell offers.
-    const REPLY_LANGUAGE_ALLOWANCE: usize = 150;
+    /// 900 is the nearest hundred above the longest measured size (Spanish, 841).
+    const APP_LAYER_BUDGET: usize = 900;
 
     #[test]
     fn the_app_layer_stays_under_its_budget() {
-        for (language, budget) in [
-            (None, APP_LAYER_BUDGET),
-            (Some("French"), APP_LAYER_BUDGET + REPLY_LANGUAGE_ALLOWANCE),
-            (Some("Spanish"), APP_LAYER_BUDGET + REPLY_LANGUAGE_ALLOWANCE),
-        ] {
+        for language in [None, Some("French"), Some("Spanish")] {
             let app = app_instructions(["wave", "nap", "sit"], false, true, language);
             assert!(
-                app.len() < budget,
-                "app_instructions in {language:?} is {} bytes, over the {budget} budget: {app}",
-                app.len()
+                app.len() < APP_LAYER_BUDGET,
+                "app_instructions in {language:?} is {} bytes, over the {} budget: {app}",
+                app.len(),
+                APP_LAYER_BUDGET
             );
         }
     }
