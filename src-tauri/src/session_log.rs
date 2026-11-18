@@ -1045,10 +1045,13 @@ mod tests {
                 "bmo",
                 false,
             )
-            .prompt(&Context {
-                happened,
-                ..Context::quiet()
-            })
+            .prompt(
+                &Context {
+                    happened,
+                    ..Context::quiet()
+                },
+                None,
+            )
         };
         let typed = frame(Happened::Chat("what are you standing on?".to_string()));
         let ambient = frame(Happened::Proactive);

@@ -388,12 +388,13 @@ impl<C: Completer> ModelDirector<C> {
     }
 
     /// The user turn for this wake. Settings shows this string.
-    pub fn prompt(&self, context: &Context) -> String {
-        self.request(context).text(false)
+    pub fn prompt(&self, context: &Context, reply_language: Option<&str>) -> String {
+        self.request(context, reply_language).text(false)
     }
 
-    /// This wake as the Completer receives it.
-    pub fn request(&self, context: &Context) -> WakeRequest {
+    /// This wake as the Completer receives it. `reply_language` is the
+    /// language the Shell resolved for this wake, `None` for English.
+    pub fn request(&self, context: &Context, reply_language: Option<&str>) -> WakeRequest {
         WakeRequest {
             prompt: named_moment(context, &self.instance),
             layers: character_layers(
@@ -401,6 +402,7 @@ impl<C: Completer> ModelDirector<C> {
                 self.behaviors.iter(),
                 self.blank,
                 self.completer.has_tools(),
+                reply_language,
             ),
             opening: !self.opened.load(Ordering::SeqCst),
             instance: self.instance.clone(),
@@ -418,7 +420,7 @@ impl<C: Completer> ModelDirector<C> {
     /// declares none of. A near miss arrives as dialogue, so without this it is
     /// invisible. Reported, never corrected: guessing a fix is ruled out.
     pub fn wake_and_near_miss(&self, context: &Context) -> Woken {
-        self.wake_request(self.request(context), &|_| {})
+        self.wake_request(self.request(context, None), &|_| {})
     }
 
     /// Run a wake whose prompt the caller already finished. `speaking` hears
@@ -1735,7 +1737,7 @@ mod tests {
         let director = directing(Scripted::says("wave"), ["wave"]);
 
         let moment = context(working(), &[]);
-        let expected = director.prompt(&moment);
+        let expected = director.prompt(&moment, None);
         director.wake(&moment);
         let asked = director.completer.seen().expect("a request was sent");
         assert_eq!(asked.instance, "buddy-1");
@@ -2379,7 +2381,7 @@ mod tests {
     fn a_request_invites_the_tools_without_naming_them() {
         let moment = context(working(), &["nap"]);
         let opening = with_layers(
-            &character_layers(&moment, ["wave"], false, true),
+            &character_layers(&moment, ["wave"], false, true, None),
             &named_moment(&moment, "buddy-1"),
         );
 
@@ -2441,16 +2443,33 @@ mod tests {
 
     /// The app layer is paid on every wake, including an HTTP Director with a
     /// small context, and it crowds the Character and Instance prompts.
-    const APP_LAYER_BUDGET: usize = 717;
+    /// 900 is the nearest hundred above the longest measured size (Spanish, 841).
+    const APP_LAYER_BUDGET: usize = 900;
 
     #[test]
     fn the_app_layer_stays_under_its_budget() {
-        let app = app_instructions(["wave", "nap", "sit"], false, true);
-        assert!(
-            app.len() < APP_LAYER_BUDGET,
-            "app_instructions is {} bytes, over the {APP_LAYER_BUDGET} budget: {app}",
-            app.len()
-        );
+        for language in [None, Some("French"), Some("Spanish")] {
+            let app = app_instructions(["wave", "nap", "sit"], false, true, language);
+            assert!(
+                app.len() < APP_LAYER_BUDGET,
+                "app_instructions in {language:?} is {} bytes, over the {} budget: {app}",
+                app.len(),
+                APP_LAYER_BUDGET
+            );
+        }
+    }
+
+    #[test]
+    fn spoken_language_is_a_preference_per_request() {
+        let french = app_instructions(["wave"], false, true, Some("French"));
+        let spanish = app_instructions(["wave"], false, true, Some("Spanish"));
+        let english = app_instructions(["wave"], false, true, None);
+        assert!(french.contains("Prefer to speak in French"));
+        assert!(french.contains("follow their language instead"));
+        assert!(!french.contains("Spanish"));
+        assert!(spanish.contains("Prefer to speak in Spanish"));
+        assert!(!english.contains("Prefer to speak in"));
+        assert_eq!(app_instructions(["wave"], true, true, Some("French")), "");
     }
 
     #[test]
@@ -2482,7 +2501,7 @@ mod tests {
         // carries the id too.
         let director = directing(Scripted::says("wave"), ["wave"]);
         director.wake(&moment);
-        let later = director.prompt(&moment);
+        let later = director.prompt(&moment, None);
         assert!(
             later.starts_with(
                 "Your instance_id is buddy-1. Pass it to every Fidget tool you call.\n\n"
@@ -2566,7 +2585,7 @@ mod tests {
         let moment = context(working(), &["nap"]);
         director.wake(&moment);
 
-        let later = director.request(&moment);
+        let later = director.request(&moment, None);
         assert_eq!(later.text(false), named_moment(&moment, "buddy-1"));
         assert_eq!(
             later.text(true),
@@ -2583,7 +2602,7 @@ mod tests {
         first.wake(&moment);
 
         let next = directing(Scripted::says("wave"), ["stroll"]);
-        let payload = next.prompt(&moment);
+        let payload = next.prompt(&moment, None);
         assert!(
             payload.contains("You may propose"),
             "switch is a new opening: {payload}"
@@ -3251,7 +3270,7 @@ mod tests {
     #[test]
     fn a_chat_turn_is_the_opening_turn_when_it_is_the_first_thing_that_happens() {
         let director = directing(Scripted::says("wave"), ["wave", "greet"]);
-        let payload = director.prompt(&typed("hello?"));
+        let payload = director.prompt(&typed("hello?"), None);
 
         assert!(
             payload.contains("You may propose") && payload.contains("greet"),
@@ -3404,9 +3423,10 @@ mod tests {
     fn streamed(reply: &str) -> (Vec<String>, Option<String>) {
         let director = directing(Scripted::says(reply), ["prowl", "wave", "stroll", "nap"]);
         let heard = std::cell::RefCell::new(Vec::new());
-        let woken = director.wake_request(director.request(&context(working(), &[])), &|line| {
-            heard.borrow_mut().push(line)
-        });
+        let woken = director
+            .wake_request(director.request(&context(working(), &[]), None), &|line| {
+                heard.borrow_mut().push(line)
+            });
         let parsed = match woken.wake {
             Wake::Proposed(proposal) => proposal.dialogue,
             Wake::Failed => None,

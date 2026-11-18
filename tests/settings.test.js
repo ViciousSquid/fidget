@@ -142,7 +142,7 @@ test('"the Director\'s mind" stays out of the state line', () => {
 });
 
 const HEADINGS = {
-  Presence: ["Do Not Disturb", "Hide", "Launch"],
+  Presence: ["Language", "Do Not Disturb", "Hide", "Launch"],
   Character: ["Character", "Instances"],
   AI: ["AI", "AI source", "Harness", "Model / API", "BYO - Point existing Harness at Fidget", "Last user turn"],
   Privacy: ["What the fidget can see", "Excluded applications", "Memory File"],
@@ -465,14 +465,17 @@ test("a redraw hands focus back to the control that held it", () => {
   const cases = [
     ["Character", (node) => node.tagName === "select", "character"],
     ["Presence", (node) => node.attributes.type === "checkbox", "dnd"],
-    ["Presence", (node) => node.tagName === "summary", "dnd"],
+    // Language's disclosure comes first on Presence, so pick Do Not Disturb's.
+    ["Presence", (node, root) => node.tagName === "summary" && rowOf(root, node) === "dnd", "dnd"],
   ];
   for (const [title, pick, row] of cases) {
     stubDocument();
     const root = focusRoot();
     const tab = MODEL_API.form.tabs.find((candidate) => candidate.title === title);
     render(root, tab, MODEL_API.values);
-    const before = root.querySelectorAll("input, textarea, select, button, summary, pre, label").find(pick);
+    const before = root
+      .querySelectorAll("input, textarea, select, button, summary, pre, label")
+      .find((node) => pick(node, root));
     assert.equal(rowOf(root, before), row);
     before.focus();
 

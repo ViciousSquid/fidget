@@ -189,6 +189,7 @@ pub struct SettingsView {
     /// Which Chat UI design is selected: minimal, terminal, or glass.
     pub chat_ui: String,
     pub chat_appearance: ChatAppearance,
+    pub language: String,
     /// A model or effort the attached Harness did not take.
     pub not_applied: Vec<crate::harness::NotAppliedNotice>,
     pub caffeinate_display: bool,
@@ -630,6 +631,9 @@ impl SettingsView {
             consent: consent::rows(|id| settings.wants_consent(id)),
             chat_ui: settings.chat_ui.clone(),
             chat_appearance: settings.chat_appearance,
+            language: crate::i18n::flag()
+                .map(|lang| lang.code().to_string())
+                .unwrap_or_else(|| settings.language.clone()),
         }
     }
 
@@ -776,6 +780,10 @@ impl SettingsView {
             "chat_appearance".to_string(),
             text(self.chat_appearance.title()),
         );
+        values.insert(
+            form::LANGUAGE_ID.to_string(),
+            text(&form::language_title(&self.language)),
+        );
         values
     }
 
@@ -817,6 +825,7 @@ impl SettingsView {
                     .unwrap_or_default(),
             )),
             "chat_appearance" => Some(self.chat_appearance.title().to_string()),
+            form::LANGUAGE_ID => Some(form::language_title(&self.language)),
             _ => None,
         }
     }
@@ -1136,6 +1145,15 @@ fn harness_retargets(settings: &Settings, patch: &SettingsPatch) -> bool {
         )
 }
 
+/// Whether a saved Language edit changed the language the Director will ask for.
+fn language_requires_new_session(
+    language_patched: bool,
+    previous: Option<&str>,
+    current: Option<&str>,
+) -> bool {
+    language_patched && previous != current
+}
+
 /// Whether an open Chat surface must hear a new opening: a Director switch, a
 /// source change, or any retarget, since the header names model and host. A key
 /// or timeout change re-pushes an identical opening, because one rule is
@@ -1337,7 +1355,7 @@ impl SettingsSession {
     pub fn apply(&self, patch: SettingsPatch) -> Result<(), String> {
         let switching = patch.roster.character.clone();
         let rebind = patch.presence.hide_hotkey;
-        let new_session = patch.new_session;
+        let requested_new_session = patch.new_session;
         let launch_at_login = patch.launch_at_login;
         write_key_off_the_settings_lock(&self.settings, self.secrets.as_ref(), &patch)?;
         if let Some(raw) = patch.completer.director_api_key.as_deref() {
@@ -1366,9 +1384,21 @@ impl SettingsSession {
             .is_some_and(|ui| *ui != settings.chat_ui);
         let new_chat_ui = patch.chat_ui.clone();
         let appearance_op = chat_appearance_op(settings.chat_appearance, &patch);
+        let language_patched = patch.language.is_some();
+        let previous_reply_language = crate::i18n::reply_language();
         // Seeded before `retarget_payload`, which rebuilds the Endpoint from
         // the live timeout and turn ceiling.
         apply_and_seed(&mut settings, patch);
+        if language_patched {
+            crate::i18n::apply(&settings.language);
+        }
+        let language_changed = language_requires_new_session(
+            language_patched,
+            previous_reply_language,
+            crate::i18n::reply_language(),
+        );
+        let new_session = requested_new_session || language_changed;
+        let reload_chat = reload_chat || language_changed;
         #[cfg(target_os = "macos")]
         consent::set_wanted(CapabilityId::Accessibility, settings.use_accessibility);
         consent::set_wanted(CapabilityId::WindowNames, settings.use_window_names);
@@ -1559,6 +1589,8 @@ pub struct SettingsPatch {
     pub chat_ui: Option<String>,
     pub chat_appearance: Option<ChatAppearance>,
     pub hover_delay_ms: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// The Character every Instance switches to.
@@ -1670,6 +1702,7 @@ pub enum TextField {
     ChatUI,
     ChatAppearance,
     HoverDelayMs,
+    Language,
 }
 
 impl SettingsPatch {
@@ -1760,6 +1793,7 @@ impl SettingsPatch {
                 self.chat_appearance = Some(ChatAppearance::from_title(value))
             }
             TextField::HoverDelayMs => self.hover_delay_ms = Some(value.to_string()),
+            TextField::Language => self.language = Some(form::language_choice(value)),
         }
         true
     }
@@ -1953,6 +1987,9 @@ impl Settings {
         if let Some(value) = patch.chat_appearance {
             self.chat_appearance = value;
         }
+        if let Some(value) = patch.language {
+            self.language = value;
+        }
         // director_api_key is intentionally ignored: the key lives in the
         // secret store, never in the JSON document.
     }
@@ -2132,6 +2169,9 @@ pub struct Settings {
     pub chat_ui: String,
     #[serde(default)]
     pub chat_appearance: ChatAppearance,
+    /// Reply language code, or blank for the computer's preferred language.
+    #[serde(default)]
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -2181,6 +2221,7 @@ impl Default for Settings {
             names_hint_dismissed: false,
             chat_ui: "minimal".to_string(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
         }
     }
 }
@@ -2438,6 +2479,7 @@ mod tests {
             capturable: true,
             chat_ui: "minimal".into(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
             use_accessibility: true,
             use_window_names: false,
             use_input_monitoring: true,
@@ -2941,6 +2983,7 @@ mod tests {
             capturable: true,
             chat_ui: "minimal".into(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
             use_accessibility: true,
             use_window_names: false,
             use_input_monitoring: false,
@@ -5127,6 +5170,37 @@ mod tests {
             ..SettingsPatch::default()
         };
         assert!(chat_surface_reloads(&Settings::default(), &patch));
+    }
+
+    #[test]
+    fn a_language_patch_reopens_only_when_the_resolved_language_changes() {
+        let language_patch = SettingsPatch {
+            language: Some("es".into()),
+            ..SettingsPatch::default()
+        };
+        let language_patched = language_patch.language.is_some();
+        assert!(language_requires_new_session(
+            language_patched,
+            None,
+            Some("Spanish")
+        ));
+        assert!(language_requires_new_session(
+            language_patched,
+            Some("French"),
+            None
+        ));
+        assert!(!language_requires_new_session(
+            language_patched,
+            Some("Spanish"),
+            Some("Spanish")
+        ));
+
+        let untouched = SettingsPatch::default();
+        assert!(!language_requires_new_session(
+            untouched.language.is_some(),
+            None,
+            Some("Spanish")
+        ));
     }
 
     #[test]
