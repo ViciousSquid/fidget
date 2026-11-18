@@ -15,6 +15,7 @@ pub enum Lang {
 }
 
 impl Lang {
+    /// The languages offered by Settings and accepted by `--lang`.
     pub const ALL: [Lang; 3] = [Lang::En, Lang::Fr, Lang::Es];
 
     /// The tag saved in settings and taken by `--lang`.
@@ -112,16 +113,14 @@ fn system() -> Lang {
         .unwrap_or(Lang::En)
 }
 
-fn resolve(setting: &str) -> Lang {
-    flag()
-        .or_else(|| Lang::parse(setting))
-        .unwrap_or_else(system)
+fn resolve(flag: Option<Lang>, setting: &str, system: Lang) -> Lang {
+    flag.or_else(|| Lang::parse(setting)).unwrap_or(system)
 }
 
 /// Make `setting`, under `--lang` and over the system locale, the language
 /// every later wake reads.
 pub fn apply(setting: &str) {
-    CURRENT.store(resolve(setting).index(), Ordering::Relaxed);
+    CURRENT.store(resolve(flag(), setting, system()).index(), Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -135,6 +134,14 @@ mod tests {
         assert_eq!(Lang::parse("EN-gb"), Some(Lang::En));
         assert_eq!(Lang::parse("de"), None);
         assert_eq!(Lang::Fr.english_name(), "French");
+    }
+
+    #[test]
+    fn command_line_overrides_saved_language_over_system_locale() {
+        assert_eq!(resolve(Some(Lang::Fr), "es", Lang::En), Lang::Fr);
+        assert_eq!(resolve(None, "es", Lang::Fr), Lang::Es);
+        assert_eq!(resolve(None, "en", Lang::Fr), Lang::En);
+        assert_eq!(resolve(None, "", Lang::Fr), Lang::Fr);
     }
 
     #[test]

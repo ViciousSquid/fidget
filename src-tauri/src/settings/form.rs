@@ -686,14 +686,17 @@ pub fn harness_choice(title: &str) -> String {
     }
 }
 
+/// The choice that follows the computer's preferred language.
 pub const LANGUAGE_SYSTEM: &str = "System";
 
+/// The language choices shown in the Presence popup.
 pub fn language_options() -> Vec<String> {
     let mut choices = vec![LANGUAGE_SYSTEM.to_string()];
     choices.extend(Lang::ALL.iter().map(|lang| lang.endonym().to_string()));
     choices
 }
 
+/// The saved language code for a title shown in the popup.
 pub fn language_choice(title: &str) -> String {
     Lang::ALL
         .into_iter()
@@ -702,6 +705,7 @@ pub fn language_choice(title: &str) -> String {
         .unwrap_or_default()
 }
 
+/// The popup title for a saved language code, or System for an unknown code.
 pub fn language_title(value: &str) -> String {
     Lang::parse(value)
         .map(|lang| lang.endonym().to_string())

@@ -2481,10 +2481,6 @@ mod tests {
         assert!(!french.contains("Spanish"));
         assert!(spanish.contains("Prefer to speak in Spanish"));
         assert!(!english.contains("Prefer to speak in"));
-        assert_eq!(
-            english,
-            app_instructions(["wave"], false, true, Some("English"))
-        );
         assert_eq!(app_instructions(["wave"], true, true, Some("French")), "");
     }
 

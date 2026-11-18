@@ -1145,6 +1145,15 @@ fn harness_retargets(settings: &Settings, patch: &SettingsPatch) -> bool {
         )
 }
 
+/// Whether a saved Language edit changed the language the Director will ask for.
+fn language_requires_new_session(
+    language_patched: bool,
+    previous: Option<&str>,
+    current: Option<&str>,
+) -> bool {
+    language_patched && previous != current
+}
+
 /// Whether an open Chat surface must hear a new opening: a Director switch, a
 /// source change, or any retarget, since the header names model and host. A key
 /// or timeout change re-pushes an identical opening, because one rule is
@@ -1346,7 +1355,7 @@ impl SettingsSession {
     pub fn apply(&self, patch: SettingsPatch) -> Result<(), String> {
         let switching = patch.roster.character.clone();
         let rebind = patch.presence.hide_hotkey;
-        let new_session = patch.new_session;
+        let requested_new_session = patch.new_session;
         let launch_at_login = patch.launch_at_login;
         write_key_off_the_settings_lock(&self.settings, self.secrets.as_ref(), &patch)?;
         if let Some(raw) = patch.completer.director_api_key.as_deref() {
@@ -1376,12 +1385,20 @@ impl SettingsSession {
         let new_chat_ui = patch.chat_ui.clone();
         let appearance_op = chat_appearance_op(settings.chat_appearance, &patch);
         let language_patched = patch.language.is_some();
+        let previous_reply_language = crate::i18n::reply_language();
         // Seeded before `retarget_payload`, which rebuilds the Endpoint from
         // the live timeout and turn ceiling.
         apply_and_seed(&mut settings, patch);
         if language_patched {
             crate::i18n::apply(&settings.language);
         }
+        let language_changed = language_requires_new_session(
+            language_patched,
+            previous_reply_language,
+            crate::i18n::reply_language(),
+        );
+        let new_session = requested_new_session || language_changed;
+        let reload_chat = reload_chat || language_changed;
         #[cfg(target_os = "macos")]
         consent::set_wanted(CapabilityId::Accessibility, settings.use_accessibility);
         consent::set_wanted(CapabilityId::WindowNames, settings.use_window_names);
@@ -5154,6 +5171,37 @@ mod tests {
             ..SettingsPatch::default()
         };
         assert!(chat_surface_reloads(&Settings::default(), &patch));
+    }
+
+    #[test]
+    fn a_language_patch_reopens_only_when_the_resolved_language_changes() {
+        let language_patch = SettingsPatch {
+            language: Some("es".into()),
+            ..SettingsPatch::default()
+        };
+        let language_patched = language_patch.language.is_some();
+        assert!(language_requires_new_session(
+            language_patched,
+            None,
+            Some("Spanish")
+        ));
+        assert!(language_requires_new_session(
+            language_patched,
+            Some("French"),
+            None
+        ));
+        assert!(!language_requires_new_session(
+            language_patched,
+            Some("Spanish"),
+            Some("Spanish")
+        ));
+
+        let untouched = SettingsPatch::default();
+        assert!(!language_requires_new_session(
+            untouched.language.is_some(),
+            None,
+            Some("Spanish")
+        ));
     }
 
     #[test]

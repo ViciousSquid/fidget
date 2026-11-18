@@ -107,7 +107,7 @@ pub fn app_instructions(
         ""
     };
     let language_rule = match reply_language {
-        None | Some("") | Some("English") => String::new(),
+        None => String::new(),
         Some(language) => format!(
             "\n\nPrefer to speak in {language}. If the user addresses you in another \
              language, follow their language instead. Keep Behavior names exactly as listed."
