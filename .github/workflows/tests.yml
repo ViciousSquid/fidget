@@ -17,6 +17,11 @@ concurrency:
   # Keep an in-flight run when the `windows` label fires `labeled`.
   cancel-in-progress: ${{ github.event.action != 'labeled' }}
 
+env:
+  # These jobs never open a debugger, and a backtrace needs only line tables.
+  # Full debug info made the Rust caches up to twice the size.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+
 jobs:
   # One job, both platforms: they differ only in tool installation. Linux is
   # built too because platform.rs carries a non-macOS arm for every decision.
