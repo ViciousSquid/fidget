@@ -13,8 +13,8 @@
 # Duration: about 12.5 s before the Chat-open case. Every wait gives up 3 s
 #   after its trigger; at startup that is the first frame after the launch, the
 #   overlay's page load after that frame, and its first report after the page
-#   load. Waits wake on each
-#   line of Fidget's piped stderr, on file changes, or on UI Automation
+#   load. The one exception: each aim waits up to 10 s for the sprite to land.
+#   Waits wake on each line of Fidget's piped stderr, on file changes, or on UI Automation
 #   events; nothing polls.
 # WebView2's profile is one folder every run reuses,
 #   %LOCALAPPDATA%\fidget-scenarios\webview2. The first run on a PC makes it
@@ -360,7 +360,7 @@ $root = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 $script:t0 = Get-NowMs
 
 function Get-SpriteAim([string]$LogFile) {
-    $at = Get-SpriteAtRest $LogFile
+    $at = Get-LastSpriteSpot $LogFile
     if (-not $at) { return $null }
     $size = Get-Content -LiteralPath $LogFile | Where-Object { $_ -match $T.size } | Select-Object -First 1
     if (-not $size) { return $null }
@@ -642,14 +642,27 @@ function Press-Hold([int]$X, [int]$Y, [string]$Case) {
     if (-not $seen) { Fail "${Case}: Fidget did not see the press at ($X,$Y) in 3 s; see $log" }
     if (-not (Wait-LogCount $T.up $ups)) { Fail "${Case}: Fidget did not see the release at ($X,$Y) in 3 s; see $log" }
 }
+# Presses the sprite $Times times at one aim, then checks every press hit it.
+# The check comes after the last press, so it adds no gap between presses.
+function Press-Sprite([int]$X, [int]$Y, [string]$Case, [int]$Times = 1) {
+    $downs = Count $T.down
+    for ($i = 0; $i -lt $Times; $i++) { Press-Hold $X $Y $Case }
+    $clicks = @(Get-Content -LiteralPath $log | Where-Object { $_ -match $T.down } | Select-Object -Skip $downs -First $Times)
+    if ($clicks.Count -lt $Times -or @($clicks | Where-Object { $_ -notmatch '(?:^|\s)click: down hits=\[true\]' }).Count) {
+        Fail "${Case}: click missed the sprite at its current position; see $log"
+    }
+}
 function Click-Notepad([int]$X, [int]$Y, [string]$Case) {
     $under = [PillWin]::RootAt($X, $Y)
     if ((Owner-Of $under) -ne $script:notepad.Id) { Fail "${Case}: refusing to click ($X,$Y): it would land on $(Describe-Window $under)" }
     Press-Hold $X $Y $Case
 }
 function Press([uint16]$Vk) { [PillWin]::Key($Vk, $false); [PillWin]::Key($Vk, $true) }
+# BMO drops in at spawn, and a falling sprite outruns the click.
 function Aim([string]$Case) {
-    if (-not (Wait-Until 3 { ($script:aim = Get-SpriteAim $log) })) { Fail "${Case}: the sprite was not at rest with a known size in 3 s; see $log" }
+    if (-not (Wait-ForGrounded $log)) { Fail "${Case}: the sprite did not land within 10 s; see $log" }
+    $script:aim = Get-SpriteAim $log
+    if (-not $script:aim) { Fail "${Case}: no current sprite position with a known size; see $log" }
 }
 # Off the sprite, and if Fidget last saw it there, until its hit test traces the
 # miss (3 s), so no hover dwell carries into the next case.
@@ -664,11 +677,12 @@ function Move-Away([string]$Case) {
 function Click-Sprite([string]$Case) {
     Aim $Case
     Move-Away $Case
+    Aim $Case
     if (-not (Wait-ForNext $T.hit { $null = [PillWin]::SetCursorPos($script:aim.X, $script:aim.Y) })) { Fail "${Case}: the sprite's click area did not follow the cursor; see $log" }
     if (Count $T.opened) { Fail "${Case}: the pill opened before the press; see $log" }
     $under = [PillWin]::RootAt($script:aim.X, $script:aim.Y)
     if ((Owner-Of $under) -ne $script:proc.Id) { Fail "${Case}: refusing to click the sprite at ($($script:aim.X),$($script:aim.Y)): it would land on $(Describe-Window $under)" }
-    Press-Hold $script:aim.X $script:aim.Y $Case
+    Press-Sprite $script:aim.X $script:aim.Y $Case
     Move-Away $Case
 }
 function Find-Chat {
@@ -682,9 +696,9 @@ function Find-Chat {
 function Summon-Chat([string]$Case) {
     Aim $Case
     Move-Away $Case
+    Aim $Case
     if (-not (Wait-ForNext $T.hit { $null = [PillWin]::SetCursorPos($script:aim.X, $script:aim.Y) })) { Fail "${Case}: the sprite's click area did not follow the cursor; see $log" }
-    Press-Hold $script:aim.X $script:aim.Y $Case
-    Press-Hold $script:aim.X $script:aim.Y $Case
+    Press-Sprite $script:aim.X $script:aim.Y $Case 2
     Move-Away $Case
     if (-not (Wait-LogCount $T.chatOpen 0)) { Fail "${Case}: Chat did not open; see $log" }
 }

@@ -3,6 +3,7 @@
 // here on Linux too. Each platform helper has to load it.
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import path from "node:path";
 import { suite, test } from "node:test";
 import { tempDir } from "./temp-path.js";
@@ -389,8 +390,6 @@ ${[10, 10, 10, 10, 210].map(frame).join("\n")}
     assert.deepStrictEqual(r.lines.slice(0, 4), ["10", "False", "False", "False"], r.err);
   });
 
-  const menuLeaf = path.join(scenarios, "..", "ci", "control-click-menu.win.ps1");
-
   function walkThenRest(t, call) {
     return ps(t, `$t = "$W/p.log"
 Set-Content "$W/walk.sh" @'
@@ -416,23 +415,93 @@ Write-Output $(if ($rest) { $rest.X } else { "null" })`);
     assert.strictEqual(r.lines[1], "160", r.err);
   });
 
-  // The leaf's Wait-Settled, not the helper. A walk past 3 s must still rest.
-  test("Windows: control-click-menu Wait-Settled keeps waiting while the sprite walks, past 3 s", { skip: noPwsh }, async (t) => {
-    const r = await walkThenRest(t, `$tokens = $null; $errors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile('${menuLeaf}', [ref]$tokens, [ref]$errors)
-$fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Wait-Settled" }, $true)
-if ($fn.Count -ne 1) { throw "missing Wait-Settled" }
-Invoke-Expression $fn[0].Extent.Text
-function Fail($m) { throw $m }
-$traceFile = $t
+  // A falling sprite moves ~60 px a frame, so a click aimed at it misses; the
+  // wait ends at the landing frame, not at rest.
+  test("Windows: Wait-ForGrounded returns the landing spot, not a falling one", { skip: noPwsh }, async (t) => {
+    const r = await ps(t, `$t = "$data/process.log"
+Add-Content $t "1 frame: 1 Falling pos(1720,696) sprite(1657,568) fall#0 x"
+Add-Content $t "1 frame: 1 Falling pos(1720,760) sprite(1657,632) talk#0 x"
+Later "echo '1 frame: 1 Grounded pos(1720,1392) sprite(1657,1264) land#0 x' >> $t"
 $start = Get-NowMs
-$rest = Wait-Settled
+$at = Wait-ForGrounded $t 5
 $took = (Get-NowMs) - $start
-Write-Output $took
-Write-Output $(if ($rest) { $rest.X } else { "null" })`);
+Write-Output $(if ($at) { "$($at.X),$($at.Y)" } else { "null" })
+Write-Output $took`);
     assert.strictEqual(r.code, 0, r.err);
-    assert.ok(Number(r.lines[0]) >= 3500 && Number(r.lines[0]) < 6000, `took ${r.lines[0]} ms: ${r.err}`);
-    assert.strictEqual(r.lines[1], "160", r.err);
+    assert.strictEqual(r.lines[0], "1657,1264", r.err);
+    assert.ok(Number(r.lines[1]) >= 250 && Number(r.lines[1]) < 2000, `took ${r.lines[1]} ms`);
+  });
+
+  test("Windows: Wait-ForGrounded gives up at its ceiling while the sprite falls", { skip: noPwsh }, async (t) => {
+    const r = await ps(t, `$t = "$data/process.log"
+Add-Content $t "1 frame: 1 Grounded pos(1720,1392) sprite(1657,1264) land#0 x"
+Add-Content $t "1 frame: 1 Falling pos(1720,696) sprite(1657,568) fall#0 x"
+Later "echo '1 frame: 1 Falling pos(1720,760) sprite(1657,632) fall#0 x' >> $t"
+$start = Get-NowMs
+$at = Wait-ForGrounded $t 1
+$took = (Get-NowMs) - $start
+Write-Output ([bool]$at)
+Write-Output $took`);
+    assert.strictEqual(r.code, 0, r.err);
+    assert.strictEqual(r.lines[0], "False", r.err);
+    assert.ok(Number(r.lines[1]) >= 900 && Number(r.lines[1]) < 2500, `took ${r.lines[1]} ms`);
+    assert.match(r.err, /the sprite did not land within 1 s/);
+  });
+
+  // #1850: a walking sprite is clicked where it is now, once, and a miss fails.
+  // The fullscreen guard must check the point that is clicked, so both get $cx $cy.
+  for (const [name, command] of [
+    ["control-click-menu.win.ps1", "menu"],
+    ["question-bubble.win.ps1", "click"],
+  ]) {
+    test(`${name} clicks once at the point the fullscreen guard checked`, () => {
+      const src = readFileSync(path.join(scenarios, "..", "ci", name), "utf8");
+      assert.doesNotMatch(src, /function Wait-Settled|Wait-ForRest|Get-SpriteAtRest|\$maxAttempts/);
+      assert.match(src, /Skip-IfFullscreenOverClick \$cx \$cy /);
+      const landed = src.indexOf("$spot = Wait-ForGrounded $traceFile");
+      assert.ok(landed >= 0, "the leaf aims without waiting for the landing");
+      assert.ok(landed < src.indexOf("$cx = $spot.X"), "the leaf aims before the landing wait");
+      const calls = (src.match(/Invoke-Ax "[^"]+" @\{[^}]*\}/g) ?? []).filter((c) => c.includes(`Command = "${command}"`));
+      assert.strictEqual(calls.length, 1, calls.join("\n"));
+      assert.match(calls[0], new RegExp(`Command = "${command}";.*X = \\$cx; Y = \\$cy`));
+      assert.doesNotMatch(calls[0], /SpriteW/);
+    });
+  }
+
+  const pillLeaf = path.join(scenarios, "..", "manual-only", "chat-close-pill-type.win.ps1");
+
+  // The first aim comes right after launch, while BMO may still be dropping in.
+  test("chat-close-pill-type aims only at a landed sprite", () => {
+    const src = readFileSync(pillLeaf, "utf8");
+    const aim = src.match(/^function Aim\(.*?^\}/ms);
+    assert.ok(aim, "missing Aim");
+    assert.match(aim[0], /Wait-ForGrounded \$log[\s\S]*Get-SpriteAim \$log/);
+    assert.doesNotMatch(src, /Get-SpriteAtRest|Wait-ForRest/);
+  });
+
+  // Both presses of the double-click go out before either is checked, so the
+  // log read sits after them and the gap between them stays one traced press.
+  test("Windows: chat-close-pill-type presses twice, then checks both hit the sprite", { skip: noPwsh }, async (t) => {
+    const r = await ps(t, `$tokens = $null; $errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile('${pillLeaf}', [ref]$tokens, [ref]$errors)
+$fn = $ast.FindAll({ $args[0] -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $args[0].Name -eq "Press-Sprite" }, $true)
+if ($fn.Count -ne 1) { throw "missing Press-Sprite" }
+Invoke-Expression $fn[0].Extent.Text
+$T = @{ down = 'click: down ' }
+$log = "$W/p.log"
+function Count($p) { @(Get-Content -LiteralPath $log | Where-Object { $_ -match $p }).Count }
+function Fail($m) { throw $m }
+function Run([string[]]$hits) {
+    Set-Content -LiteralPath $log "1 click: down hits=[false] earlier"
+    $script:queue = [System.Collections.Queue]::new($hits)
+    $script:order = @()
+    function script:Press-Hold($X, $Y, $Case) { $script:order += "press"; Add-Content -LiteralPath $log "1 click: down hits=[$($script:queue.Dequeue())] x" }
+    try { Press-Sprite 5 6 case 2; "ok $($script:order.Count)" } catch { "fail $($script:order.Count)" }
+}
+Run @("true", "true")
+Run @("false", "true")
+Run @("true", "false")`);
+    assert.deepStrictEqual(r.lines.slice(0, 3), ["ok 2", "fail 2", "fail 2"], r.err);
   });
 
   test("Windows: Wait-ForRest keeps the rest it already saw when a walk frame lands", { skip: noPwsh }, async (t) => {
