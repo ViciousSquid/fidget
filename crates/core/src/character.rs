@@ -36,6 +36,10 @@
 //! ```text
 //! name = "Blip"
 //!
+//! [frame_facing]
+//! "walk-left-0.png" = "left"
+//! "walk-left-1.png" = "left"
+//!
 //! [source]
 //! art = "Blip, cut from the Blipworks shimeji pack"
 //! url = "https://example.invalid/blip"
@@ -72,7 +76,10 @@ use crate::overlay::AlphaMask;
 mod manifest;
 mod resolve;
 use manifest::parse;
-use resolve::{check_left_strips, check_variants, resolve_animations, resolve_behaviors};
+use resolve::{
+    check_frame_facing, check_left_strips, check_play_animations, check_same_as, check_variants,
+    resolve_animations, resolve_behaviors,
+};
 
 /// A Character Package as bytes: file name to contents. The Shell does the
 /// reading; the loader never touches a path.
@@ -92,6 +99,10 @@ pub const REQUIRED_ANIMATIONS: [&str; 9] = [
     "idle", "walk", "fall", "land", "sit", "sleep", "react", "talk", "hold",
 ];
 
+/// Idle-gesture is a category of Animation, not a Behavior type. An Animation
+/// joins it with `variant_of = "idle-gesture"` and keeps its own name.
+pub const IDLE_GESTURE: &str = "idle-gesture";
+
 /// How long a Personality Prompt may be, in characters. Untrusted text in every
 /// Character Prompt the Director sends, so an unbounded one spends tokens and
 /// buries sensing under prose. Generous enough for a paragraph of personality.
@@ -110,6 +121,16 @@ pub(crate) const DEFAULT_FPS: u32 = 8;
 /// it does not say. Not zero. Ten rather than one so a declaration can go
 /// down: a default of one is also the floor.
 pub(crate) const DEFAULT_WEIGHT: u32 = 10;
+
+/// Seconds between idle-gestures when the manifest does not say. Inclusive.
+/// Short enough to read as alive, long enough that the loop is the baseline.
+pub const DEFAULT_IDLE_GESTURE_EVERY_S: (u32, u32) = (10, 30);
+
+/// Seconds of Grounded or Perched time with no user interaction before sleep.
+pub const DEFAULT_SLEEP_AFTER_S: (u32, u32) = (120, 600);
+
+/// Seconds asleep before the sprite wakes on its own.
+pub const DEFAULT_SLEEP_FOR_S: (u32, u32) = (300, 600);
 
 /// The scale the renderer uses when a Character does not say.
 /// Four is what the shipped pixel-art Characters have always been drawn at.
@@ -202,6 +223,32 @@ pub enum Primitive {
     /// velocity and nothing more. `Falling` carries the arc and the existing
     /// landing path ends it, so a jump reuses the Throw's physics.
     Jump,
+    /// The moment possession starts. The Engine plays it itself and no
+    /// Behavior composes it, so it is not in the manifest's names.
+    Possessed,
+}
+
+/// Which of the Required Animation Set a Primitive plays.
+pub(crate) fn animation_of(primitive: Primitive) -> &'static str {
+    match primitive {
+        Primitive::Idle => "idle",
+        // The Animation only. The motion belongs to the walk a proposal starts,
+        // which outlives this Primitive's turn and stops when Perch runs out.
+        Primitive::Walk => "walk",
+        Primitive::Land => "land",
+        Primitive::Sit => "sit",
+        Primitive::Sleep => "sleep",
+        Primitive::React => "react",
+        Primitive::Talk => "talk",
+        Primitive::Hold => "hold",
+        // No chase Animation in the required set; walk is the motion.
+        Primitive::Chase => "walk",
+        // Optional art: the renderer resolves it to `fall` when a package
+        // draws none, so the required set stays at nine (ADR-0007).
+        Primitive::Jump => "jump",
+        // Optional art too, resolved to `react` when a package draws none.
+        Primitive::Possessed => "possessed",
+    }
 }
 
 const PRIMITIVES: [(&str, Primitive); 10] = [
@@ -219,7 +266,7 @@ const PRIMITIVES: [(&str, Primitive); 10] = [
 
 /// Primitives Chat and MCP may ask for by Behavior name via `play_behavior`.
 /// Off the table: `land`/`hold` (Engine landing / perch grip), `talk` (Engine
-/// plays during speech), `idle` (ambient; not an ask).
+/// plays during Dialogue), `idle` (ambient; not an ask).
 pub(super) const ASKABLE_PRIMITIVES: &[(&str, Primitive)] = &[
     ("walk", Primitive::Walk),
     ("sit", Primitive::Sit),
@@ -240,9 +287,8 @@ pub struct Animation {
     pub fps: u32,
     /// Whether the Animation repeats or holds its last frame.
     pub looping: bool,
-    /// Names of the Animations that declared `variant_of` this one, in name
-    /// order. Starting this Animation draws one of this and those by weight
-    /// until the engine asks for something else.
+    /// Variants of this Animation, in name order. Draw order is the base
+    /// and then this list, so one seed lands on the same member everywhere.
     pub variants: Vec<String>,
     /// The Animation drawn in this one's place when the sprite travels left,
     /// from the package's `left_of`. `None` mirrors this Animation's own art.
@@ -251,9 +297,20 @@ pub struct Animation {
     /// manifest does not say. An Animation in no ring carries the default all
     /// the same, and nothing reads it.
     pub weight: u32,
+    /// `variant_of`. `"idle-gesture"` is a category of Animation, not a
+    /// Behavior type. The Animation keeps its own name. Other values name a base.
+    pub variant_of: Option<String>,
+    /// `same_as`: the Animation whose frames, fps and loop this one plays.
+    /// A name for the same clip, never a ring member or an idle-gesture.
+    pub same_as: Option<String>,
 }
 
 impl Animation {
+    /// Whether this Animation is classified as an idle-gesture.
+    pub fn is_idle_gesture(&self) -> bool {
+        self.variant_of.as_deref() == Some(IDLE_GESTURE)
+    }
+
     /// Which frame is on screen `elapsed_ms` after this Animation started.
     /// The renderer needs no clock of its own because this is the whole of
     /// frame selection.
@@ -297,10 +354,14 @@ pub enum Trigger {
     Frontmost(String),
 }
 
-/// A named sequence of Primitives, declared as data.
+/// A named sequence of Primitives, or one named idle-gesture Animation.
+/// A Behavior fills either `primitives` or `animation`, never both.
+/// The single Animation plays one pass before `then` continues.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Behavior {
     pub primitives: Vec<Primitive>,
+    /// One pass of this idle-gesture Animation. Empty `primitives` when set.
+    pub animation: Option<String>,
     /// A Behavior that follows this one, by name. Chains are validated to
     /// terminate, so no Character can put the sprite in a loop it never leaves.
     pub then: Option<String>,
@@ -310,6 +371,28 @@ pub struct Behavior {
     pub weight: u32,
     /// When this Behavior may be picked, or `None` for any time at all.
     pub trigger: Option<Trigger>,
+    /// The Character manifest doesn't declare it; the loader added it.
+    pub not_in_manifest: bool,
+    /// `type = "idle"`. This Behavior's `idle` steps use the Engine's idle
+    /// loops and idle-gestures. Otherwise an `idle` step draws the loop ring
+    /// and loops that member for the turn.
+    pub idle_type: bool,
+}
+
+impl Behavior {
+    /// Whether `play` includes this Primitive.
+    pub fn plays(&self, primitive: Primitive) -> bool {
+        self.primitives.contains(&primitive)
+    }
+}
+
+/// Which way a frame's art faces, as drawn. The renderer mirrors a frame
+/// exactly when this differs from the way the sprite travels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Facing {
+    Left,
+    #[default]
+    Right,
 }
 
 /// One distinct frame's art, decoded once at load.
@@ -321,6 +404,8 @@ pub struct Art {
     /// renderer hands its webview.
     pub png: Vec<u8>,
     pub mask: AlphaMask,
+    /// The manifest's `frame_facing` for this frame, else its `facing`.
+    pub facing: Facing,
 }
 
 /// A Character that has been validated: every required Animation is present,
@@ -349,6 +434,12 @@ pub struct Character {
     /// How the Character reacts to a cursor rushing at it.
     pub rush_reaction: CursorReaction,
     pub gravity_scale: GravityScale,
+    /// Inclusive seconds between idle-gestures. The manifest, or the default.
+    pub idle_gesture_every_s: (u32, u32),
+    /// Inclusive seconds awake and untouched before sleep.
+    pub sleep_after_s: (u32, u32),
+    /// Inclusive seconds asleep before waking into an idle loop.
+    pub sleep_for_s: (u32, u32),
     /// Where the art came from, when the package says. `None` is silence, not
     /// a claim: a package that declares no `[source]` gets no attribution
     /// printed for it rather than one implying the art is this repository's.
@@ -399,44 +490,204 @@ pub struct Drawn<'a> {
     pub index: usize,
     /// Whether this art is drawn flipped horizontally. The hit-test and the
     /// webview both read it, so the clickable region is the visible art.
-    /// Leftward travel mirrors unless a left strip already faces left.
+    /// True when the frame's declared facing is not the way of travel.
     pub mirrored: bool,
 }
 
+/// How the Engine's own idle is drawn. `None` for a Behavior's ordinary
+/// `idle`, and for walk, talk, and every other Animation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IdleBeat {
+    /// An idle loop: base `idle`, or a `variant_of` it.
+    IdleLoop(String),
+    /// An idle-gesture: the `idle-gesture` family, one pass from frame 0.
+    IdleGesture(String),
+}
+
+/// One idle loop, idle-gesture, or digit Animation the Engine can play.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdleMember {
+    pub(crate) name: String,
+    pub(crate) weight: u32,
+    pub(crate) frames: u32,
+    pub(crate) fps: u32,
+}
+
+/// How long one pass of an Animation is, for a Primitive that plays its art
+/// through once rather than for a fixed turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OnePass {
+    pub(crate) frames: u32,
+    pub(crate) fps: u32,
+}
+
+/// Loops, idle-gestures, the timing ranges, what digits play while possessed,
+/// and the art `react` and `possessed` play through once. The Engine picks;
+/// `draw` does not weigh this a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdlePlan {
+    pub(crate) loops: Vec<IdleMember>,
+    pub(crate) gestures: Vec<IdleMember>,
+    pub(crate) digits: Vec<IdleMember>,
+    pub(crate) react: Option<OnePass>,
+    pub(crate) possessed: Option<OnePass>,
+    pub(crate) idle_gesture_every_s: (u32, u32),
+    pub(crate) sleep_after_s: (u32, u32),
+    pub(crate) sleep_for_s: (u32, u32),
+}
+
+/// What `Character::draw` uses to choose a ring member.
+pub enum RingChoice<'a> {
+    /// Weigh the ring with this draw. Zero is the base only when the mixer
+    /// lands there, which a ring can refuse.
+    Weighed(u64),
+    /// The Engine's own idle, already decided.
+    Beat(&'a IdleBeat),
+    /// This animation's own frames. A Behavior or a digit named an Animation.
+    /// Weighing the family would play a sibling of the base.
+    Named(&'a str),
+}
+
+impl From<u64> for RingChoice<'static> {
+    fn from(draw: u64) -> Self {
+        RingChoice::Weighed(draw)
+    }
+}
+
+impl<'a> RingChoice<'a> {
+    /// Prefer a named idle beat; otherwise weigh the family with `variant_draw`.
+    pub fn from_beat(beat: Option<&'a IdleBeat>, variant_draw: u64) -> Self {
+        match beat {
+            Some(beat) => RingChoice::Beat(beat),
+            None => RingChoice::Weighed(variant_draw),
+        }
+    }
+}
+
 impl Character {
-    /// How tall this Character stands, in points: the idle Animation's frame
-    /// at this Character's scale. The art hangs above the feet, so this is the
-    /// room a Perch near the top has to leave. Idle is the usual drawn size.
+    /// How tall the base idle frame stands, in points, at this Character's
+    /// scale. Asks for the base idle loop by name: a weighed zero can land
+    /// on a variant. The art hangs above the feet a high Perch must clear.
     pub fn sprite_height(&self) -> f64 {
-        self.draw("idle", 0, 0, 1.0)
+        let beat = IdleBeat::IdleLoop("idle".to_string());
+        self.draw("idle", 0, RingChoice::Beat(&beat), 1.0)
             .map_or(0.0, |drawn| f64::from(drawn.frame_size.1))
             * f64::from(self.scale)
     }
 
-    /// Which frame of `animation` is on screen `animation_ms` after it started.
-    /// `variant_draw` is held while it plays; zero draws the base. `None` rather
-    /// than a substitute, because the renderer was told the name it asked for.
-    pub fn draw(
+    /// Idle loops (base, then `variant_of` by name), idle-gestures, the
+    /// timing ranges, and the digit Animations with their pass lengths.
+    /// Missing art is an empty plan at the defaults.
+    pub fn idle_plan(&self) -> IdlePlan {
+        let digits: Vec<IdleMember> = crate::possession::digit_animations(&self.animations)
+            .into_iter()
+            .map(|digit| idle_member(digit.play_name, &self.animations[digit.play_name]))
+            .collect();
+        let one_pass = |name| {
+            self.named(name).map(|(_, animation)| OnePass {
+                frames: animation.frames.len() as u32,
+                fps: animation.fps,
+            })
+        };
+        let (react, possessed) = (one_pass("react"), one_pass("possessed"));
+        let Some(base) = self.animations.get("idle") else {
+            return IdlePlan {
+                loops: Vec::new(),
+                gestures: Vec::new(),
+                digits,
+                react,
+                possessed,
+                idle_gesture_every_s: self.idle_gesture_every_s,
+                sleep_after_s: self.sleep_after_s,
+                sleep_for_s: self.sleep_for_s,
+            };
+        };
+        let mut loops = vec![idle_member("idle", base)];
+        for name in &base.variants {
+            if let Some(animation) = self.animations.get(name) {
+                loops.push(idle_member(name, animation));
+            }
+        }
+        let mut gestures: Vec<IdleMember> = self
+            .animations
+            .iter()
+            .filter(|(_, animation)| animation.is_idle_gesture())
+            .map(|(name, animation)| idle_member(name, animation))
+            .collect();
+        gestures.sort_by(|left, right| left.name.cmp(&right.name));
+        IdlePlan {
+            loops,
+            gestures,
+            digits,
+            react,
+            possessed,
+            idle_gesture_every_s: self.idle_gesture_every_s,
+            sleep_after_s: self.sleep_after_s,
+            sleep_for_s: self.sleep_for_s,
+        }
+    }
+
+    /// Whether a later tick would show a different frame. A one-frame loop
+    /// is still, so it must not keep the renderer hot. A Behavior's idle
+    /// loops, so it stays on the clock until the turn ends.
+    pub fn art_still_advancing(
         &self,
         animation: &str,
         animation_ms: u32,
-        variant_draw: u64,
-        facing: f64,
+        beat: Option<&IdleBeat>,
+    ) -> bool {
+        match beat {
+            Some(IdleBeat::IdleLoop(name)) => self.animations.get(name).is_some_and(|anim| {
+                (anim.looping && anim.frames.len() > 1)
+                    || anim.frame_at(animation_ms) + 1 < anim.frames.len()
+            }),
+            Some(IdleBeat::IdleGesture(name)) => self.animations.get(name).is_some_and(|anim| {
+                anim.frames.len() > 1 && anim.frame_at(animation_ms) + 1 < anim.frames.len()
+            }),
+            None => self.animations.get(animation).is_some_and(|anim| {
+                anim.looping || anim.frame_at(animation_ms) + 1 < anim.frames.len()
+            }),
+        }
+    }
+
+    /// Which frame of `animation` is on screen. A weighed draw picks a ring
+    /// member. A beat plays the named loop or gesture from `animation_ms`.
+    pub fn draw<'c>(
+        &self,
+        animation: &str,
+        animation_ms: u32,
+        choice: impl Into<RingChoice<'c>>,
+        heading: f64,
     ) -> Option<Drawn<'_>> {
-        let (name, animation) = self.resolve(animation, variant_draw)?;
-        // Strip first, mirror second, and never both: an Animation that draws
-        // its own leftward art is handed over as authored, and one that does
-        // not is mirrored.
-        let (name, animation, mirrored) = match animation
+        let (name, animation, elapsed) = match choice.into() {
+            RingChoice::Weighed(draw) => {
+                let (name, animation) = self.resolve(animation, draw)?;
+                (name, animation, animation_ms)
+            }
+            RingChoice::Beat(IdleBeat::IdleLoop(member) | IdleBeat::IdleGesture(member)) => {
+                let (name, animation) = self.beat_member(animation, member)?;
+                (name, animation, animation_ms)
+            }
+            RingChoice::Named(member) => {
+                let (name, animation) = self.animations.get_key_value(member)?;
+                (name.as_str(), animation, animation_ms)
+            }
+        };
+        let travel = if heading < 0.0 {
+            Facing::Left
+        } else {
+            Facing::Right
+        };
+        let (name, animation) = match animation
             .left_strip
             .as_deref()
-            .filter(|_| facing < 0.0)
+            .filter(|_| travel == Facing::Left)
             .and_then(|left| self.animations.get_key_value(left))
         {
-            Some((left_name, left)) => (left_name.as_str(), left, false),
-            None => (name, animation, facing < 0.0),
+            Some((left_name, left)) => (left_name.as_str(), left),
+            None => (name, animation),
         };
-        let index = animation.frame_at(animation_ms);
+        let index = animation.frame_at(elapsed);
         let art = self.art.get(animation.frames.get(index)?)?;
 
         Some(Drawn {
@@ -444,28 +695,58 @@ impl Character {
             mask: &art.mask,
             frame_size: animation.frame_size,
             index,
-            mirrored,
+            mirrored: art.facing != travel,
         })
+    }
+
+    /// The Animation asked for, or its fallback. A missing optional wants the
+    /// Animation the manifest named, not a weighed member.
+    fn named(&self, requested: &str) -> Option<(&str, &Animation)> {
+        match self.animations.get_key_value(requested) {
+            Some((name, animation)) => Some((name.as_str(), animation)),
+            None => {
+                let (_, fallback) = OPTIONAL_FALLBACKS
+                    .iter()
+                    .find(|(optional, _)| *optional == requested)?;
+                self.animations
+                    .get_key_value(*fallback)
+                    .map(|(name, animation)| (name.as_str(), animation))
+            }
+        }
+    }
+
+    /// True when `member` declares `variant_of = "idle-gesture"`.
+    fn idle_gesture_named(&self, member: &str) -> bool {
+        self.animations
+            .get(member)
+            .is_some_and(|animation| animation.is_idle_gesture())
+    }
+
+    /// `member` when it is `requested`, a variant of it, or an idle-gesture
+    /// while `requested` is idle. Anything else draws nothing, so a stale
+    /// name cannot show another Animation.
+    fn beat_member(&self, requested: &str, member: &str) -> Option<(&str, &Animation)> {
+        let (name, base) = self.named(requested)?;
+        let linked = member == name || base.variants.iter().any(|variant| variant == member);
+        let gesture = name == "idle" && self.idle_gesture_named(member);
+        if !linked && !gesture {
+            return None;
+        }
+        self.animations
+            .get_key_value(member)
+            .map(|(found, animation)| (found.as_str(), animation))
     }
 
     /// Which Animation actually draws: the one asked for, its fallback, or the
     /// variant-ring member the draw weighs out. Same mixer as the Static
     /// Director, and members in `BTreeMap` order: the draw walks a running total.
     fn resolve(&self, requested: &str, draw: u64) -> Option<(&str, &Animation)> {
-        let (name, base) = match self.animations.get_key_value(requested) {
-            Some(found) => found,
-            None => {
-                let (_, fallback) = OPTIONAL_FALLBACKS
-                    .iter()
-                    .find(|(optional, _)| *optional == requested)?;
-                self.animations.get_key_value(*fallback)?
-            }
-        };
+        let (name, base) = self.named(requested)?;
         if base.variants.is_empty() {
-            return Some((name.as_str(), base));
+            return Some((name, base));
         }
 
-        let members: Vec<(&str, &Animation)> = std::iter::once((name.as_str(), base))
+        let members: Vec<(&str, &Animation)> = std::iter::once((name, base))
             .chain(base.variants.iter().filter_map(|variant| {
                 self.animations
                     .get_key_value(variant)
@@ -480,20 +761,40 @@ impl Character {
     }
 }
 
+fn idle_member(name: &str, animation: &Animation) -> IdleMember {
+    IdleMember {
+        name: name.to_string(),
+        weight: animation.weight,
+        frames: animation.frames.len() as u32,
+        fps: animation.fps,
+    }
+}
+
 /// Optional Animations, and what draws when a package does not declare them:
 /// used when present, and absent silently, never as a missing sprite.
-const OPTIONAL_FALLBACKS: [(&str, &str); 3] = [
+const OPTIONAL_FALLBACKS: [(&str, &str); 4] = [
     ("climb", "walk"),
     ("grab", "fall"),
     // The Required Animation Set is closed at nine, so a jump is optional art.
     // A Character without it rises and falls in its `fall`.
     ("jump", "fall"),
+    ("possessed", "react"),
 ];
 
 /// How many Behaviors of a loop a rejection spells out before it stops.
 /// A bound on the error rather than on the package: an author wants to see
 /// where their loop closes, and an awkward package can chain twenty thousand.
 const SHOWN_LOOP_BEHAVIORS: usize = 8;
+
+/// The name a package's Character Manifest declares, read without decoding
+/// any art, so a caller can skip a package whose name another already took.
+pub fn declared_name(package: &PackageBytes) -> Option<String> {
+    let manifest = std::str::from_utf8(package.get(CHARACTER_MANIFEST_FILE)?).ok()?;
+    if manifest.len() > MANIFEST_LIMIT {
+        return None;
+    }
+    parse(manifest, &mut Vec::new())?.name
+}
 
 /// Validate a Character Package.
 /// Returns every error at once rather than the first, so an author fixes their
@@ -529,7 +830,7 @@ pub fn load(package: &PackageBytes) -> Result<Character, Vec<String>> {
         errors.push("the package declares no name".to_string());
     }
     for required in REQUIRED_ANIMATIONS {
-        if !declared.animations.contains_key(required) {
+        if !declared.animations.contains_key(required) && !declared.same_as.contains_key(required) {
             errors.push(format!(
                 "the package declares no {required:?} animation, \
                  which every Character must supply"
@@ -538,15 +839,49 @@ pub fn load(package: &PackageBytes) -> Result<Character, Vec<String>> {
     }
 
     let personality = personality(package, &mut errors);
-    let variant_pairs = check_variants(&declared.animations, &mut errors);
-    let left_pairs = check_left_strips(&declared.animations, &mut errors);
-    let (mut animations, art) = resolve_animations(package, declared.animations, &mut errors);
+    let alias_pairs = check_same_as(&declared.animations, &declared.same_as, &mut errors);
+    let variant_pairs = check_variants(&declared.animations, &declared.same_as, &mut errors);
+    let left_pairs = check_left_strips(&declared.animations, &declared.same_as, &mut errors);
+    check_frame_facing(&declared, &mut errors);
+    let (mut animations, art) = resolve_animations(
+        package,
+        declared.animations,
+        declared.facing,
+        &declared.frame_facing,
+        &mut errors,
+    );
     // Linked after resolution so a variant whose frames failed never joins a
     // ring; its own declaration errors already say why.
     for (variant, base) in variant_pairs {
         if animations.contains_key(&variant) {
             if let Some(base) = animations.get_mut(&base) {
                 base.variants.push(variant);
+            }
+        }
+    }
+    // Idle swaps a loop and a gesture mid-stretch, so a different size would
+    // jump the sprite. A walk or talk ring is drawn once and may differ.
+    let idle_loops = animations
+        .get("idle")
+        .map(|idle| (idle.frame_size, idle.variants.clone()));
+    let gesture_names: Vec<String> = animations
+        .iter()
+        .filter(|(_, animation)| animation.is_idle_gesture())
+        .map(|(name, _)| name.clone())
+        .collect();
+    if let Some((base_size, loops)) = idle_loops {
+        let mut names = loops;
+        names.extend(gesture_names);
+        for name in names {
+            let Some(member) = animations.get(&name) else {
+                continue;
+            };
+            if member.frame_size != base_size {
+                errors.push(format!(
+                    "animation {name:?} frames are {}x{}, and its base \"idle\" is {}x{}; \
+                     idle loops and idle-gestures share the base frame size",
+                    member.frame_size.0, member.frame_size.1, base_size.0, base_size.1
+                ));
             }
         }
     }
@@ -569,7 +904,24 @@ pub fn load(package: &PackageBytes) -> Result<Character, Vec<String>> {
             }
         }
     }
+    for (alias, owner) in alias_pairs {
+        if let Some(owner_animation) = animations.get(&owner) {
+            let same = Animation {
+                frames: owner_animation.frames.clone(),
+                frame_size: owner_animation.frame_size,
+                fps: owner_animation.fps,
+                looping: owner_animation.looping,
+                variants: Vec::new(),
+                left_strip: None,
+                weight: DEFAULT_WEIGHT,
+                variant_of: None,
+                same_as: Some(owner),
+            };
+            animations.insert(alias, same);
+        }
+    }
     let behaviors = resolve_behaviors(declared.behaviors, &mut errors);
+    check_play_animations(&behaviors, &animations, &mut errors);
 
     match (errors.is_empty(), declared.name) {
         (true, Some(name)) => Ok(Character {
@@ -585,6 +937,11 @@ pub fn load(package: &PackageBytes) -> Result<Character, Vec<String>> {
             near_reaction: declared.near_reaction.unwrap_or_default(),
             rush_reaction: declared.rush_reaction.unwrap_or_default(),
             gravity_scale: declared.gravity_scale.unwrap_or(GravityScale::DEFAULT),
+            idle_gesture_every_s: declared
+                .idle_gesture_every_s
+                .unwrap_or(DEFAULT_IDLE_GESTURE_EVERY_S),
+            sleep_after_s: declared.sleep_after_s.unwrap_or(DEFAULT_SLEEP_AFTER_S),
+            sleep_for_s: declared.sleep_for_s.unwrap_or(DEFAULT_SLEEP_FOR_S),
             source: declared.source,
         }),
         _ => Err(errors),
@@ -610,7 +967,7 @@ fn personality(package: &PackageBytes, errors: &mut Vec<String>) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use crate::overlay::SpriteRect;
@@ -636,7 +993,7 @@ mod tests {
     }
 
     /// A Character Manifest declaring exactly `animations`, one frame each.
-    pub(super) fn declaring(animations: &[&str]) -> String {
+    pub(crate) fn declaring(animations: &[&str]) -> String {
         let mut manifest = String::from("name = \"Blip\"\n");
         for animation in animations {
             manifest.push_str(&format!(
@@ -646,7 +1003,7 @@ mod tests {
         manifest
     }
 
-    pub(super) fn load_manifest(manifest: &str) -> Result<Character, Vec<String>> {
+    pub(crate) fn load_manifest(manifest: &str) -> Result<Character, Vec<String>> {
         let mut package = art();
         package.insert(
             CHARACTER_MANIFEST_FILE.to_string(),
@@ -677,9 +1034,23 @@ mod tests {
             fps,
             looping,
             variants: Vec::new(),
+            variant_of: None,
+            same_as: None,
             left_strip: None,
             weight: DEFAULT_WEIGHT,
         }
+    }
+
+    #[test]
+    fn the_declared_name_is_the_name_a_load_gives() {
+        let mut package = art();
+        assert_eq!(declared_name(&package), None, "no manifest, no name");
+        package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            declaring(&REQUIRED_ANIMATIONS).into_bytes(),
+        );
+        let loaded = load(&package).expect("loads");
+        assert_eq!(declared_name(&package), Some(loaded.name));
     }
 
     #[test]
@@ -802,6 +1173,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "jump".to_string(),
                 dialogue: None,
+                direction: None,
+                source: crate::engine::AnimationSource::LocalDirector,
             }),
             ..ground.clone()
         };
@@ -848,6 +1221,7 @@ mod tests {
                 .get(name)
                 .unwrap_or_else(|| panic!("every Character can be asked for {name}"));
             assert_eq!(behavior.primitives, vec![primitive]);
+            assert_eq!(behavior.animation, None);
             assert_eq!(behavior.weight, 0, "{name} stays ambient-off until earned");
         }
         for name in ["land", "hold", "idle", "talk"] {
@@ -1009,6 +1383,117 @@ mod tests {
         assert!(!character.animations["land"].looping, "land plays once");
     }
 
+    /// Every required Animation but `react`, a four-frame-per-second `wave`
+    /// idle-gesture, and `react` declared with `extra` below it.
+    fn reacting_with(extra: &str) -> String {
+        let others: Vec<&str> = REQUIRED_ANIMATIONS
+            .into_iter()
+            .filter(|name| *name != "react")
+            .collect();
+        format!(
+            "{}[animations.wave]\nframes = [\"wave-0.png\", \"idle-0.png\"]\nfps = 4\n\
+             variant_of = \"idle-gesture\"\n[animations.react]\n{extra}",
+            declaring(&others)
+        )
+    }
+
+    /// A required slot whose clip is another Animation's names it instead of
+    /// listing the same frames again, and plays exactly what that one plays.
+    #[test]
+    fn a_same_as_slot_plays_its_owners_frames_fps_and_loop() {
+        let character =
+            load_manifest(&reacting_with("same_as = \"wave\"\n")).expect("same_as fills react");
+        let (react, wave) = (
+            &character.animations["react"],
+            &character.animations["wave"],
+        );
+
+        assert_eq!(react.frames, wave.frames);
+        assert_eq!((react.fps, react.looping), (4, true));
+        assert_eq!(react.frame_size, wave.frame_size);
+        assert_eq!(react.same_as.as_deref(), Some("wave"));
+        assert_eq!(react.variant_of, None, "an alias joins no category");
+        assert!(wave.variants.is_empty(), "and no ring");
+        let gestures: Vec<String> = character
+            .idle_plan()
+            .gestures
+            .into_iter()
+            .map(|member| member.name)
+            .collect();
+        assert_eq!(gestures, ["wave"], "the slot is not a second idle-gesture");
+    }
+
+    /// A slot that names its owner and also says how to play would be two
+    /// playbacks of one clip under one name. The owner says it once.
+    #[test]
+    fn same_as_stands_alone_in_its_table() {
+        for extra in [
+            "frames = [\"react-0.png\"]",
+            "fps = 6",
+            "loop = \"once\"",
+            "variant_of = \"idle-gesture\"",
+            "left_of = \"walk\"",
+            "weight = 3",
+        ] {
+            let errors = errors(load_manifest(&reacting_with(&format!(
+                "same_as = \"wave\"\n{extra}\n"
+            ))));
+            assert_eq!(
+                errors,
+                vec![
+                    "animation \"react\" is the same_as \"wave\", and declares nothing \
+                      else; it plays that animation's frames, fps and loop"
+                        .to_string()
+                ],
+                "{extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn same_as_names_an_animation_that_has_frames_of_its_own() {
+        let errors_for = |extra: &str| errors(load_manifest(&reacting_with(extra)));
+        assert_eq!(
+            errors_for("same_as = \"shrug\"\n"),
+            vec!["animation \"react\" is the same_as \"shrug\", which is not declared".to_string()]
+        );
+        assert_eq!(
+            errors_for("same_as = \"react\"\n"),
+            vec!["animation \"react\" is the same_as itself".to_string()]
+        );
+        assert_eq!(
+            errors_for("same_as = \"wave\"\n[animations.hi]\nsame_as = \"react\"\n"),
+            vec![
+                "animation \"hi\" is the same_as \"react\", itself a same_as; \
+                  name the animation that owns the frames"
+                    .to_string()
+            ]
+        );
+        assert_names(
+            &errors_for(
+                "same_as = \"wave\"\n[animations.wiggle]\nframes = [\"wave-0.png\"]\n\
+                 variant_of = \"react\"\n",
+            ),
+            "a same_as",
+        );
+    }
+
+    /// One clip at two speeds is two Animations on the same files, and the
+    /// loader keeps allowing it: `same_as` is only for a clip played the same.
+    #[test]
+    fn two_animations_may_share_frame_files_at_their_own_fps() {
+        let character = load_manifest(&reacting_with(
+            "frames = [\"wave-0.png\", \"idle-0.png\"]\nfps = 8\nloop = \"once\"\n",
+        ))
+        .expect("shared paths load");
+        assert_eq!(
+            character.animations["react"].frames,
+            character.animations["wave"].frames
+        );
+        assert_eq!(character.animations["react"].fps, 8);
+        assert_eq!(character.animations["react"].same_as, None);
+    }
+
     #[test]
     fn a_behavior_carries_its_primitives_in_order() {
         let manifest = format!(
@@ -1022,9 +1507,12 @@ mod tests {
             character.behaviors["greet"],
             Behavior {
                 primitives: vec![Primitive::React, Primitive::Talk],
+                animation: None,
                 then: Some("settle".to_string()),
                 weight: DEFAULT_WEIGHT,
                 trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
             }
         );
         assert_eq!(character.behaviors["settle"].then, None);
@@ -1042,9 +1530,12 @@ mod tests {
             character.behaviors["nap"],
             Behavior {
                 primitives: vec![Primitive::Sit, Primitive::Sleep],
+                animation: None,
                 then: None,
                 weight: 4,
                 trigger: Some(Trigger::IdleOver(Duration::from_secs(120))),
+                not_in_manifest: false,
+                idle_type: false,
             }
         );
     }
@@ -1329,9 +1820,9 @@ mod tests {
         );
     }
 
-    /// Whole loops: a drawn member starts at its own first frame and runs on
-    /// the clock the family is already keeping, so nothing is cut mid-stride.
-    /// `check_variants` refusing a `loop = "once"` member is the other half.
+    /// A weighed member starts at its own first frame and wraps, because the
+    /// strip loops. The Engine's own idle stops after one pass and rests;
+    /// that cut is the Engine's clock, not this wrap.
     #[test]
     fn a_drawn_variant_plays_from_its_first_frame() {
         let mut package = art();
@@ -1437,9 +1928,36 @@ mod tests {
         );
     }
 
-    /// Art is authored facing right and leftward travel mirrors it, which puts
-    /// Buddy Bot's cheek LED on the wrong cheek. A left strip is drawn as
-    /// authored instead.
+    /// Possessed art is optional and outside the Required Animation Set
+    /// (ADR-0007). A package without it shows the moment in its `react`.
+    #[test]
+    fn possessed_is_optional_and_falls_back_to_react() {
+        let character = load_manifest(&declaring(&REQUIRED_ANIMATIONS)).expect("loads");
+        assert_eq!(
+            character
+                .draw("possessed", 0, 0, 1.0)
+                .expect("draws")
+                .animation,
+            "react"
+        );
+
+        let manifest = format!(
+            "{}[animations.possessed]\nframes = [\"idle-0.png\"]\n",
+            declaring(&REQUIRED_ANIMATIONS)
+        );
+        let character = load_manifest(&manifest).expect("loads");
+        assert_eq!(
+            character
+                .draw("possessed", 0, 0, 1.0)
+                .expect("draws")
+                .animation,
+            "possessed"
+        );
+    }
+
+    /// Mirroring a frame flips it, which puts Buddy Bot's cheek LED on the
+    /// wrong cheek. A left strip is drawn instead, and its frames' facing
+    /// decides whether it mirrors, the same as any frame's.
     #[test]
     fn a_left_strip_replaces_the_mirror_for_the_package_that_draws_one() {
         let mirroring = load_manifest(&declaring(&REQUIRED_ANIMATIONS)).expect("loads");
@@ -1451,14 +1969,29 @@ mod tests {
         );
 
         let manifest = format!(
-            "{}[animations.walk-left]\nframes = [\"wave-0.png\"]\nleft_of = \"walk\"\n",
+            "{}[animations.walk-left]\nframes = [\"wave-0.png\"]\nleft_of = \"walk\"\n\
+             [frame_facing]\n\"wave-0.png\" = \"left\"\n",
             declaring(&REQUIRED_ANIMATIONS)
         );
         let asymmetric = load_manifest(&manifest).expect("loads");
 
         let left = asymmetric.draw("walk", 0, 0, -1.0).expect("draws");
         assert_eq!(left.animation, "walk-left");
-        assert!(!left.mirrored, "the strip is already facing left");
+        assert!(!left.mirrored, "the strip is declared facing left");
+
+        let undeclared = format!(
+            "{}[animations.walk-left]\nframes = [\"wave-0.png\"]\nleft_of = \"walk\"\n",
+            declaring(&REQUIRED_ANIMATIONS)
+        );
+        let left = load_manifest(&undeclared)
+            .expect("loads")
+            .draw("walk", 0, 0, -1.0)
+            .expect("draws")
+            .mirrored;
+        assert!(
+            left,
+            "a strip left at the default faces right, so it mirrors"
+        );
 
         let right = asymmetric.draw("walk", 0, 0, 1.0).expect("draws");
         assert_eq!(right.animation, "walk");
@@ -1476,6 +2009,43 @@ mod tests {
                 .animation,
             "walk-left"
         );
+    }
+
+    /// A frame mirrors exactly when the way it faces is not the way the
+    /// sprite travels.
+    #[test]
+    fn a_frame_mirrors_when_its_facing_differs_from_the_travel() {
+        let base = declaring(&REQUIRED_ANIMATIONS).replace("name = \"Blip\"\n", "");
+        // The Character's default, walk-0's override, travel, and whether
+        // walk and idle (which takes the default) are drawn mirrored.
+        for (default, frame, travel, walk, idle) in [
+            (None, None, 1.0, false, false),
+            (None, None, -1.0, true, true),
+            (Some("right"), None, 1.0, false, false),
+            (Some("left"), None, 1.0, true, true),
+            (Some("left"), None, -1.0, false, false),
+            (Some("left"), Some("right"), 1.0, false, true),
+            (Some("left"), Some("right"), -1.0, true, false),
+            (None, Some("left"), 1.0, true, false),
+            (None, Some("left"), -1.0, false, true),
+        ] {
+            let mut manifest = String::from("name = \"Blip\"\n");
+            if let Some(default) = default {
+                manifest.push_str(&format!("facing = \"{default}\"\n"));
+            }
+            manifest.push_str(&base);
+            if let Some(frame) = frame {
+                manifest.push_str(&format!("[frame_facing]\n\"walk-0.png\" = \"{frame}\"\n"));
+            }
+            let character = load_manifest(&manifest).expect("loads");
+            let drawn = |animation| {
+                let drawn = character.draw(animation, 0, 0, travel).expect("draws");
+                drawn.mirrored
+            };
+            let case = format!("default {default:?}, override {frame:?}, travel {travel}");
+            assert_eq!(drawn("walk"), walk, "walk, {case}");
+            assert_eq!(drawn("idle"), idle, "idle, {case}");
+        }
     }
 
     #[test]

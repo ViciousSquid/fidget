@@ -26,22 +26,15 @@ model_power = 1
 near_reaction = "away"
 rush_reaction = "react"
 
+# Soft breathing: the robe and hands rise and settle, back through the rest pose.
 [animations.idle]
 frames = [
   "frames/idle-0.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
   "frames/idle-1.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
-  "frames/idle-0.png",
   "frames/idle-0.png",
   "frames/idle-2.png",
 ]
-fps = 1
+fps = 2
 
 [animations.walk]
 frames = ["frames/walk-0.png", "frames/walk-1.png", "frames/walk-2.png", "frames/walk-3.png"]
@@ -85,8 +78,9 @@ frames = ["frames/react-0.png", "frames/react-1.png"]
 fps = 8
 loop = "once"
 
+# The talk is the react's two poses, slower and looping.
 [animations.talk]
-frames = ["frames/talk-0.png", "frames/talk-1.png"]
+frames = ["frames/react-0.png", "frames/react-1.png"]
 fps = 3
 
 # Greets by announcing himself, idles by seething, only powers down when
@@ -119,3 +113,10 @@ when = "idle over 2m"
 play = ["walk"]
 weight = 10
 when = "idle over 30s"
+
+# The fall, and the land that opens with it, is drawn turned the other way from the rest.
+[frame_facing]
+"frames/fall-0.png" = "left"
+"frames/fall-1.png" = "left"
+"frames/land-0.png" = "left"
+"frames/land-1.png" = "left"

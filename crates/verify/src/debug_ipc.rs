@@ -31,7 +31,7 @@ fn send_command(cmd: &str, report: &mut RunReport) -> Outcome {
 
     let _ = fs::remove_file(&result_path);
 
-    if let Err(e) = fs::write(&cmd_path, cmd) {
+    if let Err(e) = fidget_core::debug::write_whole_file_at_once(&cmd_path, cmd) {
         report.check(
             Outcome::Error,
             "debug ipc",

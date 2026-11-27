@@ -1,0 +1,383 @@
+//! One possessed Instance's keyboard. The frame loop owns the session. The
+//! webview only enqueues key and focus edges, so the two threads never share
+//! the `Possession`.
+
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use fidget_core::possession::{Intent, Key, Possession, Walk};
+
+/// A blur shorter than this is the focus request's own false-then-true pair,
+/// not the user leaving. Longer, and the keyups will never arrive.
+pub const BLUR_SETTLE: Duration = Duration::from_millis(80);
+
+/// Why the session ended. Each path clears the same switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Release {
+    Escape,
+    /// The Release Possession row.
+    Menu,
+    Hide,
+    Quit,
+    FullscreenHide,
+    Removed,
+}
+
+/// The Instance the keys move, and the overlay that holds them.
+pub struct Session {
+    pub instance: String,
+    pub window: String,
+    keys: Possession,
+    paused: bool,
+    blurred_at: Option<Instant>,
+    /// The overlay the card just left. Its keyups still count until focus moves.
+    left_window: Option<String>,
+    /// The press began while paused, so its click resumes and is not a Poke.
+    /// A drag that follows still grabs.
+    pub swallow_click: bool,
+}
+
+impl Session {
+    pub fn start(instance: impl Into<String>, window: impl Into<String>) -> Self {
+        Self {
+            instance: instance.into(),
+            window: window.into(),
+            keys: Possession::default(),
+            paused: false,
+            blurred_at: None,
+            left_window: None,
+            swallow_click: false,
+        }
+    }
+
+    pub fn paused(&self) -> bool {
+        self.paused
+    }
+
+    /// A press on the sprite. While paused it swallows its click and asks for
+    /// focus, as the card's Focus button does.
+    pub fn press(&mut self) -> bool {
+        self.swallow_click |= self.paused;
+        self.paused
+    }
+
+    pub fn apply(&mut self, edge: &Edge, now: Instant) {
+        let window = match edge {
+            Edge::Key { window, .. } | Edge::Focus { window, .. } => window,
+        };
+        let late_keyup = matches!(edge, Edge::Key { down: false, .. })
+            && self.left_window.as_ref() == Some(window);
+        if window != &self.window && !late_keyup {
+            return;
+        }
+        match edge {
+            Edge::Key { name, down, .. } => {
+                if self.paused {
+                    return;
+                }
+                if let Some(key) = parse_key(name) {
+                    self.keys.key(key, *down);
+                }
+            }
+            Edge::Focus { focused, .. } => {
+                if *focused {
+                    self.blurred_at = None;
+                    self.left_window = None;
+                    self.paused = false;
+                } else if self.blurred_at.is_none() {
+                    self.blurred_at = Some(now);
+                }
+            }
+        }
+    }
+
+    /// The card moved to another overlay's display, which counts as a blur until it
+    /// reports focus. Returns whether to ask for focus: never while paused.
+    pub fn move_to(&mut self, window: impl Into<String>, now: Instant) -> bool {
+        let left = std::mem::replace(&mut self.window, window.into());
+        if !self.paused {
+            self.blurred_at = Some(now);
+            self.left_window = Some(left);
+        }
+        !self.paused
+    }
+
+    /// What the keys ask for this tick. A settled blur drops every held key
+    /// before the tick, so a jump cannot launch into a pause.
+    pub fn tick(&mut self, elapsed_ms: u32, now: Instant) -> Intent {
+        if let Some(at) = self.blurred_at {
+            if !self.paused && now.saturating_duration_since(at) >= BLUR_SETTLE {
+                self.paused = true;
+                self.keys.pause();
+                self.blurred_at = None;
+                self.left_window = None;
+            }
+        }
+        self.keys.tick(elapsed_ms)
+    }
+}
+
+/// A key or focus edge from one overlay.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Edge {
+    Key {
+        window: String,
+        name: String,
+        down: bool,
+    },
+    Focus {
+        window: String,
+        focused: bool,
+    },
+}
+
+/// The names the overlay sends. Anything else is not a possession key.
+pub fn parse_key(name: &str) -> Option<Key> {
+    match name {
+        "left" => Some(Key::Walk(Walk::Left)),
+        "right" => Some(Key::Walk(Walk::Right)),
+        "up" => Some(Key::Up),
+        "down" => Some(Key::Down),
+        "space" => Some(Key::Space),
+        "escape" => Some(Key::Escape),
+        "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+            Some(Key::Digit(name.as_bytes()[0] - b'0'))
+        }
+        _ => None,
+    }
+}
+
+static EDGES: Mutex<Vec<Edge>> = Mutex::new(Vec::new());
+
+pub fn push_key(window: &str, name: &str, down: bool) {
+    push(Edge::Key {
+        window: window.to_string(),
+        name: name.to_string(),
+        down,
+    });
+}
+
+pub fn push_focus(window: &str, focused: bool) {
+    push(Edge::Focus {
+        window: window.to_string(),
+        focused,
+    });
+}
+
+fn push(edge: Edge) {
+    if let Ok(mut edges) = EDGES.lock() {
+        edges.push(edge);
+    }
+}
+
+pub fn take_edges() -> Vec<Edge> {
+    EDGES
+        .lock()
+        .ok()
+        .map(|mut edges| std::mem::take(&mut *edges))
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn key(name: &str, down: bool) -> Edge {
+        Edge::Key {
+            window: "overlay-0".into(),
+            name: name.into(),
+            down,
+        }
+    }
+
+    fn focus(focused: bool) -> Edge {
+        Edge::Focus {
+            window: "overlay-0".into(),
+            focused,
+        }
+    }
+
+    #[test]
+    fn arrows_space_escape_and_digits_are_the_possession_keys() {
+        assert_eq!(parse_key("left"), Some(Key::Walk(Walk::Left)));
+        assert_eq!(parse_key("right"), Some(Key::Walk(Walk::Right)));
+        assert_eq!(parse_key("up"), Some(Key::Up));
+        assert_eq!(parse_key("down"), Some(Key::Down));
+        assert_eq!(parse_key("space"), Some(Key::Space));
+        assert_eq!(parse_key("escape"), Some(Key::Escape));
+        assert_eq!(parse_key("1"), Some(Key::Digit(1)));
+        assert_eq!(parse_key("9"), Some(Key::Digit(9)));
+        assert!(parse_key("0").is_none());
+        assert!(parse_key("a").is_none());
+        assert!(parse_key("d").is_none());
+    }
+
+    #[test]
+    fn a_digit_press_reaches_the_intent_once() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("4", true), t0);
+        assert_eq!(session.tick(16, t0).play, Some(4));
+        session.apply(&key("4", true), t0);
+        assert_eq!(session.tick(16, t0).play, None);
+        session.apply(&key("4", false), t0);
+        assert_eq!(session.tick(16, t0).play, None);
+    }
+
+    #[test]
+    fn a_blur_that_returns_at_once_keeps_a_held_space() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("space", true), t0);
+        session.apply(&focus(false), t0);
+        session.apply(&focus(true), t0 + Duration::from_millis(10));
+        let intent = session.tick(16, t0 + Duration::from_millis(20));
+        assert!(!session.paused());
+        assert!(intent.charging.is_some());
+        assert!(intent.launch.is_none());
+    }
+
+    #[test]
+    fn a_blur_that_stays_pauses_and_drops_space_without_launching() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("space", true), t0);
+        session.tick(16, t0);
+        session.apply(&focus(false), t0);
+        let early = session.tick(16, t0 + Duration::from_millis(40));
+        assert!(!session.paused());
+        assert!(early.launch.is_none());
+        assert!(early.charging.is_some());
+        let later = session.tick(16, t0 + BLUR_SETTLE + Duration::from_millis(5));
+        assert!(session.paused());
+        assert!(later.charging.is_none());
+        assert!(later.launch.is_none());
+    }
+
+    fn on(window: &str, edge: Edge) -> Edge {
+        match edge {
+            Edge::Key { name, down, .. } => Edge::Key {
+                window: window.into(),
+                name,
+                down,
+            },
+            Edge::Focus { focused, .. } => Edge::Focus {
+                window: window.into(),
+                focused,
+            },
+        }
+    }
+
+    #[test]
+    fn a_held_walk_crosses_to_an_overlay_that_takes_focus() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.move_to("overlay-1", t0);
+        session.apply(&focus(false), t0);
+        session.apply(&on("overlay-1", focus(true)), t0);
+        let later = t0 + BLUR_SETTLE * 2;
+        assert_eq!(session.tick(16, later).walk, Some(Walk::Right));
+        session.apply(&on("overlay-1", key("right", false)), later);
+        assert_eq!(session.tick(16, later).walk, None);
+    }
+
+    #[test]
+    fn a_crossing_whose_focus_never_lands_pauses_and_drops_the_walk() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.move_to("overlay-1", t0);
+        let intent = session.tick(16, t0 + BLUR_SETTLE + Duration::from_millis(5));
+        assert!(session.paused());
+        assert_eq!(intent.walk, None);
+    }
+
+    #[test]
+    fn a_paused_crossing_resumes_on_the_new_overlays_focus() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&focus(false), t0);
+        session.tick(16, t0 + BLUR_SETTLE);
+        session.move_to("overlay-1", t0 + BLUR_SETTLE);
+        session.apply(&on("overlay-1", focus(true)), t0 + BLUR_SETTLE);
+        session.tick(16, t0 + BLUR_SETTLE);
+        assert!(!session.paused());
+    }
+
+    #[test]
+    fn only_a_press_while_paused_asks_for_focus_and_swallows_its_click() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        assert!(!session.press());
+        assert!(!session.swallow_click);
+        session.apply(&focus(false), t0);
+        session.tick(16, t0 + BLUR_SETTLE);
+        assert!(session.press());
+        assert!(session.swallow_click);
+    }
+
+    #[test]
+    fn only_a_live_crossing_asks_for_focus() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        assert!(session.move_to("overlay-1", t0));
+        session.tick(16, t0 + BLUR_SETTLE);
+        assert!(!session.move_to("overlay-0", t0 + BLUR_SETTLE));
+    }
+
+    #[test]
+    fn a_keyup_on_the_old_overlay_during_the_wait_still_releases() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.move_to("overlay-1", t0);
+        session.apply(&key("right", false), t0);
+        session.apply(&key("left", true), t0);
+        session.apply(&on("overlay-1", focus(true)), t0);
+        assert_eq!(session.tick(16, t0).walk, None);
+    }
+
+    #[test]
+    fn a_keyup_for_a_key_never_down_changes_nothing() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.apply(&key("left", false), t0);
+        session.apply(&key("space", false), t0);
+        let intent = session.tick(16, t0);
+        assert_eq!(intent.walk, Some(Walk::Right));
+        assert!(intent.launch.is_none());
+    }
+
+    #[test]
+    fn a_keyup_for_a_held_key_releases_it() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.apply(&key("right", false), t0);
+        assert_eq!(session.tick(16, t0).walk, None);
+    }
+
+    #[test]
+    fn a_keyup_from_an_overlay_the_session_never_held_is_ignored() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("right", true), t0);
+        session.apply(&on("overlay-1", key("right", false)), t0);
+        assert_eq!(session.tick(16, t0).walk, Some(Walk::Right));
+    }
+
+    #[test]
+    fn escape_asks_to_end_and_does_not_launch() {
+        let mut session = Session::start("a", "overlay-0");
+        let t0 = Instant::now();
+        session.apply(&key("space", true), t0);
+        session.tick(200, t0);
+        session.apply(&key("escape", true), t0);
+        let intent = session.tick(16, t0);
+        assert!(intent.end_possession);
+        assert!(intent.launch.is_none());
+        assert!(intent.charging.is_none());
+    }
+}

@@ -72,8 +72,8 @@ that adding a character is drawing, not programming.
    not vanish when I switch context.
 5. As a user, I want the character never to steal keyboard focus, so that it cannot interrupt
    what I am typing.
-6. As a user, I want Fidget not to appear in my application switcher, so that it does
-   not clutter the list of things I am actually working in.
+6. As a user, I want Fidget in my Dock or taskbar and application switcher, so that I can
+   find it when the menu bar is crowded.
 7. As a user, I want Fidget to launch at login if I choose, so that the character is simply
    always there.
 8. As a user, I want a tray or menu bar icon, so that I can reach settings and quit
@@ -339,8 +339,8 @@ it works in the space all displays share and knows nothing about windows.
 ### Overlay and input
 
 One always-on-top overlay window per display per Character Instance. On macOS: a
-non-activating panel at floating level, joining all Spaces, stationary, excluded from the
-application switcher, never accepting first responder status. Identical on every overlay,
+non-activating panel at floating level, joining all Spaces, stationary, excluded from
+window cycling, never accepting first responder status. Identical on every overlay,
 which is why one code path builds and configures them all.
 
 Click-through is decided once per tick, in the shared point space, and applied to the
@@ -372,7 +372,8 @@ the offending declaration.
 Required Animation Set is exactly nine: `idle`, `walk`, `fall`, `land`, `sit`, `sleep`,
 `react`, `talk`, `hold`. A declared optional set is used when present and silently absent
 otherwise: `climb` falls back to `walk`, and `grab` — the sprite held by the cursor — and
-`jump` both fall back to `fall`.
+`jump` both fall back to `fall`. `possessed`, played when Possession starts, falls back
+to `react`.
 
 A Personality Prompt influences Director output only. It cannot reference Primitives that
 do not exist, cannot enable capabilities, and is never forwarded to the Harness as
@@ -417,6 +418,15 @@ also carries the last few seconds, with no timestamps or ages, from
 - `doing:` the Behavior playing as the wake is built.
 - `lately:` the States and Behaviors entered in the last 12 seconds, oldest
   first, at most five, when there are at least two.
+
+Possession reaches the Director as two wakes and nothing between them. The
+moves the keys make add no step to `lately:` and nothing to `recent:`, so the
+Behavior history after a release is the one from before it. The possessed wake
+reads `possessed: yes`. Earlier steps and gesture snapshots keep their normal
+12-second lifetime; possession records no new ones. The release wake reads
+`released from possession` and
+`feeling: dazed and confused, not sure how you got here`, and its whereabouts
+line, `on display: 1; placement: (80, 100)`, says where the drive left it.
 
 Two implementations ship:
 

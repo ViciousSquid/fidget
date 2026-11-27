@@ -123,7 +123,7 @@ $env:FIDGET_CHARACTERS = Join-Path $root "characters"
 $startMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 $script:proc = Start-FidgetPiped $Bin @() $log (Join-Path $out "app.err")
 try {
-    if (-not (Wait-ForUp 5 (Join-Path $out "app.err"))) { Fail "Fidget never wrote its overlay line; see $out\app.err" }
+    if (-not (Wait-ForUp (Join-Path $out "app.err"))) { Fail "Fidget never wrote its overlay line; see $out\app.err" }
     if (-not (Wait-ForMarks 3 $marks '^asked$')) {
         Fail "no wake reached the Harness; see $log"
     }
@@ -163,8 +163,5 @@ try {
     $elapsedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $startMs
     Write-Output "PASS: evidence in $out (${elapsedMs}ms)"
 } finally {
-    if (-not $script:proc.HasExited) { Stop-Process -Id $script:proc.Id -Force -ErrorAction SilentlyContinue }
-    Get-CimInstance Win32_Process -Filter "Name = 'bash.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -like "*count=$marks*" } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    Stop-FidgetTree $script:proc "count=$marks"
 }

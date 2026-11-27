@@ -226,10 +226,10 @@
   /* A piece of the chat panel carried onto the desktop. Minimal chat is unconditionally dark, so
      this bubble is that dark ramp, not the ramp inverted. */
   .b-new {
-    --bub-panel: #14171e;         /* chat-ui.css --chat-panel */
-    --bub-ink: #e8ebf2;           /* chat-ui.css --chat-ink */
-    --bub-accent: #5cc9b5;        /* chat-ui.css --chat-accent */
-    --bub-radius: 12px;           /* chat-ui.css --chat-radius */
+    --bub-panel: #14171e;         /* bubble-tokens.css --bubble-panel */
+    --bub-ink: #e8ebf2;           /* bubble-tokens.css --bubble-ink */
+    --bub-accent: #5cc9b5;        /* bubble-tokens.css --bubble-accent */
+    --bub-radius: 12px;           /* bubble-tokens.css --bubble-radius */
 
     /* In chat the line is bare ink, because a panel sits under it. The overlay has no panel, so
        the box has to carry the fill, the radius, and the padding the log can skip. */
@@ -245,7 +245,7 @@
     box-shadow: 0 4px 16px rgba(0, 0, 0, 0.55);
 
     font-family: system-ui, -apple-system, sans-serif;  /* --chat-sans */
-    font-size: 13.5px;                                   /* chat-ui.css body */
+    font-size: 13.5px;                                   /* bubble-tokens.css --bubble-type-size */
     line-height: 1.55;                                   /* .row.them .said */
   }
   /* The tail is a ring triangle with a fill triangle over it. A single panel-colored spike would
@@ -396,6 +396,8 @@
   th, td { text-align: left; vertical-align: top; padding: 8px 12px 8px 0; border-bottom: 1px solid var(--line); }
   th { font-size: 11.5px; letter-spacing: .07em; text-transform: uppercase; color: var(--ink-3); }
   td.tok { font-family: var(--mono); font-size: 12.5px; white-space: nowrap; }
+  /* Two nowrap token columns make the row wider than a phone. 720px is where the desks stack. */
+  @media (max-width: 720px) { td.tok { white-space: normal; } }
   .yes { color: var(--accent); font-weight: 700; }
   .no  { color: var(--ink-2); font-weight: 700; }
   footer { margin-top: 44px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--ink-3); font-size: 13px; }
@@ -446,7 +448,7 @@
     the dismiss both fade over 180ms. Replay them below; the three grounds
     are the same question the speech bubble just answered.</p>
 
-  <p>Hover is not a link. After 1.5s on the Character the pill appears and
+  <p>Hover is not a link. After 2.5s on the Character the pill appears and
     the field takes focus. Leaving during that wait cancels it. Leaving once
     the pill is up does not. It dismisses on a click outside, a drag of the
     pet of at least 4px, or a double-click, and that double-click is Summon.
@@ -533,7 +535,7 @@
     the step the chat already uses for a bordered box holding one piece of text.
     <code>--chat-radius-tail</code> no longer travels. That tightened corner is
     <code>.row.you</code>'s gesture for <i>you said this</i>, and putting it on
-    the Character's speech would say the wrong thing.</p>
+    the Character's Dialogue would say the wrong thing.</p>
 
   <p><b>Thinking is the same bubble with an ellipsis in it.</b> No round
     silhouette, no trailing discs. The dots take <code>--chat-accent</code>,
@@ -627,7 +629,7 @@
     </tbody>
   </table>
 
-  <h2>History — what #119 decided, and what #456 reversed</h2>
+  <h2>History: what #119 decided, and what #456 reversed</h2>
 
   <p>The speech bubble and the thinking indicator were drawn apart on purpose.
     <code>src/main.css:75-117</code>, up to #456, gave that state a round silhouette

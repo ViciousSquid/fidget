@@ -26,6 +26,11 @@ $Bin = if ($args.Count -gt 1) { $args[1] } else { "" }
 $TestBin = if ($args.Count -gt 2) { $args[2] } else { "" }
 $ErrorActionPreference = "Stop"
 $Ellipsis = [string][char]0x2026
+# Before the self-check, whose FAIL line carries the ellipsis: a desktop console
+# on an OEM codepage writes it as '.', and only CI's runner switches to 65001.
+$utf8 = New-Object System.Text.UTF8Encoding $false
+[Console]::OutputEncoding = $utf8
+$OutputEncoding = $utf8
 
 function Show-Header {
     $lines = Get-Content -LiteralPath $PSCommandPath
@@ -55,7 +60,7 @@ $selfTestMenuLine = "1791259425 verbs: [Menu]"
 $selfTestPresenceHidden = "1791260872 presence: hidden over 500ms"
 $selfTestClickHitTrue = "1791260862 click: down hits=[true] target=Some(0) cursor=(2554,1328) visible=true sprite=untargeted(2563,1264)"
 $selfTestClickHitFalse = "1791260862 click: down hits=[false] target=None cursor=(2554,1328) visible=true sprite=untargeted(2563,1264)"
-$selfTestSettledFrame = "1791260880 frame: 1791260880723 Grounded pos(1720,1328) sprite(1657,1264) land#1 <id>"
+$selfTestLatestFrame = "1791260880 frame: 1791260880723 Walk pos(1720,1328) sprite(1657,1264) walk#1 <id>"
 if (-not ($selfTestFrameLine -match '^\d+ frame: .* sprite\(')) { Write-Error "self-test: frame pattern failed"; exit 1 }
 if (-not ($selfTestFrameLine -match '^\d+ frame: .* sprite\((-?\d+),(-?\d+)\) ')) { Write-Error "self-test: frame coordinate pattern failed"; exit 1 }
 if (-not ($selfTestMenuLine -match '^\d+ verbs: .*\[Menu\]')) { Write-Error "self-test: Menu pattern failed"; exit 1 }
@@ -63,8 +68,7 @@ if ($selfTestVerbsLine -match '^\d+ verbs: ') { Write-Error "self-test: should n
 if (-not ($selfTestPresenceHidden -match '^\d+ presence: hidden')) { Write-Error "self-test: presence:hidden pattern failed"; exit 1 }
 if (-not ($selfTestClickHitTrue -match '^\d+ click: down hits=\[true\]')) { Write-Error "self-test: click hits=[true] pattern failed"; exit 1 }
 if ($selfTestClickHitFalse -match '^\d+ click: down hits=\[true\]') { Write-Error "self-test: should not match hits=[false]"; exit 1 }
-if (-not ($selfTestSettledFrame -match '^\d+\.?\d* frame: .* Grounded .* sprite\((-?\d+),(-?\d+)\) ')) { Write-Error "self-test: settled frame Grounded pattern failed"; exit 1 }
-if ($selfTestSettledFrame -match 'walk#|Falling') { Write-Error "self-test: settled frame should not match walk# or Falling"; exit 1 }
+if (-not ($selfTestLatestFrame -match '^\d+\.?\d* frame: .* sprite\((-?\d+),(-?\d+)\) ')) { Write-Error "self-test: latest frame coordinate pattern failed"; exit 1 }
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot "../../..")).Path
 . (Join-Path $PSScriptRoot "..\helpers\wait-helpers.win.ps1")
@@ -73,8 +77,8 @@ $script:Evidence = $null
 function Fail([string]$Message) {
     [Console]::Error.WriteLine("FAIL: $Message")
     if ($script:Evidence) { [Console]::Error.WriteLine("evidence in $($script:Evidence)") }
-    $traceFile = Join-Path $data "process.log"
-    if (-not (Test-Path -LiteralPath $traceFile -ErrorAction SilentlyContinue)) {
+    # A self-check fails before the leaf seeds a data dir, so there is none to check.
+    if ($data -and -not (Test-Path -LiteralPath (Join-Path $data "process.log") -ErrorAction SilentlyContinue)) {
         [Console]::Error.WriteLine("data_dir did not resolve to $data")
     }
     exit 1
@@ -129,10 +133,6 @@ $env:FIDGET_TRACE_WINDOWS = "1"
 $env:FIDGET_CHARACTER = "bmo"
 $env:FIDGET_CHARACTERS = Join-Path $root "characters"
 
-$utf8 = New-Object System.Text.UTF8Encoding $false
-[Console]::OutputEncoding = $utf8
-$OutputEncoding = $utf8
-
 . (Join-Path $PSScriptRoot "..\helpers\fullscreen-over-click.win.ps1")
 
 $axPs1 = Join-Path $out "ax.ps1"
@@ -157,14 +157,6 @@ try {
             return $false
         }
     }
-    function Wait-Settled {
-        $script:rest = Wait-ForRest $traceFile
-        if (-not $script:rest) {
-            Fail "the sprite never came to rest within 10s; see $traceFile"
-        }
-        return $script:rest
-    }
-
     $traceFile = Join-Path $data "process.log"
     if (-not (Wait-ForFile 3 $traceFile)) { Fail "process.log never appeared; see $err" }
 
@@ -182,42 +174,25 @@ try {
         Fail "overlay hidden (presence: hidden) - see process.log window_source lines"
     }
 
-    $settled = Wait-Settled
     $trace = Get-Content -LiteralPath $traceFile
     $size = $trace | Select-String -Pattern 'sprite (\d+)x(\d+);' | Select-Object -First 1
     if (-not $size) { Fail "no sprite size in $traceFile" }
     $w = [int]$size.Matches[0].Groups[1].Value
     $h = [int]$size.Matches[0].Groups[2].Value
 
-    $attemptsFile = Join-Path $out "menu-attempts.txt"
-    $maxAttempts = 3
-    $success = $false
-    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
-        $attemptLog = "Attempt $attempt of $maxAttempts"
-        Add-Content -LiteralPath $attemptsFile -Value $attemptLog
-        $trace = Get-Content -LiteralPath $traceFile
-        $menuCountBefore = @($trace | Select-String -Pattern '^\d+ verbs: .*\[Menu\]').Count
-        Skip-IfFullscreenOverClick ($settled.X + [int]($w / 2)) ($settled.Y + [int]($h / 2)) $proc.Id $out "right-click"
-        if (-not (Invoke-Ax "menu-$attempt" @{ Command = "menu"; ProcessId = $proc.Id; TraceFile = $traceFile; SpriteW = $w; SpriteH = $h })) {
-            $msg = "no open menu in the UI Automation tree on attempt $attempt; see $out\menu-$attempt.txt"
-            Add-Content -LiteralPath $attemptsFile -Value $msg
-            if ($attempt -eq $maxAttempts) { Fail $msg }
-            $settled = Wait-Settled
-            continue
-        }
-        if (Wait-ForCount 2 $traceFile '^\d+ verbs: .*\[Menu\]' $menuCountBefore) {
-            $menuFile = Join-Path $out "menu-$attempt.txt"
-            $destFile = Join-Path $out "menu.txt"
-            Copy-Item -LiteralPath $menuFile -Destination $destFile -Force
-            $success = $true
-            break
-        }
-        if ($attempt -lt $maxAttempts) {
-            $settled = Wait-Settled
-        }
+    # BMO drops in at spawn; aim once it has landed, wherever it walks after.
+    $spot = Wait-ForGrounded $traceFile
+    if (-not $spot) { Fail "the sprite did not land within 10 s, so there is no spot to click; see $traceFile" }
+    # One point for the guard and the click: no SpriteW, so ax clicks -X/-Y.
+    $cx = $spot.X + [int]($w / 2); $cy = $spot.Y + [int]($h / 2)
+    Skip-IfFullscreenOverClick $cx $cy $proc.Id $out "right-click"
+    $trace = Get-Content -LiteralPath $traceFile
+    $menuCountBefore = @($trace | Select-String -Pattern '^\d+ verbs: .*\[Menu\]').Count
+    if (-not (Invoke-Ax "menu" @{ Command = "menu"; ProcessId = $proc.Id; TraceFile = $traceFile; X = $cx; Y = $cy })) {
+        Fail "no open menu in the UI Automation tree after clicking the sprite at its current position; see $out\menu.txt"
     }
-    if (-not $success) {
-        Fail "right-click did not produce [Menu] verb after $maxAttempts attempts"
+    if (-not (Wait-ForCount 2 $traceFile '^\d+ verbs: .*\[Menu\]' $menuCountBefore)) {
+        Fail "right-click at the sprite's current position did not produce [Menu]; see $traceFile"
     }
     Write-Output "ok: the right-click landed as Menu"
     Check-Items (Join-Path $out "menu.txt")

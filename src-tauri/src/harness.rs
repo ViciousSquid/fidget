@@ -19,8 +19,7 @@ use serde_json::{json, Value};
 use windows_sys::Win32::System::Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW};
 
 use crate::acp_wire::{
-    kill_harness_tree, Event, Handshake, McpChoice, McpLaunch, OpenError, SpawnError, TurnError,
-    Wire,
+    Event, Handshake, McpChoice, McpLaunch, OpenError, SpawnError, TurnError, Wire,
 };
 use crate::action_log;
 use crate::tool_content::{Place, ToolPiece};
@@ -222,8 +221,13 @@ impl Launch {
     /// The child inherits our environment without a provider key,
     /// `CLAUDE_CONFIG_DIR`, or `--bare`; each overrides or cuts the login.
     /// `pi` gets the token via `process.env`; `own_interrupt` isolates it.
-    fn command(&self, cwd: &AttachCwd, mcp_available: bool) -> Command {
-        let mut command = Command::new(resolved_program(&self.argv[0], None));
+    fn command(
+        &self,
+        cwd: &AttachCwd,
+        mcp_available: bool,
+        interrupt: Option<InterruptOwned>,
+    ) -> Command {
+        let mut command = Command::new(resolved_program(&self.argv[0]));
         let endpoint = crate::mcp_http::endpoint();
         let mut args = self.argv[1..].to_vec();
         if endpoint.is_some() && mcp_available {
@@ -255,7 +259,7 @@ impl Launch {
             command.env("CODEX_CONFIG", config);
             command.env(fidget_mcp_server::TOKEN_VAR, token.expose_to_code());
         }
-        isolate_from_interrupt(&mut command);
+        apply_isolation(&mut command, interrupt.is_some());
         command
     }
 
@@ -532,15 +536,44 @@ impl Target {
     }
 }
 
-/// Tests isolate without installing a `ctrlc` handler. Production stays
-/// false until `own_interrupt`. A failed handler must not orphan a tree
-/// Ctrl+C can no longer reach.
-static INTERRUPT_OWNED: AtomicBool = AtomicBool::new(cfg!(test));
+/// Witness that Ctrl+C is ours. Only a successful handler install makes one,
+/// so a child leaves our process group only when Ctrl+C can still reach it.
+#[derive(Clone, Copy)]
+pub(crate) struct InterruptOwned(());
+
+/// The witness from the successful install. A bare flag could be set by a
+/// refused install; only a stored witness can be minted, and `Session` reads
+/// this one.
+static INTERRUPT: Mutex<Option<InterruptOwned>> = Mutex::new(None);
 static INTERRUPT_QUITTING: AtomicBool = AtomicBool::new(false);
 
-/// Isolation is on. Ctrl+C is ours, so the child may leave this process group.
-pub fn own_interrupt() {
-    INTERRUPT_OWNED.store(true, Ordering::SeqCst);
+/// Forces the refusal arm, so a test can prove a failed install isolates nothing.
+#[cfg(test)]
+static FAIL_INTERRUPT_INSTALL: AtomicBool = AtomicBool::new(false);
+
+/// Install the Ctrl+C handler, then claim the interrupt. `None` when `ctrlc`
+/// refuses: isolation stays off and the child stays where Ctrl+C reaches it.
+pub(crate) fn own_interrupt(handler: impl FnMut() + Send + 'static) -> Option<InterruptOwned> {
+    #[cfg(test)]
+    let installed = if FAIL_INTERRUPT_INSTALL.swap(false, Ordering::SeqCst) {
+        Err(ctrlc::Error::MultipleHandlers)
+    } else {
+        ctrlc::set_handler(handler)
+    };
+    #[cfg(not(test))]
+    let installed = ctrlc::set_handler(handler);
+    match installed {
+        Ok(()) => {
+            *lock_interrupt() = Some(InterruptOwned(()));
+            Some(InterruptOwned(()))
+        }
+        Err(why) => {
+            eprintln!(
+                "harness: could not catch interrupt: {why}; child stays in this process group"
+            );
+            None
+        }
+    }
 }
 
 /// True on the second Ctrl+C, which should `exit` rather than nest `shutdown`.
@@ -548,8 +581,25 @@ pub fn interrupt_already_quitting() -> bool {
     INTERRUPT_QUITTING.swap(true, Ordering::SeqCst)
 }
 
-fn isolate_from_interrupt(command: &mut Command) {
-    apply_isolation(command, INTERRUPT_OWNED.load(Ordering::SeqCst));
+fn owned_interrupt() -> Option<InterruptOwned> {
+    *lock_interrupt()
+}
+
+fn lock_interrupt() -> MutexGuard<'static, Option<InterruptOwned>> {
+    INTERRUPT.lock().unwrap_or_else(|why| why.into_inner())
+}
+
+#[cfg(all(test, unix))]
+fn forget_interrupt() {
+    *lock_interrupt() = None;
+}
+
+#[cfg(all(test, unix))]
+impl InterruptOwned {
+    /// Stands in for a successful install in a test that sends no signal.
+    fn for_test() -> Self {
+        Self(())
+    }
 }
 
 /// Version probe timeout. Short enough not to block the UI thread, long
@@ -629,13 +679,15 @@ fn timed_command(
     args: &[&str],
     timeout: Duration,
 ) -> Result<std::process::Output, TimedCommandError> {
-    let mut command = Command::new(resolved_program(program, None));
+    let mut command = Command::new(resolved_program(program));
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    without_console_window(&mut command);
+    // Isolated: in the app's group, `kill_harness_tree` refuses the group, kills
+    // nothing, and a hung launcher outlives its timeout.
+    apply_isolation(&mut command, true);
     let child = match command.spawn() {
         Ok(child) => child,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -652,19 +704,49 @@ fn timed_command(
         Ok(Ok(output)) => Ok(output),
         Ok(Err(error)) => Err(TimedCommandError::Wait(error)),
         Err(_) => {
-            kill_harness_tree(pid);
+            kill_timed_out_tree(pid);
             Err(TimedCommandError::TimedOut)
         }
     }
 }
 
-/// On Windows, resolves stand-in executables (.cmd, .bat, .exe) to absolute
-/// paths because CreateProcess with a bare name + PATH override does not find
-/// them as the shell does. Rust wraps .cmd/.bat when given an absolute path.
-fn resolved_program(program: &str, path_override: Option<&Path>) -> OsString {
-    windows_program(program, path_override).unwrap_or_else(|| OsString::from(program))
+/// `timed_command`'s child runs outside a Job Object, which is all
+/// `kill_harness_tree` can end on Windows, so there `taskkill /T` walks the tree.
+fn kill_timed_out_tree(pid: u32) {
+    #[cfg(windows)]
+    {
+        // By absolute path only: a PATH lookup could find another `taskkill`.
+        let Some(root) = std::env::var_os("SystemRoot") else {
+            return;
+        };
+        let mut command = Command::new(PathBuf::from(root).join("System32").join("taskkill.exe"));
+        command
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        without_console_window(&mut command);
+        let _ = command.status();
+    }
+    #[cfg(not(windows))]
+    crate::acp_wire::kill_harness_tree(pid);
 }
 
+/// On Windows, asks `windows_program` for an absolute stand-in.
+fn resolved_program(program: &str) -> OsString {
+    #[cfg(windows)]
+    {
+        windows_program(program, None).unwrap_or_else(|| OsString::from(program))
+    }
+    #[cfg(not(windows))]
+    {
+        OsString::from(program)
+    }
+}
+
+/// CreateProcess with a bare name does not find `.cmd`, `.bat`, or `.exe`
+/// the way the shell does. Rust wraps `.cmd` and `.bat` when given an
+/// absolute path.
 #[cfg(windows)]
 fn windows_program(program: &str, path_override: Option<&Path>) -> Option<OsString> {
     if program.contains(['/', '\\']) {
@@ -696,11 +778,6 @@ fn windows_candidates(dir: &Path, program: &str) -> Vec<PathBuf> {
         .into_iter()
         .map(|extension| base.with_extension(extension))
         .collect()
-}
-
-#[cfg(not(windows))]
-fn windows_program(_program: &str, _path_override: Option<&Path>) -> Option<OsString> {
-    None
 }
 
 /// Spawns the child with no console window. A release build has no console to
@@ -943,7 +1020,7 @@ impl SessionKey {
 #[derive(Clone, Debug)]
 pub struct InboundWake {
     pub instance: String,
-    pub speech: String,
+    pub dialogue: String,
 }
 
 /// A loaded session's replay, for its Instance's Chat. Not a wake: nothing
@@ -1865,8 +1942,8 @@ impl Session {
     }
 
     /// The wire died. Drop it, charge the loss, and let a later wake respawn.
-    /// Empty the slot here. `alive()` flips only once the wire's thread has
-    /// dropped its receiver, and a wake arriving before then would reuse it.
+    /// Empty the slot here. `Wire::alive` stays true until the receiver drops.
+    /// Shutdown may already have cleared `inspect.alive` when it took the wire.
     fn lost(&self, wire: &Wire, state: &mut State) {
         self.retire(wire);
         self.charge_loss(state);
@@ -1948,6 +2025,7 @@ impl Session {
         let Some(wire) = self.wire.lock().ok().and_then(|mut slot| slot.take()) else {
             return;
         };
+        self.update_inspect(|inspect| inspect.alive = false);
         wire.shutdown();
         if !wire.wait_for_exit(REAP) {
             eprintln!(
@@ -2264,7 +2342,9 @@ impl Session {
         let owners = Arc::clone(&self.owners);
         let serving = Arc::clone(&self.serving_instance);
         let plays = Arc::clone(&self.plays);
-        let mut command = self.launch.command(cwd, mcp_stdio().is_some());
+        let mut command = self
+            .launch
+            .command(cwd, mcp_stdio().is_some(), owned_interrupt());
         if self.launch.name == "codex" {
             let inputs = self.open_inputs();
             apply_codex_project_config(
@@ -2700,6 +2780,10 @@ impl Completer for Session {
         reply
     }
 
+    fn has_tools(&self) -> bool {
+        true
+    }
+
     /// One child serves every Instance, so an outstanding ask
     /// belongs to the Instance whose session asked it, mid-turn or between
     /// turns. Another character's wake is not held by this one's question.
@@ -2817,15 +2901,10 @@ pub fn run_probe() -> i32 {
     // `kill_harness_tree` can reap `npx` grandchildren. The handler shuts the
     // session down. 130 is the shell's SIGINT code, not a probe verdict.
     let interrupted = session.clone();
-    match ctrlc::set_handler(move || {
+    own_interrupt(move || {
         interrupted.shutdown();
         std::process::exit(130);
-    }) {
-        Ok(()) => own_interrupt(),
-        Err(why) => eprintln!(
-            "probe-harness: could not catch interrupt: {why}; the Harness stays in this process group"
-        ),
-    }
+    });
     // An Apply step leaves its settings here. The next probe starts without them.
     let _ = std::fs::remove_file(crate::settings::settings_path(session.data.as_path()));
     let code = match ProbeThen::from_env() {
@@ -3137,6 +3216,7 @@ fn answer_probe_calls(calls: std::sync::mpsc::Receiver<crate::mcp_http::Call>) {
             expression: None,
             placement: PlacementQuery::empty(),
             caffeinate: None,
+            animation_source: fidget_core::engine::AnimationSource::AiMcp,
         };
         let _ = call
             .reply
@@ -3255,9 +3335,9 @@ fn note_event(
         // Forwarded and not logged. The Action Log points at the Harness's own
         // session dump rather than copying it (GLOSSARY.md), and a reply is not
         // copied there either.
-        Event::InboundWake { session, speech } => {
+        Event::InboundWake { session, dialogue } => {
             if let Some(instance) = instance_of(&session) {
-                forward(Forwarded::InboundWake(InboundWake { instance, speech }));
+                forward(Forwarded::InboundWake(InboundWake { instance, dialogue }));
             }
         }
         Event::Thought { session, text } => {
@@ -3311,8 +3391,8 @@ pub fn note_parsed(instance: &str, wake: &Wake, reactive: bool, near_miss: Optio
     );
 }
 
-/// The six answers: `near_miss`, `proposal`, `speech`, `failed`, `error`,
-/// `withdrawn`. `near_miss` arrives as speech but is not `speech`.
+/// The six answers: `near_miss`, `proposal`, `dialogue`, `failed`, `error`,
+/// `withdrawn`. `near_miss` arrives as dialogue but is not `dialogue`.
 /// `withdrawn` outranks `error` because our own cancel arrives as one.
 fn parsed_fields(
     instance: &str,
@@ -3327,7 +3407,7 @@ fn parsed_fields(
         (None, Wake::Proposed(proposal)) if !proposal.behavior.is_empty() => {
             ("proposal", Some(proposal.behavior.as_str()))
         }
-        (None, Wake::Proposed(_)) => ("speech", None),
+        (None, Wake::Proposed(_)) => ("dialogue", None),
         (None, Wake::Failed) if withdrawn_for.is_some() => ("withdrawn", None),
         (None, Wake::Failed) if error.is_some() => ("error", None),
         (None, Wake::Failed) => ("failed", None),
@@ -3559,6 +3639,41 @@ fn attachment() -> MutexGuard<'static, Attachment> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// One permit for every test that installs or retargets the process slot.
+/// Installing tests take it before a timed worker. The bad-order case
+/// starts its budget while another holder still has the slot.
+#[cfg(test)]
+struct AttachmentTestHold {
+    _guard: MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+static ATTACHMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+thread_local! {
+    static ATTACHMENT_TEST_HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn attachment_test_hold() -> AttachmentTestHold {
+    let guard = ATTACHMENT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    ATTACHMENT_TEST_HELD.with(|held| held.set(true));
+    AttachmentTestHold { _guard: guard }
+}
+
+#[cfg(test)]
+impl Drop for AttachmentTestHold {
+    fn drop(&mut self) {
+        ATTACHMENT_TEST_HELD.with(|held| held.set(false));
+        let mut slot = attachment();
+        slot.session = None;
+        slot.forward = None;
+    }
+}
+
 /// Read the source, the variable, else `saved` from Settings, and hold the
 /// Session until the row moves it or the process exits. Process-global because
 /// the session is one per app and a Retarget rebuilds `DirectorSettings`.
@@ -3610,6 +3725,13 @@ fn reattach(attached: Option<&Target>, wanted: Option<Target>) -> Reattach {
 /// A wire that dies is the Session's own business. `spawning` is the
 /// Director's switch, so a session no wake will reach is not opened.
 pub(crate) fn retarget(wanted: Option<Target>, spawning: bool) {
+    #[cfg(test)]
+    ATTACHMENT_TEST_HELD.with(|held| {
+        assert!(
+            held.get(),
+            "a test must hold the attachment slot for the whole install and restore"
+        );
+    });
     let mut slot = attachment();
     // The probe and the tests never call `attach`, so there is no forward to
     // rebuild a Session with and nothing of theirs to move.
@@ -3732,7 +3854,7 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn with_sign_in_gate(
     login: Option<&str>,
-    methods: Vec<agent_client_protocol::schema::v1::AuthMethod>,
+    methods: Vec<agent_client_protocol::v1::schema::AuthMethod>,
     body: impl FnOnce(),
 ) {
     let dir = std::env::temp_dir().join(format!("fidget-sign-in-{}", uuid::Uuid::new_v4()));
@@ -4634,6 +4756,36 @@ mod tests {
                             chunk(&session, "Hello");
                             stop(&id, "end_turn");
                         }
+                        // `scripts/scenarios/ci/tool-narration.sh`. grok's wire:
+                        // no `messageId`, planning, a tool call, then a reply
+                        // whose `behavior:` line carries its dialogue. The ask
+                        // opens Chat so the leaf can read the Thinking row.
+                        "scenario-tool-narration" => {
+                            say(
+                                json!({"jsonrpc": "2.0", "id": 99, "method": "session/request_permission", "params": {
+                                    "sessionId": &session,
+                                    "toolCall": {"toolCallId": "t1", "title": "Open Chat for the scenario", "kind": "other"},
+                                    "options": [
+                                        {"optionId": "allow", "name": "Allow", "kind": "allow_once"},
+                                        {"optionId": "reject", "name": "Reject", "kind": "reject_once"},
+                                    ],
+                                }}),
+                            );
+                            record(count, "asked");
+                            thread::sleep(Duration::from_millis(300));
+                            say(json!({"jsonrpc": "2.0", "id": 99, "result": {"option": "allow"}}));
+                            chunk(
+                                &session,
+                                "He is still planted beside the Dock. I will set him moving.",
+                            );
+                            tool_call(&session, "fidget__play_behavior");
+                            chunk(
+                                &session,
+                                "behavior: walk I am walking. The floor ends here.",
+                            );
+                            stop(&id, "end_turn");
+                            record(count, "replied");
+                        }
                         // `scripts/scenarios/ci/thinking-row.sh`. The first turn
                         // asks, so Chat opens by itself, and its end cancels
                         // the ask. Later turns think slowly enough to capture.
@@ -5442,7 +5594,7 @@ mod tests {
     fn a_codex_acp_launch_carries_the_exact_trust_argument() {
         let data = PathBuf::from("/tmp/ct/data.dir");
         let launch = launch(Some("codex")).unwrap();
-        let mut command = launch.command(&tmp_attach(), false);
+        let mut command = launch.command(&tmp_attach(), false, None);
         apply_codex_launch_trust(&mut command, &launch.argv, &data);
         let args: Vec<String> = command
             .get_args()
@@ -5465,7 +5617,7 @@ mod tests {
                 "script=hello".into(),
             ],
         };
-        let mut command = launch.command(&tmp_attach(), false);
+        let mut command = launch.command(&tmp_attach(), false, None);
         apply_codex_launch_trust(&mut command, &launch.argv, &data);
         let args: Vec<_> = command.get_args().collect();
         assert!(!args.iter().any(|arg| *arg == "-c"), "{args:?}");
@@ -5522,7 +5674,7 @@ mod tests {
                 "@agentclientprotocol/codex-acp@latest".into(),
             ],
         };
-        let mut command = launch.command(&AttachCwd(root.clone()), false);
+        let mut command = launch.command(&AttachCwd(root.clone()), false, None);
         apply_codex_launch_trust(&mut command, &launch.argv, &data);
         command.env("FIDGET_ARGV_OUT", &out);
         without_console_window(&mut command);
@@ -5564,7 +5716,7 @@ mod tests {
                 "@agentclientprotocol/codex-acp@latest".into(),
             ],
         };
-        let mut command = launch.command(&AttachCwd(root.clone()), false);
+        let mut command = launch.command(&AttachCwd(root.clone()), false, None);
         apply_codex_launch_trust(&mut command, &launch.argv, &data);
         command.env("FIDGET_ARGV_OUT", &out);
         without_console_window(&mut command);
@@ -5586,21 +5738,50 @@ mod tests {
 
     #[test]
     fn codex_trust_override_uses_an_inline_table_and_survives_dots() {
-        let dir = PathBuf::from("/tmp/ct/data.dir");
-        assert_eq!(
-            codex_trust_override(&dir),
-            "projects={'/tmp/ct/data.dir'={trust_level='trusted'}}"
-        );
-        let win = PathBuf::from(r"C:\Users\demo\.local\share\fidget");
-        assert_eq!(
-            codex_trust_override(&win),
-            r"projects={'C:\Users\demo\.local\share\fidget'={trust_level='trusted'}}"
-        );
-        let odd = PathBuf::from("/tmp/o'brian/data.dir");
-        assert_eq!(
-            codex_trust_override(&odd),
-            r#"projects={"/tmp/o'brian/data.dir"={trust_level="trusted"}}"#
-        );
+        let cases = [
+            (
+                PathBuf::from("/tmp/ct/data.dir"),
+                "projects={'/tmp/ct/data.dir'={trust_level='trusted'}}",
+            ),
+            (
+                PathBuf::from(r"C:\Users\demo\.local\share\fidget"),
+                r"projects={'C:\Users\demo\.local\share\fidget'={trust_level='trusted'}}",
+            ),
+            (
+                PathBuf::from("/tmp/o'brian/data.dir"),
+                r#"projects={"/tmp/o'brian/data.dir"={trust_level="trusted"}}"#,
+            ),
+            (
+                PathBuf::from(r#"/tmp/say "hi"/data.dir"#),
+                r#"projects={'/tmp/say "hi"/data.dir'={trust_level='trusted'}}"#,
+            ),
+            (
+                PathBuf::from(r"C:\Users\o'brien"),
+                r#"projects={"C:\\Users\\o'brien"={trust_level="trusted"}}"#,
+            ),
+            (
+                PathBuf::from(r#"/tmp/o'brien "hi""#),
+                r#"projects={"/tmp/o'brien \"hi\""={trust_level="trusted"}}"#,
+            ),
+        ];
+        for (dir, exact) in cases {
+            let emitted = codex_trust_override(&dir);
+            assert_eq!(emitted, exact);
+            let doc = emitted
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_or_else(|err| panic!("{err}\n{emitted}"));
+            let projects = doc
+                .get("projects")
+                .and_then(toml_edit::Item::as_inline_table)
+                .unwrap_or_else(|| panic!("projects is not an inline table\n{emitted}"));
+            let path = dir.to_string_lossy();
+            let trust = projects
+                .get(path.as_ref())
+                .and_then(toml_edit::Value::as_inline_table)
+                .and_then(|table| table.get("trust_level"))
+                .and_then(toml_edit::Value::as_str);
+            assert_eq!(trust, Some("trusted"), "{emitted}");
+        }
     }
 
     /// Detach takes the token back out of `.cursor/mcp.json` and leaves the
@@ -5672,7 +5853,7 @@ mod tests {
         let args = |name, mcp_available| {
             launch(Some(name))
                 .unwrap()
-                .command(&tmp_attach(), mcp_available)
+                .command(&tmp_attach(), mcp_available, None)
                 .get_args()
                 .map(|arg| arg.to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
@@ -6365,7 +6546,7 @@ mod tests {
             let endpoint_was_served = crate::mcp_http::endpoint().is_some();
             let inline_config = std::env::var("OPENCODE_CONFIG_CONTENT").ok();
             let codex_config = launch.codex_mcp_config();
-            let command = launch.command(&tmp_attach(), true);
+            let command = launch.command(&tmp_attach(), true, None);
             let mut env: Vec<_> = command
                 .get_envs()
                 .map(|(key, _)| key.to_string_lossy().into_owned())
@@ -6473,7 +6654,7 @@ mod tests {
             name: "sleep".into(),
             argv: vec!["/bin/sleep".into(), "8".into()],
         };
-        let mut command = launch.command(&tmp_attach(), false);
+        let mut command = launch.command(&tmp_attach(), false, Some(InterruptOwned::for_test()));
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
         let mut child = command.spawn().expect("sleep");
@@ -6487,14 +6668,52 @@ mod tests {
         );
     }
 
+    /// Nothing in this binary catches Ctrl+C, so the production path has to
+    /// leave the child where a terminal Ctrl+C still reaches it.
     #[cfg(unix)]
     #[test]
     fn an_unowned_interrupt_leaves_the_child_in_the_app_group() {
-        let mut command = std::process::Command::new("/bin/sleep");
-        command.arg("8");
+        let launch = Launch {
+            name: "sleep".into(),
+            argv: vec!["/bin/sleep".into(), "8".into()],
+        };
+        let mut command = launch.command(&tmp_attach(), false, None);
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
-        apply_isolation(&mut command, false);
+        let mut child = command.spawn().expect("sleep");
+        let child_pgid = pgid_of(child.id()).expect("child pgid");
+        let app_pgid = pgid_of(std::process::id()).expect("app pgid");
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(
+            child_pgid, app_pgid,
+            "a failed ctrlc handler must not orphan a tree Ctrl+C can no longer reap"
+        );
+    }
+
+    /// A refused handler reaps nothing, so a child spawned after it must stay
+    /// where Ctrl+C still reaches it.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_interrupt_install_leaves_the_child_in_the_app_group() {
+        FAIL_INTERRUPT_INSTALL.store(true, Ordering::SeqCst);
+        forget_interrupt();
+        assert!(
+            own_interrupt(|| {}).is_none(),
+            "a refused handler claimed the interrupt"
+        );
+        let interrupt = owned_interrupt();
+        assert!(
+            interrupt.is_none(),
+            "a refused handler left a witness Session could mint"
+        );
+        let launch = Launch {
+            name: "sleep".into(),
+            argv: vec!["/bin/sleep".into(), "8".into()],
+        };
+        let mut command = launch.command(&tmp_attach(), false, interrupt);
+        command.stdout(std::process::Stdio::null());
+        command.stderr(std::process::Stdio::null());
         let mut child = command.spawn().expect("sleep");
         let child_pgid = pgid_of(child.id()).expect("child pgid");
         let app_pgid = pgid_of(std::process::id()).expect("app pgid");
@@ -6529,6 +6748,18 @@ mod tests {
         );
     }
 
+    /// `killpg(0)` is our group, and a negative id is not a group.
+    #[cfg(unix)]
+    #[test]
+    fn killable_group_refuses_our_own_group() {
+        let ours = unsafe { libc::getpgrp() };
+        assert!(!crate::acp_wire::killable_group(ours));
+        let other: libc::pid_t = if ours == 1 { 2 } else { 1 };
+        assert!(crate::acp_wire::killable_group(other));
+        assert!(!crate::acp_wire::killable_group(0));
+        assert!(!crate::acp_wire::killable_group(-1));
+    }
+
     /// The process group a `/bin/sleep` spawned under
     /// `apply_isolation(isolate)` landed in. The child is reaped before this
     /// returns; only its group is of interest.
@@ -6554,10 +6785,11 @@ mod tests {
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                r#"trap "" HUP; sleep 30 & wait"#.into(),
+                // TERM as well as HUP: a SIGTERM kill would leave the grandchild running.
+                r#"trap "" HUP TERM; sleep 30 & wait"#.into(),
             ],
         };
-        let mut command = launch.command(&tmp_attach(), false);
+        let mut command = launch.command(&tmp_attach(), false, Some(InterruptOwned::for_test()));
         command.stdout(std::process::Stdio::null());
         command.stderr(std::process::Stdio::null());
         let mut child = command.spawn().expect("sh");
@@ -6760,7 +6992,7 @@ mod tests {
         );
     }
 
-    /// The Harness Director's Speech reaches the bubble a chunk at a time,
+    /// The Harness Director's Dialogue reaches the bubble a chunk at a time,
     /// before the turn ends, and the Behavior name never does.
     #[test]
     fn a_harness_answer_is_spoken_as_its_chunks_land() {
@@ -6776,7 +7008,26 @@ mod tests {
             Wake::Proposed(BehaviorProposal {
                 behavior: "wave".to_string(),
                 dialogue: Some("Good morning".to_string()),
+                direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             })
+        );
+    }
+
+    /// The Shell hands Directors an `AnyCompleter`, so the tools invitation
+    /// has to survive that wrapper, not just the bare Session.
+    #[test]
+    fn a_harness_wake_is_invited_to_use_its_tools() {
+        let (_fx, session) = Fixture::new("speaking");
+        let completer = crate::completer::AnyCompleter::Harness(Arc::new(session));
+        let director = ModelDirector::new(completer, ["wave"], "buddy-1", "bmo", false);
+
+        let request = director.request(&crate::completer::tests::wake_context(), None);
+
+        assert!(
+            request.layers.contains("use the tools you have"),
+            "the Harness opening invites tool use: {}",
+            request.layers
         );
     }
 
@@ -6847,7 +7098,7 @@ mod tests {
                     }
                     _ => session.drop_conversation("buddy-1"),
                 }
-                let mut request = director.request(&context);
+                let mut request = director.request(&context, None);
                 request.prompt.push_str("\nextra chat context");
                 let woken = director.wake_request(request.clone(), &|_| {});
                 if matches!(replacement, "refused-fresh" | "cancelled-fresh") {
@@ -6995,6 +7246,73 @@ mod tests {
         );
         assert_eq!(fx.count("load"), 1, "the other Instance was dropped too");
         session.shutdown();
+    }
+
+    /// A saved slot is not a session this Harness can resume. It never
+    /// advertised `loadSession`, so the open is `session/new`.
+    #[test]
+    fn a_harness_without_load_session_opens_new_despite_a_saved_slot() {
+        let (fx, session) = Fixture::new("happy");
+        std::fs::write(
+            fx.dir.join(SESSION_FILE),
+            r#"{"harness":"fake","sessions":[{"instance":"buddy-1","character":"bmo","session_id":"saved-ok"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session.complete(&asking("hi"), &|_| {}),
+            Ok(Reply::whole("Hello"))
+        );
+        session.shutdown();
+
+        let loads = fx.count("load");
+        let news = fx.count("new");
+        assert_eq!(
+            loads, 0,
+            "session/load count {loads}, session/new count {news}"
+        );
+        assert!(
+            news >= 1,
+            "session/load count {loads}, session/new count {news}"
+        );
+    }
+
+    /// Bytes that do not parse are not a session to resume. The open is
+    /// `session/new`, and the save that follows names the id that open minted.
+    #[test]
+    fn a_corrupt_session_file_opens_new_and_the_save_names_that_id() {
+        let (fx, session) = Fixture::new("load");
+        std::fs::write(fx.dir.join(SESSION_FILE), b"not json").unwrap();
+        assert_eq!(
+            session.complete(&asking("hi"), &|_| {}),
+            Ok(Reply::whole("Hello"))
+        );
+        session.shutdown();
+
+        let loads = fx.count("load");
+        let news = fx.count("new");
+        assert_eq!(
+            loads, 0,
+            "session/load count {loads}, session/new count {news}"
+        );
+        assert!(
+            news >= 1,
+            "session/load count {loads}, session/new count {news}"
+        );
+        let prompts = fx.events("prompt");
+        let opened = prompts[0]["session_id"]
+            .as_str()
+            .expect("the prompt names the session that opened");
+        let saved: SavedSession = serde_json::from_str(
+            &std::fs::read_to_string(fx.dir.join(SESSION_FILE)).expect("the save wrote a file"),
+        )
+        .expect("the save replaced the corrupt file with JSON");
+        assert_eq!(
+            saved.sessions.len(),
+            1,
+            "the save should name only the opened session: {:?}",
+            saved.sessions
+        );
+        assert_eq!(saved.sessions[0].session_id, opened);
     }
 
     /// Start a new session drops every live Instance, so every lane has to
@@ -7289,6 +7607,8 @@ mod tests {
             Wake::Proposed(BehaviorProposal {
                 behavior: String::new(),
                 dialogue: Some(line.to_string()),
+                direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             })
         };
 
@@ -7297,6 +7617,8 @@ mod tests {
             &Wake::Proposed(BehaviorProposal {
                 behavior: "prowl".to_string(),
                 dialogue: Some("mine now".to_string()),
+                direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             }),
             true,
             None,
@@ -7312,10 +7634,10 @@ mod tests {
         // talk rather than name a Behavior.
         let talked = parsed_fields("buddy-1", &spoke("hello?"), false, None, None, None);
         assert_eq!(talked["wake"], json!("proactive"));
-        assert_eq!(talked["result"], json!("speech"));
+        assert_eq!(talked["result"], json!("dialogue"));
         assert_eq!(talked["behavior"], json!(null));
 
-        // The same shape as speech on the wire, and a different thing. The
+        // The same shape as dialogue on the wire, and a different thing. The
         // name it named is what makes it readable as a miss.
         let missed = parsed_fields(
             "buddy-1",
@@ -8038,7 +8360,7 @@ mod tests {
             match fx.forwarded.recv_timeout(Duration::from_secs(5)) {
                 Ok(Forwarded::Ask { ask, .. }) => break ask,
                 Ok(Forwarded::Thought { instance, line }) => thoughts.push((instance, line)),
-                Ok(Forwarded::InboundWake(wake)) => said.push((wake.instance, wake.speech)),
+                Ok(Forwarded::InboundWake(wake)) => said.push((wake.instance, wake.dialogue)),
                 Ok(_) => {}
                 Err(_) => panic!("the between-turn ask never reached Chat"),
             }
@@ -8100,7 +8422,7 @@ mod tests {
     }
 
     /// A closed session's thought from between turns has ended, so its
-    /// Thinking row closes with it. Speech accumulated between turns is
+    /// Thinking row closes with it. Dialogue accumulated between turns is
     /// emitted as an inbound wake before the close.
     #[test]
     fn closing_a_session_ends_its_thought_from_between_turns() {
@@ -8110,8 +8432,8 @@ mod tests {
             Ok(Reply::whole("Hello"))
         );
         // The ask is the last thing the Harness sends between turns, so once
-        // it is forwarded the speech before it has been collected. The thought
-        // is not enough: the speech follows it on the wire.
+        // it is forwarded the dialogue before it has been collected. The thought
+        // is not enough: the dialogue follows it on the wire.
         let mut buffered = Vec::new();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         let mut asked = false;
@@ -8124,14 +8446,14 @@ mod tests {
         assert!(asked, "the between-turn ask never arrived before timeout");
         let wire = session.current_wire().expect("attached");
         assert_eq!(wire.close("fresh-id"), Ok(()));
-        let mut speech_seen = false;
+        let mut dialogue_seen = false;
         let mut thought_ended = false;
         // Check buffered events first, then drain any remaining.
         for forwarded in buffered.into_iter().chain(fx.forwarded.try_iter()) {
             match forwarded {
                 Forwarded::InboundWake(wake) if wake.instance == "buddy-1" => {
-                    assert_eq!(wake.speech, "Your reminder: time to stretch!");
-                    speech_seen = true;
+                    assert_eq!(wake.dialogue, "Your reminder: time to stretch!");
+                    dialogue_seen = true;
                 }
                 Forwarded::Thought { instance, line }
                     if instance == "buddy-1" && line.is_empty() =>
@@ -8141,22 +8463,22 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(speech_seen, "between-turn speech was dropped on close");
+        assert!(dialogue_seen, "between-turn dialogue was dropped on close");
         assert!(thought_ended, "the Thinking row stayed open after close");
         session.shutdown();
     }
 
     /// Prompting again while a between-turn ask is unanswered still emits the
-    /// accumulated speech as an inbound wake, not drops it.
+    /// accumulated dialogue as an inbound wake, not drops it.
     #[test]
-    fn prompting_before_between_turn_ask_flushes_speech() {
+    fn prompting_before_between_turn_ask_flushes_dialogue() {
         let (fx, session) = Fixture::new("between-turn");
         assert_eq!(
             session.complete(&asking("hi"), &|_| {}),
             Ok(Reply::whole("Hello"))
         );
-        // The ask follows the speech on the wire, so once it is forwarded the
-        // speech is collected. The wake may come before it or after the next
+        // The ask follows the dialogue on the wire, so once it is forwarded the
+        // dialogue is collected. The wake may come before it or after the next
         // prompt, so count it from both sides.
         let mut wakes = Vec::new();
         let mut asked = false;
@@ -8178,15 +8500,15 @@ mod tests {
                 wakes.push(wake);
             }
         }
-        let speech: Vec<_> = wakes
+        let dialogue: Vec<_> = wakes
             .iter()
             .filter(|wake| wake.instance == "buddy-1")
-            .map(|wake| wake.speech.as_str())
+            .map(|wake| wake.dialogue.as_str())
             .collect();
         assert_eq!(
-            speech,
+            dialogue,
             ["Your reminder: time to stretch!"],
-            "between-turn speech was dropped when prompting again"
+            "between-turn dialogue was dropped when prompting again"
         );
         drop(worker);
     }
@@ -8212,7 +8534,7 @@ mod tests {
         let ask = loop {
             match fx.forwarded.recv_timeout(Duration::from_secs(5)) {
                 Ok(Forwarded::Ask { ask, .. }) => break ask,
-                Ok(Forwarded::InboundWake(wake)) => wakes.push((wake.instance, wake.speech)),
+                Ok(Forwarded::InboundWake(wake)) => wakes.push((wake.instance, wake.dialogue)),
                 Ok(_) => {}
                 Err(_) => panic!("B's ask never reached Chat"),
             }
@@ -8230,7 +8552,7 @@ mod tests {
         fx: Fixture,
         session: Arc<Session>,
         ask: PermissionAsk,
-        /// Instance and speech of each inbound wake before the ask.
+        /// Instance and dialogue of each inbound wake before the ask.
         wakes: Vec<(String, String)>,
         worker: thread::JoinHandle<Result<Reply, String>>,
     }
@@ -8267,7 +8589,7 @@ mod tests {
         session.shutdown();
     }
 
-    /// B's speech during A's turn is not A's reply. It reaches B's Chat as
+    /// B's dialogue during A's turn is not A's reply. It reaches B's Chat as
     /// work between turns.
     #[test]
     fn another_sessions_update_mid_turn_is_not_folded_into_the_turn() {
@@ -8282,7 +8604,7 @@ mod tests {
         assert_eq!(
             wakes,
             [("buddy-b".to_string(), "Not yours".to_string())],
-            "B's speech did not reach B"
+            "B's dialogue did not reach B"
         );
         assert_eq!(worker.join().unwrap(), Ok(Reply::whole("Hello")));
         session.answer_permission(&ask.request, "allow");
@@ -8435,7 +8757,7 @@ mod tests {
                     restored.push((instance, history))
                 }
                 Forwarded::InboundWake(wake) => {
-                    panic!("replay woke {}: {}", wake.instance, wake.speech)
+                    panic!("replay woke {}: {}", wake.instance, wake.dialogue)
                 }
                 Forwarded::Plan { steps, .. } if !steps.is_empty() => {
                     panic!("replay drew a live plan: {steps:?}")
@@ -8588,7 +8910,7 @@ mod tests {
                  "kind": "execute", "status": "completed",
                  "locations": [],
                  "content": [
-                    {"type": "terminal", "id": "term-7"},
+                    {"type": "terminal", "label": "Terminal term-7"},
                     {"type": "text", "text": "running 3 tests"},
                  ]},
                 {"type": "tool_call", "id": "t-media", "title": "Fetch page",
@@ -9594,15 +9916,15 @@ mod tests {
         assert!(!inspect.alive && !inspect.initializing && inspect.missing.is_none());
         let failed = inspect.failed.expect("the landing has no reason to show");
         assert_eq!(failed.command, Some(session.launch.line()));
-        // Linux adds " (core dumped)" when the runner keeps cores; macOS does not.
+        // Linux appends " (core dumped)" when the runner keeps cores.
         #[cfg(unix)]
-        assert!(
-            failed
+        {
+            let reason = failed
                 .reason
-                .starts_with("exited before initialize, signal: 6 (SIGABRT)"),
-            "{}",
-            failed.reason
-        );
+                .strip_suffix(" (core dumped)")
+                .unwrap_or(&failed.reason);
+            assert_eq!(reason, "exited before initialize, signal: 6 (SIGABRT)");
+        }
         // Its stderr, and libtest's own stdout from before the fixture ran.
         assert!(
             failed.output.contains(
@@ -9673,7 +9995,8 @@ mod tests {
 
     fn surface_tick(session: &Arc<Session>) -> (Duration, Vec<SignIn>) {
         use fidget_core::character::{
-            Character, CursorReaction, GravityScale, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+            Character, CursorReaction, GravityScale, DEFAULT_IDLE_GESTURE_EVERY_S,
+            DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S,
         };
         use fidget_core::engine::{Point, WorldSnapshot};
         use fidget_core::roster::Roster;
@@ -9700,6 +10023,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         };
         let id = roster.spawn(&character, "bmo".to_string(), Point { x: 10.0, y: 20.0 });
@@ -10160,11 +10486,21 @@ mod tests {
         session.shutdown();
     }
 
+    /// `Empty` means `complete` has not returned. A queued signal means the
+    /// caller has already finished.
+    fn assert_caller_still_pending(returned: &mpsc::Receiver<()>) {
+        assert!(
+            matches!(returned.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "the caller returned before shutdown was accepted"
+        );
+    }
+
     /// Switching the AI source commits on the UI thread, so `retarget` must
     /// not wait on the child it is dropping. That is cheap only because
     /// `Msg::Shutdown` ends the turn in flight instead of being swallowed by it.
     #[test]
     fn retarget_does_not_wait_out_a_turn_in_flight() {
+        let _hold = attachment_test_hold();
         let (fx, session) = Fixture::new("slow");
         let session = Arc::new(session);
         let worker = {
@@ -10191,25 +10527,234 @@ mod tests {
             slot.session = None;
             slot.forward = None;
         }
-        // Fast and reaped are the same fact. `shutdown` returns when the
-        // wire thread ends after `kill_harness_tree`, or when `REAP` runs
-        // out at 2s. Under half a second is killed. 2s is still running.
+        // Retarget returns on the UI thread. The reap is the switch thread.
+        // Under half a second means this call did not wait for that reap.
         assert!(
             waited < Duration::from_millis(500),
             "retarget waited {waited:?} on the dropped session"
         );
         assert!(attached().is_none(), "the Off pick did not take");
-        // And the child really was killed rather than left behind. The wire
-        // thread ends only after `kill_harness_tree`, and the turn's caller
-        // only returns once that thread has hung up on it.
+        // Only a shutdown loss clears `inspect.alive` before the caller
+        // returns. A budget timeout is a different error, and the return
+        // does not mean the child has been reaped.
+        let err = worker
+            .join()
+            .unwrap()
+            .expect_err("the turn outlived the kill");
         assert!(
-            worker.join().unwrap().is_err(),
-            "the turn outlived the kill"
+            err == LOST,
+            "the turn did not end as a shutdown loss: {err}"
         );
         assert!(
             !session.inspect().alive,
             "the dropped session still reads live"
         );
+    }
+
+    #[test]
+    fn shutdown_drops_alive_before_the_in_flight_caller_returns() {
+        for iteration in 0..10 {
+            let _hold = attachment_test_hold();
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (returned_tx, returned_rx) = mpsc::channel();
+            let (fx, session) = Fixture::new("slow");
+            let session = Arc::new(session);
+            let worker = {
+                let session = Arc::clone(&session);
+                thread::spawn(move || {
+                    crate::acp_wire::arm_shutdown_park(entered_tx);
+                    let result = session.complete(&asking("hi"), &|_| {});
+                    let _ = returned_tx.send(());
+                    result
+                })
+            };
+            assert!(
+                fx.wait_for("prompt", 1),
+                "iteration {iteration}: the turn never went out"
+            );
+            {
+                let mut slot = attachment();
+                slot.forward = Some(silent());
+                slot.session = Some(Arc::clone(&session));
+            }
+            let start = Instant::now();
+            retarget(None, false);
+            assert!(
+                start.elapsed() < Duration::from_millis(500),
+                "iteration {iteration}: retarget waited {:?} on the dropped session",
+                start.elapsed()
+            );
+            let release = entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap_or_else(|_| {
+                    panic!("iteration {iteration}: shutdown never reached the wire")
+                });
+            assert_caller_still_pending(&returned_rx);
+            assert!(
+                !session.inspect().alive,
+                "iteration {iteration}: the dropped session still reads live"
+            );
+            let _ = release.send(());
+            assert_eq!(
+                worker
+                    .join()
+                    .unwrap()
+                    .expect_err("the turn outlived the kill"),
+                LOST,
+                "iteration {iteration}: the turn did not end as a shutdown loss"
+            );
+            assert!(
+                !session.inspect().alive,
+                "iteration {iteration}: the dropped session still reads live"
+            );
+        }
+    }
+
+    #[test]
+    fn a_budget_return_after_shutdown_does_not_read_live() {
+        let _hold = attachment_test_hold();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (fx, session) = Fixture::new("slow");
+        let session = Arc::new(session.with_timeout(Duration::from_secs(1)));
+        let worker = {
+            let session = Arc::clone(&session);
+            thread::spawn(move || {
+                crate::acp_wire::arm_shutdown_park(entered_tx);
+                let result = session.complete(&asking("hi"), &|_| {});
+                let _ = returned_tx.send(());
+                result
+            })
+        };
+        assert!(fx.wait_for("prompt", 1), "the turn never went out");
+        {
+            let mut slot = attachment();
+            slot.forward = Some(silent());
+            slot.session = Some(Arc::clone(&session));
+        }
+        let start = Instant::now();
+        retarget(None, false);
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "retarget waited {:?} on the dropped session",
+            start.elapsed()
+        );
+        let release = entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown never reached the wire");
+        assert_caller_still_pending(&returned_rx);
+        let err = worker.join().unwrap().unwrap_err();
+        assert!(
+            err.contains("exceeded"),
+            "the turn was not released on its budget: {err}"
+        );
+        assert!(
+            !session.inspect().alive,
+            "the dropped session still reads live"
+        );
+        let _ = release.send(());
+    }
+
+    /// Starting the budget before the slot is ours lets the caller finish
+    /// while another holder still has it. The same pending check the other
+    /// tests use then rejects that caller. Release and join still run.
+    #[test]
+    #[should_panic(expected = "the caller returned before shutdown was accepted")]
+    fn a_budget_caller_that_starts_before_the_hold_is_already_done() {
+        let blocker = attachment_test_hold();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (returned_tx, returned_rx) = mpsc::channel();
+        let (finished_tx, finished_rx) = mpsc::channel();
+        let (fx, session) = Fixture::new("slow");
+        let session = Arc::new(session.with_timeout(Duration::from_secs(1)));
+        let worker = {
+            let session = Arc::clone(&session);
+            thread::spawn(move || {
+                crate::acp_wire::arm_shutdown_park(entered_tx);
+                let result = session.complete(&asking("hi"), &|_| {});
+                let _ = returned_tx.send(());
+                let _ = finished_tx.send(());
+                result
+            })
+        };
+        assert!(fx.wait_for("prompt", 1), "the turn never went out");
+        finished_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the budget caller never returned");
+        drop(blocker);
+        let _hold = attachment_test_hold();
+        {
+            let mut slot = attachment();
+            slot.forward = Some(silent());
+            slot.session = Some(Arc::clone(&session));
+        }
+        retarget(None, false);
+        let release = entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("shutdown never reached the wire");
+        let _ = worker.join();
+        let _ = release.send(());
+        assert_caller_still_pending(&returned_rx);
+    }
+
+    #[test]
+    #[should_panic(expected = "hold the attachment slot")]
+    fn a_test_retarget_without_the_slot_hold_is_refused() {
+        retarget(None, false);
+    }
+
+    #[test]
+    fn two_retargets_each_shut_down_their_own_session() {
+        for iteration in 0..4 {
+            let run = |name: &'static str| {
+                thread::spawn(move || {
+                    let _hold = attachment_test_hold();
+                    let (entered_tx, entered_rx) = mpsc::channel();
+                    let (returned_tx, returned_rx) = mpsc::channel();
+                    let (fx, session) = Fixture::new("slow");
+                    let session = Arc::new(session);
+                    let worker = {
+                        let session = Arc::clone(&session);
+                        thread::spawn(move || {
+                            crate::acp_wire::arm_shutdown_park(entered_tx);
+                            let result = session.complete(&asking("hi"), &|_| {});
+                            let _ = returned_tx.send(());
+                            result
+                        })
+                    };
+                    assert!(
+                        fx.wait_for("prompt", 1),
+                        "{name} {iteration}: the turn never went out"
+                    );
+                    {
+                        let mut slot = attachment();
+                        slot.forward = Some(silent());
+                        slot.session = Some(Arc::clone(&session));
+                    }
+                    retarget(None, false);
+                    let release = entered_rx
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap_or_else(|_| {
+                            panic!("{name} {iteration}: shutdown missed this session")
+                        });
+                    assert_caller_still_pending(&returned_rx);
+                    let _ = release.send(());
+                    let err = worker
+                        .join()
+                        .unwrap()
+                        .expect_err("the turn outlived the kill");
+                    assert_eq!(err, LOST, "{name} {iteration}: {err}");
+                    assert!(
+                        !session.inspect().alive,
+                        "{name} {iteration}: the dropped session still reads live"
+                    );
+                })
+            };
+            let left = run("left");
+            let right = run("right");
+            left.join().unwrap();
+            right.join().unwrap();
+        }
     }
 
     /// The stalled open has to stay unanswered until the session is dropped.
@@ -10508,6 +11053,7 @@ mod tests {
     /// and the wake does not come back succeeded.
     #[test]
     fn retarget_does_not_wait_out_a_session_open() {
+        let _hold = attachment_test_hold();
         let (fx, session) = Fixture::new("stall-open");
         let session = Arc::new(session);
         let worker = {
@@ -10541,6 +11087,7 @@ mod tests {
 
     #[test]
     fn a_failed_switch_thread_still_reaps_the_old_child() {
+        let _hold = attachment_test_hold();
         let (fx, session) = Fixture::new("stall-open");
         let session = Arc::new(session);
         let worker = {
@@ -11481,7 +12028,7 @@ mod tests {
     /// and env are a credential path and never ride along on the offer.
     #[test]
     fn sign_in_buttons_keep_agent_ids_and_drop_terminal_secrets() {
-        use agent_client_protocol::schema::v1::{AuthMethod, AuthMethodAgent, AuthMethodTerminal};
+        use agent_client_protocol::v1::schema::{AuthMethod, AuthMethodAgent, AuthMethodTerminal};
         use std::collections::HashMap;
 
         let mut env = HashMap::new();
@@ -11952,6 +12499,54 @@ mod tests {
     }
 
     #[test]
+    fn a_timed_out_probe_kills_the_launcher_and_what_it_started() {
+        let dir = std::env::temp_dir().join(format!("fidget-probe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("survived");
+
+        // A grandchild writes the marker after a pause. It can only write it
+        // if the timeout left it running.
+        #[cfg(unix)]
+        let script = {
+            use std::os::unix::fs::PermissionsExt;
+            let path = dir.join("hung-launcher.sh");
+            let body = format!(
+                "#!/bin/sh\n(sleep 2; touch '{}') &\nwait\n",
+                marker.display()
+            );
+            std::fs::write(&path, body).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+
+        #[cfg(windows)]
+        let script = {
+            let path = dir.join("hung-launcher.bat");
+            let body = format!(
+                "@echo off\r\ncmd /c \"ping -n 3 127.0.0.1 >nul & echo x > \"{}\"\"\r\n",
+                marker.display()
+            );
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+
+        let launch = Launch {
+            name: "hung-fixture".into(),
+            argv: vec![script.to_string_lossy().to_string()],
+        };
+        assert!(matches!(
+            probe_launcher_within(&launch, Duration::from_millis(300)),
+            ProbeOutcome::Unhealthy(_)
+        ));
+        thread::sleep(Duration::from_secs(4));
+        assert!(
+            !marker.exists(),
+            "the launcher's child outlived the probe's timeout"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn probe_no_output() {
         let dir = std::env::temp_dir().join(format!("fidget-probe-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -12062,6 +12657,21 @@ mod tests {
         assert_eq!(
             windows_program("npx", Some(&dir)).as_deref(),
             Some(dir.join("npx.cmd").as_os_str())
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Some installs ship only `npx.bat`. The launcher has to name that file
+    /// or the Windows run is `NotFound`.
+    #[cfg(windows)]
+    #[test]
+    fn a_bat_stand_in_is_the_program_when_the_fixture_has_only_that_file() {
+        let dir = std::env::temp_dir().join(format!("fidget-bat-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("npx.bat"), "@echo off\r\n").unwrap();
+        assert_eq!(
+            windows_program("npx", Some(&dir)).as_deref(),
+            Some(dir.join("npx.bat").as_os_str())
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

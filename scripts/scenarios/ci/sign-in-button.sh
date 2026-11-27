@@ -56,6 +56,8 @@ opened="$out/opened.txt"
 printf '#!/bin/sh\nprintf "%%s\\n" "$*" >> %q\n' "$opened" > "$out/bin/open"
 chmod +x "$out/bin/open"
 
+seed_tour_shown "$out/home"
+start_ms=$(now_ms)
 env HOME="$out/home" PATH="$out/bin:$PATH" \
   FIDGET_HARNESS="$harness" \
   FIDGET_DIRECTOR_WAKE_SECS=1 \
@@ -74,13 +76,13 @@ shot() { # <name>
   screencapture -x -o -l "$id" "$out/$1.png"
 }
 
-wait_for_up 3 "$log" || fail "Fidget never wrote its overlay line; see $log"
+wait_for_up "$log" || fail "Fidget never wrote its overlay line; see $log"
 wait_for_marks 3 "$marks" '^spawn$' || fail "Harness never spawned; see $log"
 # The 1 s timed wake sends session/new (refused: auth required), which shows the
 # needs-login UI; a session/new only comes from a wake, not from attach alone.
 "$tools/ax" open "$pid" Chat BMO > "$out/open.txt" 2>&1 || fail "the menu's Chat row did not open Chat; see $out/open.txt"
 wait_for_ax_dump 3 "$pid" BMO . || fail "Chat did not open for needs-login"
-wait_for_marks 2 "$marks" '^new$' || fail "timed wake did not send session/new; see $marks"
+wait_for_first_wake "$marks" '^new$' || fail "timed wake did not send session/new; see $marks"
 
 dump needs-login
 shot needs-login
@@ -117,4 +119,4 @@ if grep -qE 'Finish signing in in your browser' "$out/signed-in.ax.txt"; then
   fail "waiting line still present after sign-in; see $out/signed-in.ax.txt"
 fi
 echo "ok: session opened, waiting line cleared"
-echo "PASS: evidence in $out"
+echo "PASS: evidence in $out ($(($(now_ms) - start_ms))ms)"

@@ -12,7 +12,7 @@ is defined in [GLOSSARY.md](./GLOSSARY.md) and used precisely here.
 
 Early. Work is tracked as [GitHub issues](https://github.com/omesser/fidget/issues).
 
-The overlay is up and the frame loop runs the Engine, so the sprite falls, lands on the top edge of whatever window is under it, rides that edge when the window is dragged slowly, and drops when the window is yanked or closed, and it stands on the Dock rather than behind it. It can be clicked, picked up, dragged and thrown. It knows when to get out of the way: it moves off a display a fullscreen application has taken and fades out when every display is taken, goes away at once on Control-Option-Command-B and comes back the same way, and appears in screen captures and shares by default, with an opt-out in Presence settings for users who need meeting privacy. Startup stops if no Character Package loads. A Director proposes Behaviors: Static weights with nothing configured, an HTTP Completer if you set a key, or a Harness if you attach one (see [Get It](./README.md#get-it)). Both HTTP and Harness fill the Director role and answer chat ([ADR-0008](./docs/adr/0008-one-harness-session.md)). Double-clicking is a Summon that opens the chat surface; the sprite reacts and the Director answers. Right-clicking the sprite and the tray / menu bar icon open the same menu: Chat, Character, Instances, Director, Do Not Disturb, Go away, Hide rules, Memory, Action Log, Settings, Quit.
+The overlay is up and the frame loop runs the Engine, so the sprite falls, lands on the top edge of whatever window is under it, rides that edge when the window is dragged slowly, and drops when the window is yanked or closed, and it stands on the Dock rather than behind it. It can be clicked, picked up, dragged and thrown. It knows when to get out of the way: it moves off a display a fullscreen application has taken and fades out when every display is taken, goes away at once on Control-Option-Command-B and comes back the same way, and appears in screen captures and shares by default, with an opt-out in Presence settings for users who need meeting privacy. Startup stops if no Character Package loads. A Director proposes Behaviors: Static weights with nothing configured, an HTTP Completer if you set a key, or a Harness if you attach one (see [Get It](./README.md#get-it)). Both HTTP and Harness fill the Director role and answer chat ([ADR-0008](./docs/adr/0008-one-harness-session.md)). Double-clicking is a Summon that opens the chat surface; the sprite reacts and the Director answers. Right-clicking the sprite and the tray icon open one menu: Chat, Character, Instances, Caffeinate, Do Not Disturb, Possess, Go away, Settings, and Quit. The tray also offers Bring to this display. Hide in fullscreen apps, the hide hotkey, and AI are in Settings. Memory opens from Settings. The Action Log opens from Settings, Development.
 
 The Engine drives all nine required Animations. `idle`, `fall`, `sit`, `sleep` and `walk` each answer a State, `fall` covering being dragged as well; `land` plays when a fall ends, `hold` when a Perch is ridden, and `react` answers a Poke. Eight of the nine are also Primitives a Character can compose into a Behavior — all but `fall`, which is what losing your footing looks like rather than something a Behavior can ask for. A Behavior plays its Primitives in order and the Behaviors it chains into, and is refused or abandoned when the State the sprite is in does not permit it. `talk` plays when a proposal names a Behavior that includes it.
 
@@ -265,18 +265,23 @@ member on every machine.
 
 | Ring | Declared shares | Ring total | Share |
 |---|---|---|---|
-| BMO `idle` | `idle` 80, `sing` 10, `skate` 10 | 100 | 80%, 10%, 10% |
+| BMO `idle` | loop `idle` 80; gestures `sing` 10, `skate` 10 | | the loop is the base; the gestures split evenly |
 | BMO `walk` | `walk` 30, `ballwalk` 10 | 40 | 75%, 25% |
-| Buddy Bot `idle` | `idle` 20, and 10 each to `idle-blink`, `idle-breathe`, `idle-listen` | 50 | 40%, 20%, 20%, 20% |
-| Cat `idle` | `idle` 20, `waiting` 10 | 30 | 67%, 33% |
-| Jotaro `idle` | `idle` 30, `waiting` 10 | 40 | 75%, 25% |
-| Timber Wolf `idle` | `idle` 30, `scan` 10 | 40 | 75%, 25% |
-| Trump `idle` | `idle` 30, `waiting` 20 | 50 | 60%, 40% |
+| Buddy Bot `idle` | loop `idle` 20; gestures `idle-blink`, `idle-breathe`, `idle-listen` at 10 | | the loop is the base; the gestures split evenly |
+| Cat `idle` | loop `idle` 20; gestures `grooming` 10, `waiting` 10 | | the loop is the base; the gestures split evenly |
+| Jotaro `idle` | loop `idle` (the first sheet row, six frames) 10 | | the stand is the loop; there is no gesture |
+| Timber Wolf `idle` | loop `idle` 30; gesture `scan` 10 | | the loop is the base |
+| Trump `idle` | loop `idle` 30; gesture `waiting` 20 | | the loop is the base |
+| Tux `idle` | loop `idle` 80; gestures `restless-sitting` 10, `look-around` 10, `checking-work` 3, `recover-card` 4, `waddle-in-place` 3 | | the loop is the base; gestures use those weights |
+| Rubber Duck `idle` | loop `idle` 10; gestures `wave`, `thinking`, `pondering`, `look-right`, `look-left` at 10 | | the loop is the base; the gestures split evenly |
 
-Only two of the seven rings declare more than one number, because an undeclared
-member is already 10: `idle = 80` against two silent variants is the whole of
-80/10/10. The shares above are what a million draws actually produced, not what
-the arithmetic promises.
+An undeclared member is already 10, so a ring can set one number and leave the
+rest. Loops and idle-gestures are separate draws: the calm loop is base `idle`
+plus any `variant_of` it, and a gesture declares `variant_of = "idle-gesture"`
+under its own name. The Engine plays
+one weighted loop, waits a seeded gap (`idle_gesture_every_s`, or 10 to 30
+seconds), plays one idle-gesture for a single pass, and picks a loop again. A
+Behavior's `idle`, and the walk and talk rings, still draw one member and loop it.
 
 ### 7. Physics, Perches, and five verbs
 
@@ -340,7 +345,7 @@ additions wait for v2.
 ### 8. Always-on-top, single z-level, aggressive hiding
 
 One window level. On macOS: a non-activating panel at floating level, joining
-all Spaces, stationary, never taking focus, never in the app switcher.
+all Spaces, stationary, never taking focus, never in window cycling.
 
 "Sits on your window" needs always-on-top. "Hides behind your window" needs
 desktop level. One window cannot be both, and restacking dynamically by sprite

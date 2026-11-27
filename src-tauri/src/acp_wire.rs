@@ -2,6 +2,8 @@
 //! No SDK type leaves the file. Reversing the crate choice rewrites this
 //! file only. The frame loop never sees it.
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -12,25 +14,26 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::content_mark::chunk_text;
+use crate::content_mark::{self, chunk_text};
 use crate::mcp_http::SecretString;
-use crate::tool_content::{pieces, places, Place, ToolPiece};
-use agent_client_protocol::schema::v1::{
+use crate::tool_content::{piece, pieces, places, Piece, Place, ToolPiece};
+use agent_client_protocol::schema::ProtocolVersion;
+use agent_client_protocol::v1::schema::{
     AuthMethod, AuthenticateRequest, CancelNotification, ClientCapabilities, CloseSessionRequest,
     CompleteElicitationNotification, ContentBlock, CreateElicitationRequest,
     CreateElicitationResponse, ElicitationAcceptAction, ElicitationAction, ElicitationCapabilities,
     ElicitationContentValue, ElicitationFormCapabilities, ElicitationId, ElicitationMode,
     ElicitationPropertySchema, ElicitationScope, ElicitationSessionScope,
-    ElicitationUrlCapabilities, EnvVariable, Error, ErrorCode, HttpHeader, Implementation,
-    InitializeRequest, LoadSessionRequest, McpServer, McpServerHttp, McpServerStdio, MessageId,
-    Meta, NewSessionRequest, Plan, PromptRequest, PromptResponse, RequestPermissionOutcome,
+    ElicitationUrlCapabilities, EnvVariable, HttpHeader, Implementation, InitializeRequest,
+    LoadSessionRequest, McpServer, McpServerHttp, McpServerStdio, MessageId, Meta,
+    NewSessionRequest, Plan, PromptRequest, PromptResponse, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
     SessionConfigId, SessionConfigKind, SessionConfigOption, SessionConfigOptionCategory,
     SessionConfigSelectOptions, SessionId, SessionNotification, SessionUpdate,
     SetSessionConfigOptionRequest, StopReason, TextContent, ToolCallContent, ToolCallLocation,
 };
-use agent_client_protocol::schema::ProtocolVersion;
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Responder};
+use agent_client_protocol::v1::{ConnectionTo, Responder};
+use agent_client_protocol::{Agent, ByteStreams, Client, Error, ErrorCode};
 use fidget_core::director::Reply;
 #[cfg(test)]
 use fidget_core::turn_motion::Beat;
@@ -41,6 +44,35 @@ use tokio::sync::mpsc;
 /// After `session/cancel`, how long the turn lock waits for the `cancelled`
 /// reply before it is given back regardless.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
+
+#[cfg(test)]
+thread_local! {
+    static SHUTDOWN_PARK: RefCell<Option<sync_mpsc::Sender<sync_mpsc::Sender<()>>>> =
+        const { RefCell::new(None) };
+}
+
+/// Hold the next wire this thread spawns at shutdown so a test can read `alive` before `Done`.
+#[cfg(test)]
+pub(crate) fn arm_shutdown_park(park: sync_mpsc::Sender<sync_mpsc::Sender<()>>) {
+    SHUTDOWN_PARK.with(|slot| *slot.borrow_mut() = Some(park));
+}
+
+#[cfg(test)]
+fn take_shutdown_park() -> Option<sync_mpsc::Sender<sync_mpsc::Sender<()>>> {
+    SHUTDOWN_PARK.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(test)]
+fn hold_shutdown(park: &mut Option<sync_mpsc::Sender<sync_mpsc::Sender<()>>>) {
+    let Some(park) = park.take() else {
+        return;
+    };
+    let (release_tx, release_rx) = sync_mpsc::channel();
+    if park.send(release_tx).is_err() {
+        return;
+    }
+    let _ = release_rx.recv();
+}
 
 /// How long a cancelled turn may go without one frame from the child before
 /// the child counts as hung and is retired. The default turn budget: no frame
@@ -234,6 +266,9 @@ pub struct PermissionAsk {
     /// The tool call's `content`, as the text of it. Where a question from an
     /// MCP server arrives, and so the first thing the row has to show.
     pub content: Vec<String>,
+    /// Every other piece but a diff, as the Markdown mark a replayed tool row
+    /// draws for it. Not words, so `input` still stands in beside them.
+    pub marks: Vec<String>,
     /// The arguments the call was made with. ACP's `rawInput`, arbitrary JSON.
     /// What the row falls back to when a call carried no content.
     pub input: Option<serde_json::Value>,
@@ -340,8 +375,8 @@ pub enum Event {
     Thought { session: String, text: String },
     /// Between-turn agent text accumulated in a session's `Stream` and flushed
     /// when a session transitions (Ask, Elicit, Prompt, or Close).
-    InboundWake { session: String, speech: String },
-    /// A Harness turn beat for the character. Not speech, and not a Behavior
+    InboundWake { session: String, dialogue: String },
+    /// A Harness turn beat for the character. Not dialogue, and not a Behavior
     /// the Director named.
     Moment { session: String, moment: Moment },
     /// A forwarded ask that can no longer be answered. Every Chat surface
@@ -527,7 +562,7 @@ pub enum TurnError {
 /// mid-session as `-32603` with `errorKind: "authentication_failed"` in
 /// `data`, the field it tells clients to dispatch on instead of the text.
 fn auth_refused(error: &Error) -> bool {
-    error.code == ErrorCode::AuthRequired
+    error.code == ErrorCode::AUTH_REQUIRED
         || error
             .data
             .as_ref()
@@ -667,9 +702,21 @@ impl Wire {
         let (tx, rx) = mpsc::unbounded_channel();
         let (ready_tx, ready_rx) = sync_mpsc::channel();
         let (done_tx, done) = sync_mpsc::channel();
+        #[cfg(test)]
+        let shutdown_park = take_shutdown_park();
         thread::Builder::new()
             .name("acp-wire".into())
-            .spawn(move || run(command, rx, ready_tx, done_tx, on_event))
+            .spawn(move || {
+                run(
+                    command,
+                    rx,
+                    ready_tx,
+                    done_tx,
+                    on_event,
+                    #[cfg(test)]
+                    shutdown_park,
+                )
+            })
             .map_err(|why| SpawnError::Failed(format!("could not start the wire thread: {why}")))?;
         let handshake = match ready_rx.recv_timeout(timeout) {
             Ok(Ok(handshake)) => handshake,
@@ -903,6 +950,7 @@ fn run(
     // is what `wait_for_exit` waits for.
     _done: sync_mpsc::Sender<()>,
     on_event: OnEvent,
+    #[cfg(test)] mut shutdown_park: Option<sync_mpsc::Sender<sync_mpsc::Sender<()>>>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -962,7 +1010,7 @@ fn run(
         let mut ready = Some(ready);
         let mut refused = None;
         let outcome = Client
-            .builder()
+            .v1()
             .name("fidget")
             .on_receive_notification(
                 async move |notification: SessionNotification, _cx| {
@@ -1019,7 +1067,15 @@ fn run(
                             if let Some(ready) = ready.take() {
                                 let _ = ready.send(Ok(handshake));
                             }
-                            serve(&cx, rx, incoming_rx, &on_event).await;
+                            serve(
+                                &cx,
+                                rx,
+                                incoming_rx,
+                                &on_event,
+                                #[cfg(test)]
+                                &mut shutdown_park,
+                            )
+                            .await;
                         }
                         Err(why) => refused = Some(error_text(why)),
                     }
@@ -1198,6 +1254,11 @@ pub(crate) fn killable_group(pgid: libc::pid_t) -> bool {
     pgid > 0 && pgid != unsafe { libc::getpgrp() }
 }
 
+/// SIGKILL, not SIGTERM. Claude's ACP adapter dumps
+/// `Query closed before response received` on a polite signal.
+#[cfg(unix)]
+const HARNESS_KILL_SIGNAL: i32 = libc::SIGKILL;
+
 /// SIGKILL the Harness's process group. `npx` grandchildren share it, and a
 /// direct `Child::kill` leaves them running. Never our own group.
 /// On Windows this terminates the Job Object so grandchildren die too.
@@ -1207,10 +1268,8 @@ pub(crate) fn kill_harness_tree(pid: u32) {
         // SAFETY: getpgid queries the child's group; errors yield pgid <= 0 and skip killpg.
         let pgid = unsafe { libc::getpgid(pid as libc::pid_t) };
         if killable_group(pgid) {
-            // SIGKILL, not SIGTERM: Claude's ACP adapter dumps
-            // `Query closed before response received` on a polite signal.
             // SAFETY: killable_group verified pgid is not our own process group.
-            let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            let _ = unsafe { libc::killpg(pgid, HARNESS_KILL_SIGNAL) };
         }
     }
     #[cfg(windows)]
@@ -1338,6 +1397,7 @@ async fn serve(
     mut rx: mpsc::UnboundedReceiver<Msg>,
     mut incoming: mpsc::UnboundedReceiver<Incoming>,
     on_event: &OnEvent,
+    #[cfg(test)] shutdown_park: &mut Option<sync_mpsc::Sender<sync_mpsc::Sender<()>>>,
 ) {
     let mut auth: Option<(Flight<'_, Result<(), String>>, sync_mpsc::Sender<_>)> = None;
     let mut job = Job::Idle;
@@ -1418,9 +1478,12 @@ async fn serve(
             () = cx.incoming_closed() => Step::Closed,
         };
         match step {
-            Step::Heard(None) | Step::Command(None | Some(Msg::Shutdown)) | Step::Closed => {
-                break TurnError::Lost
+            Step::Command(Some(Msg::Shutdown)) => {
+                #[cfg(test)]
+                hold_shutdown(shutdown_park);
+                break TurnError::Lost;
             }
+            Step::Heard(None) | Step::Command(None) | Step::Closed => break TurnError::Lost,
             Step::Heard(Some(message)) => {
                 if let Job::Turn {
                     quiet_until: Some(at),
@@ -1746,6 +1809,9 @@ struct Restore {
     joined: Option<MessageId>,
     /// The open message's id differs from `joined`, so joining it breaks the paragraph.
     break_next: bool,
+    /// A tool call came since the last words, so joining the next ones breaks
+    /// the paragraph. Unlike `break_next`, it never starts a second reply.
+    after_tool: bool,
 }
 
 impl Restore {
@@ -1785,8 +1851,12 @@ impl Restore {
                 let text = chunk_text(block, self.thought_so_far());
                 self.add_turn_thought(&text);
             }
-            Heard::ToolCall(tool) => self.entries.push(tool.row()),
+            Heard::ToolCall(tool) => {
+                self.after_tool = true;
+                self.entries.push(tool.row());
+            }
             Heard::ToolUpdate(tool) => {
+                self.after_tool = true;
                 let known =
                     self.entries.iter_mut().rev().find(
                         |entry| matches!(entry, Replayed::ToolCall { id, .. } if *id == tool.id),
@@ -1882,6 +1952,7 @@ impl Restore {
         };
         let break_before = self.break_next;
         self.break_next = false;
+        let after_tool = std::mem::take(&mut self.after_tool);
         let text = answer.finish();
         let turn = self.turn_start();
         // No prompt means the replay never marked a turn, so a new id is the
@@ -1893,7 +1964,7 @@ impl Restore {
                 .iter_mut()
                 .find(|entry| matches!(entry, Replayed::Reply { .. }))
             {
-                if break_before {
+                if break_before || after_tool {
                     break_paragraph(held);
                 }
                 held.push_str(&text);
@@ -2400,28 +2471,21 @@ fn permission_ask(request: &RequestPermissionRequest, id: String) -> PermissionA
         .map(|at| at.path.display().to_string())
         .collect();
     let mut content = Vec::new();
-    for piece in fields.content.iter().flatten() {
-        match piece {
-            ToolCallContent::Content(block) => {
-                // Only text is drawn here. A replayed tool row marks the
-                // other blocks in `tool_content`.
-                if let ContentBlock::Text(text) = &block.content {
-                    content.push(text.text.clone());
-                }
-            }
+    let mut marks = Vec::new();
+    for sent in fields.content.iter().flatten() {
+        match piece(sent) {
+            Piece::Text(text) => content.push(text.to_string()),
+            Piece::Mark(mark) => marks.push(mark),
             // A diff is a file the call would rewrite, and the path is the
             // part a consent row can use. Its text is a whole new file.
             // The same path can arrive both ways and is still one path.
-            ToolCallContent::Diff(diff) => {
+            Piece::Diff(diff) => {
                 let path = diff.path.display().to_string();
                 if !locations.contains(&path) {
                     locations.push(path);
                 }
             }
-            // Only text is drawn on the consent row. A replayed tool row
-            // names a terminal, and marks any other variant, in
-            // `tool_content`.
-            _ => {}
+            Piece::Terminal(label) => marks.push(content_mark::escaped(&label)),
         }
     }
     PermissionAsk {
@@ -2429,6 +2493,7 @@ fn permission_ask(request: &RequestPermissionRequest, id: String) -> PermissionA
         title: fields.title.clone(),
         kind: fields.kind.as_ref().map(name_of),
         content,
+        marks,
         input: fields.raw_input.clone(),
         locations,
         options: request
@@ -2575,18 +2640,21 @@ fn show(heard: Heard<'_>, session: &SessionId, stream: &mut Stream, on_event: &O
         }
         // None leaves the row's previous content or locations. An update
         // replaces only the fields it carries, as the replay does.
-        Heard::ToolCall(tool) | Heard::ToolUpdate(tool) => on_event(Event::ToolCall {
-            session: session.0.to_string(),
-            id: tool.id.to_string(),
-            title: tool.title.map(str::to_string),
-            name: tool.name.map(str::to_string),
-            kind: tool.kind,
-            status: tool.status,
-            raw_input: tool.raw_input.cloned(),
-            raw_output: tool.raw_output.cloned(),
-            locations: tool.locations.map(places),
-            content: tool.content.map(pieces),
-        }),
+        Heard::ToolCall(tool) | Heard::ToolUpdate(tool) => {
+            said.pause();
+            on_event(Event::ToolCall {
+                session: session.0.to_string(),
+                id: tool.id.to_string(),
+                title: tool.title.map(str::to_string),
+                name: tool.name.map(str::to_string),
+                kind: tool.kind,
+                status: tool.status,
+                raw_input: tool.raw_input.cloned(),
+                raw_output: tool.raw_output.cloned(),
+                locations: tool.locations.map(places),
+                content: tool.content.map(pieces),
+            })
+        }
         Heard::Plan(steps) => on_event(Event::Plan {
             session: session.0.to_string(),
             steps,
@@ -2624,6 +2692,9 @@ pub(crate) struct Answer {
     /// A tail that may be the start of a tag, held until the next chunk says.
     held: String,
     thinking: bool,
+    /// A tool call came after the last words, so the next words are a new
+    /// paragraph even when no `messageId` says so, as grok sends them.
+    paused: bool,
 }
 
 const OPEN: [&str; 2] = ["<think>", "<thinking>"];
@@ -2685,9 +2756,17 @@ impl Answer {
         break_paragraph(&mut self.said);
     }
 
+    /// The turn stepped away to a tool. The next words start a paragraph.
+    fn pause(&mut self) {
+        self.paused = true;
+    }
+
     /// Adds a chunk's block to the answer, a mark as its own paragraph, and
     /// returns the part that sat inside tags.
     pub(crate) fn hear(&mut self, block: &ContentBlock) -> String {
+        if std::mem::take(&mut self.paused) {
+            self.separate();
+        }
         let text = chunk_text(block, self.so_far());
         self.push(&text)
     }
@@ -2753,16 +2832,16 @@ impl Held<'_> {
 
     /// ACP v1 says nothing when a turn the Harness started is over, so a
     /// prompt, a close, an ask, a form or the next fire ends it: flush the
-    /// session's speech as an inbound wake and close open thinking.
+    /// session's dialogue as an inbound wake and close open thinking.
     fn end_inbound(&mut self, session: &SessionId) {
         let Some(held) = self.inbound.remove(session) else {
             return;
         };
-        let speech = held.said.finish();
-        if !speech.is_empty() {
+        let dialogue = held.said.finish();
+        if !dialogue.is_empty() {
             (self.on_event)(Event::InboundWake {
                 session: session.0.to_string(),
-                speech,
+                dialogue,
             });
         }
         if !held.thought.is_empty() {
@@ -2958,7 +3037,7 @@ fn name_of<T: Serialize>(value: &T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agent_client_protocol::schema::v1::{
+    use agent_client_protocol::v1::schema::{
         AuthMethodAgent, ContentChunk, ImageContent, ResourceLink, ToolKind,
     };
     use std::sync::Arc;
@@ -3622,6 +3701,51 @@ mod tests {
         assert_eq!(drawn_replies, ["Hello\n\n there"]);
     }
 
+    /// grok sends no `messageId`, so only the tool call between them marks the
+    /// words written before the tools apart from the reply after. A call or
+    /// an update alone is that mark, live and restored, and the Behavior line reads.
+    #[test]
+    fn a_tool_call_breaks_the_paragraph_when_no_message_id_does() {
+        let call = wire(
+            serde_json::json!({"sessionUpdate": "tool_call", "toolCallId": "t1",
+            "title": "fidget__play_behavior", "kind": "other", "status": "pending"}),
+        );
+        let update = wire(
+            serde_json::json!({"sessionUpdate": "tool_call_update", "toolCallId": "t1",
+            "status": "completed"}),
+        );
+        let expected =
+            "He is still planted beside the Dock. I will set him moving.\n\nbehavior: walk\nI am walking.";
+        for (name, tool) in [("tool_call", call), ("tool_call_update", update)] {
+            let updates = vec![
+                wire_text("user_message_chunk", "walk"),
+                wire_text(
+                    "agent_message_chunk",
+                    "He is still planted beside the Dock. I will set him moving.",
+                ),
+                tool,
+                wire_text("agent_message_chunk", "behavior: walk\nI am walking."),
+            ];
+            let (reply, _) = drive(updates.clone());
+            assert_eq!(reply, expected, "{name}: live");
+            let behaviors = ["walk".to_string()];
+            assert_eq!(
+                fidget_core::director::dialogue_of(&reply, &behaviors).as_deref(),
+                Some("I am walking."),
+                "{name}"
+            );
+
+            let restored: Vec<String> = restored_rows(&updates)
+                .into_iter()
+                .filter_map(|row| match row {
+                    Replayed::Reply { text } => Some(text),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(restored, [expected], "{name}: restored");
+        }
+    }
+
     /// A thought chunk between two messages stays above the one reply, where
     /// live Chat files the turn's thought. Later words still join that reply.
     #[test]
@@ -4002,7 +4126,7 @@ mod tests {
         events
             .into_iter()
             .filter_map(|event| match event {
-                Event::InboundWake { session, speech } => Some((session, speech)),
+                Event::InboundWake { session, dialogue } => Some((session, dialogue)),
                 _ => None,
             })
             .collect()
@@ -4109,10 +4233,11 @@ mod tests {
         assert_eq!(ask.locations, ["/tmp/a.rs", "/tmp/b.rs"]);
     }
 
-    /// Content this row cannot read out is not content. An image says nothing
-    /// on a text surface, and the arguments still say what was asked.
+    /// An image is not words, so the arguments still say what was asked. It
+    /// is still part of the ask, so it arrives as the mark a replayed tool
+    /// row draws for it.
     #[test]
-    fn content_with_no_words_leaves_the_arguments_to_say_it() {
+    fn content_with_no_words_is_marked_and_leaves_the_arguments_to_say_it() {
         let ask = asked_for(serde_json::json!({
             "toolCallId": "t1",
             "content": [{
@@ -4123,7 +4248,34 @@ mod tests {
         }));
 
         assert!(ask.content.is_empty(), "{:?}", ask.content);
+        assert_eq!(ask.marks, ["[image image/png]"]);
         assert_eq!(ask.input, Some(serde_json::json!({"path": "/tmp/a.png"})));
+    }
+
+    /// Every piece that is neither text nor a diff reaches the row as a mark,
+    /// in the order sent, so an ask of only such pieces is never blank.
+    #[test]
+    fn every_other_piece_is_marked_in_the_order_sent() {
+        let ask = asked_for(serde_json::json!({
+            "toolCallId": "t1",
+            "content": [
+                {"type": "content", "content": {"type": "audio", "data": "AAAA", "mimeType": "audio/wav"}},
+                {"type": "content", "content": {
+                    "type": "resource_link", "name": "spec", "uri": "https://example.com/spec",
+                }},
+                {"type": "terminal", "terminalId": "term_1"},
+            ],
+        }));
+
+        assert!(ask.content.is_empty(), "{:?}", ask.content);
+        assert_eq!(
+            ask.marks,
+            [
+                "[audio audio/wav]",
+                "[spec](https://example.com/spec)",
+                "Terminal term\\_1",
+            ]
+        );
     }
 
     /// A missing title is missing, not `(untitled)`. The surface has to tell
@@ -4356,21 +4508,22 @@ mod windows_job {
         CREATE_SUSPENDED, PROCESS_ALL_ACCESS, THREAD_SUSPEND_RESUME,
     };
 
-    /// A Job Object handle, parked in `JOBS` until the process exits.
-    /// The job carries `KILL_ON_JOB_CLOSE`, so closing the handle kills
-    /// the child. `Drop` would be a bug. The leak is intentional.
-    struct SafeHandle(HANDLE);
+    /// Closing the handle kills the child, so `Drop` must not run.
+    struct LeakedJobHandle(HANDLE);
 
     // SAFETY: a Job Object handle is process-wide and thread-agnostic, so
     // moving it between threads reaches the same object. `HANDLE` is `!Send`
-    // only as a raw pointer. Anything in `SafeHandle` has to be that kind too.
-    unsafe impl Send for SafeHandle {}
+    // only as a raw pointer. Anything in `LeakedJobHandle` has to be that
+    // kind too.
+    unsafe impl Send for LeakedJobHandle {}
 
-    static JOBS: Mutex<Option<HashMap<u32, SafeHandle>>> = Mutex::new(None);
+    static JOBS: Mutex<Option<HashMap<u32, LeakedJobHandle>>> = Mutex::new(None);
 
-    /// Spawn with create-time Job Object association via `CREATE_SUSPENDED`.
-    /// The process cannot fork children until after job assignment, which
-    /// closes the post-spawn race.
+    const SPAWN_IN_JOB_CREATION_FLAGS: u32 =
+        CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED;
+
+    /// The child is suspended until `AssignProcessToJobObject` returns, so
+    /// the process cannot fork children until after job assignment.
     pub(super) fn spawn_in_job(
         mut command: std::process::Command,
         stderr: std::process::Stdio,
@@ -4401,8 +4554,7 @@ mod windows_job {
             job
         };
 
-        let creation_flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW | CREATE_SUSPENDED;
-        command.creation_flags(creation_flags);
+        command.creation_flags(SPAWN_IN_JOB_CREATION_FLAGS);
 
         let mut async_command = async_process::Command::from(command);
         async_command
@@ -4462,11 +4614,16 @@ mod windows_job {
             match JOBS.lock() {
                 Ok(mut slot) => {
                     let map = slot.get_or_insert_with(HashMap::new);
-                    map.insert(pid, SafeHandle(job));
+                    map.insert(pid, LeakedJobHandle(job));
                 }
                 Err(_) => {
-                    eprintln!("harness: JOBS lock poisoned, handle leaked for pid {pid}");
+                    eprintln!(
+                        "harness: JOBS lock poisoned for pid {pid}; closing the job, which kills the child"
+                    );
                     CloseHandle(job);
+                    return Err(std::io::Error::other(format!(
+                        "JOBS lock poisoned for pid {pid}; the job was closed"
+                    )));
                 }
             }
         }
@@ -4545,7 +4702,7 @@ mod windows_job {
             map.remove(&pid)
         };
 
-        let Some(SafeHandle(job)) = job else {
+        let Some(LeakedJobHandle(job)) = job else {
             return;
         };
 
@@ -4562,6 +4719,30 @@ mod windows_job {
         #[test]
         fn test_terminate_job_missing_pid_is_noop() {
             terminate_job(0xFFFF_FFFE);
+        }
+
+        #[test]
+        fn spawn_in_job_creation_flags_include_create_suspended() {
+            assert_eq!(
+                SPAWN_IN_JOB_CREATION_FLAGS & CREATE_SUSPENDED,
+                CREATE_SUSPENDED
+            );
+        }
+
+        #[test]
+        fn spawn_in_job_keeps_the_pid_handle() {
+            let mut command = std::process::Command::new("cmd.exe");
+            command.args(["/d", "/c", "exit"]);
+            let child = spawn_in_job(command, std::process::Stdio::null())
+                .unwrap_or_else(|err| panic!("spawn_in_job failed: {err}"));
+            let pid = child.id();
+            let kept = JOBS
+                .lock()
+                .expect("JOBS lock")
+                .as_ref()
+                .is_some_and(|map| map.contains_key(&pid));
+            terminate_job(pid);
+            assert!(kept, "JOBS did not keep a handle for pid {pid}");
         }
 
         /// #1671: a second suspended thread owned by the child must resume too.

@@ -39,7 +39,7 @@ To inspect it:
 - macOS: `tail -f ~/Library/Application\ Support/fidget/action-log.jsonl`
 - Linux: `tail -f ~/.local/share/fidget/action-log.jsonl`
 - Windows (PowerShell): `Get-Content -Wait -Tail 50 $env:APPDATA\fidget\action-log.jsonl`
-- The **Action Log…** row in the tray and sprite menus opens the current file in the system editor.
+- Settings → Development → Action Log → Open in editor opens the current file in the system editor.
 
 ### Memory size
 
@@ -67,9 +67,26 @@ Covers whitespace, YAML/JSON/TOML, spelling, shell (shfmt + shellcheck), `cargo 
 
 The Security workflow (`.github/workflows/security.yml`) runs `cargo audit` and `npm audit` on every pull request, on `main`, and nightly. The nightly run catches a new advisory against a dependency nobody touched.
 
+## Workflow Lockfile
+
+`.github/workflows/actions.lock` pins every action the workflows use, direct and transitive, to a commit, so `uses:` lines carry a readable tag such as `actions/checkout@v7.0.1`. [gh-actions-lock](https://github.com/github/gh-actions-lock) writes it; never edit it by hand. Install it once:
+
+```sh
+gh extension install github/gh-actions-lock
+```
+
+- **After adding a workflow or changing a `uses:`:** run `gh actions-lock` and commit the lockfile with the workflow. A `uses:` the lockfile does not cover keeps that workflow from starting at all. The Actions Lockfile workflow (`.github/workflows/actions-lock.yml`) runs `gh actions-lock --verify` on every pull request and on `main`, and a pre-commit hook runs the offline `--verify-local` when the extension is installed. The check is its own workflow because it has to report when another workflow cannot start; the hook is skippable and checks coverage only, so it is not the gate.
+- **Review a lockfile diff like a dependency bump:** each changed `commit:` is new code that runs in CI, so read what changed upstream between the two commits. Dependabot updates the lockfile in its own github-actions pull requests.
+- **On a `ref-moved` warning, or a `tag-commit-mismatch` error:** the tag now points at a different commit than the one locked. Find out why upstream before you move. To take the new commit, run `gh actions-lock --relock` and review the diff.
+- **Never pass `--accept-moved` in a script or workflow:** it accepts a pin whose commit is gone upstream, which is the case the lockfile exists to stop. Run it only by hand, after you know why the commit moved.
+
 ## Secret Scanning
 
-The Secret Scanning workflow (`.github/workflows/secret-scanning.yml`) runs two scanners on every pull request and on `main`. detect-secrets 1.5.0 scans every tracked file, Markdown included. A false positive goes on its line as a `pragma: allowlist secret` comment. Where a comment can't go, as in JSON, the hit is recorded in [`.secrets.baseline`](../.secrets.baseline) instead. A hit inside a YAML block such as a workflow's `run: |` covers the whole block, whether a pragma or the baseline allows it, so move the value into the step's `env:` until the block has none. Quoting it doesn't help: the scanner keeps only a block's first match and then drops the quoted value, which hides every hit below it. A baselined hit that moves lines only warns, since the baseline matches by hash; `detect-secrets scan --baseline .secrets.baseline` refreshes it. TruffleHog scans the new commits and fails only on secrets it verifies against their issuer.
+The Secret Scanning workflow (`.github/workflows/secret-scanning.yml`) runs two scanners on every pull request and on `main`. detect-secrets 1.5.0 scans every tracked file, Markdown included. A false positive goes on its line as a `pragma: allowlist secret` comment. Where a comment can't go, as in JSON, the hit is recorded in [`.secrets.baseline`](../.secrets.baseline) instead. A line filter there skips any line of the form `"commit": "<40 lowercase hex>",` in any file. Today only `.agents/*/UPSTREAM.json` has one, where the weekly skill syncs write the upstream commit hash, so a sync needs no baseline edit. A hit inside a YAML block such as a workflow's `run: |` covers the whole block, whether a pragma or the baseline allows it, so move the value into the step's `env:` until the block has none. Quoting it doesn't help: the scanner keeps only a block's first match and then drops the quoted value, which hides every hit below it. A baselined hit that moves lines only warns, since the baseline matches by hash; `detect-secrets scan --baseline .secrets.baseline` refreshes it. TruffleHog scans the new commits and fails only on secrets it verifies against their issuer.
+
+## Guard Scanner
+
+The `guard-scanner` workflow (`.github/workflows/guard-scanner.yml`) is dispatch-only. Pick the fidget branch or tag in the Run workflow dialog; `scanner_ref` chooses which ref of private `glance-labs/glance-scanner-private` to build. Two jobs scan the checkout in parallel, each with its own build of the scanner. `surfaces` reads the agent surfaces: hooks, rules, skills and configs that an agent loads or runs. `analyze` reads the code with semgrep (`p/default`, pinned semgrep 1.185.0), `npm audit` and the scanner's malicious-package denylist. By default each job prints the readable report to the job log and uploads nothing. With `upload_sarif` checked, each job writes SARIF instead, and a complete scan (exit 0 or 1) is uploaded to GitHub code scanning under the scanner's own category, `glance-scanner/surfaces/` or `glance-scanner/analyze/`, so one job's upload never replaces the other's alerts; the log then keeps only warnings, `baselined:` and `scan incomplete:` lines. Either way, exit 0 or 1 passes and 2 or anything else fails. The workflow always holds `security-events: write`, because a permission cannot depend on an input. `.glance/allow.yml` lists the auto-run items we want; they show as `allowed:` lines in the readable report and as `glance/autorun-allowed` notifications in the surfaces SARIF. `.glance/baseline.yml` lists reviewed surfaces findings we accept; they print as `baselined:` lines. `analyze` reads neither file. It needs the `SCANNER_TOKEN` repository secret: a fine-grained PAT from a glance-labs owner, limited to that repository, with Contents read-only.
 
 ## Trace Variables
 
@@ -87,7 +104,7 @@ All off by default. Switches take `1`/`on`/`true`/`yes` or `0`/`off`/`false`/`no
 | `FIDGET_DEBUG_IPC` | Enable file-based debug commands (`~/.fidget-debug-cmd` / `~/.fidget-debug-result`) for `fidget-verify place` and `snapshot`. Off by default, with no Settings row. While on, any same-user process can move the sprite via the command file. |
 | `FIDGET_CLICK_TRACE` | With no Settings row. `click-trace:` lines on stderr with Unix-ms `t=` stamps: every overlay pointer edge (`witness ... edge=down\|up`, plus `edge=forget` on X11 and Windows when click-through drops a held witness), on X11 every XI2 raw button edge (`xi2 ... edge=down\|up`, once per device that reports it), the edges X11 reads its presses from, and on macOS one `tick` line per button whenever its level or its down/up event counters changed, with what the frame loop was told (`out_primary`, `out_secondary`), plus a bare `tick` line for any tick 50 ms or more after the last. An `idle` or `active` line marks each switch of the frame loop's schedule; a visible Character whose idle Animation loops stays Active. For `scripts/analyze-click-trace.py` (#1858). |
 | `FIDGET_CAPTURABLE` | `1` forces the overlay into screen captures, `0` excludes it. Overrides Settings → Presence → "Appear in screenshots and screen shares". For verify scripts and CI. |
-| `FIDGET_HOVER_DELAY_MS` | How long the cursor rests on the Character before the quick message pill opens, in ms. Overrides Settings → Development → "Hover delay, in milliseconds". A positive number; anything else leaves the default 1500. |
+| `FIDGET_HOVER_DELAY_MS` | How long the cursor rests on the Character before the quick message pill opens, in ms. Overrides Settings → Development → "Hover delay, in milliseconds". A positive number; anything else leaves the default 2500. |
 
 ## Verifying the Overlay
 
@@ -123,7 +140,8 @@ scripts/bench-rss-linux.sh                          # Linux: RSS baseline (needs
 scripts/bench-rss-windows.ps1                       # Windows: RSS baseline
 scripts/measure-mask-rebuild-x11.sh                 # Linux: mask updates per second and ms per update, per scenario (#428)
 scripts/flame-mask-rebuild-x11.sh                   # Linux: mask update timings and perf flamegraph (#428)
-scripts/bench-mask-rebuild-windows-flame.ps1        # Windows: WPR CPU trace of the region rebuild, Nim or BMO (#428); -Check steers without WPR
+scripts/bench-mask-rebuild-windows-flame.ps1        # Windows: WPR CPU trace of the region rebuild, Nim or BMO (#428); -Check steers without WPR, -Scenario runs one #428 scenario
+scripts/bench-mask-rebuild-windows-scenarios.ps1    # Windows: every #428 scenario back to back with -Check, no admin; rebuilds/s and ms per rebuild table
 scripts/export-mask-flame-windows.ps1               # Windows: trace.etl to folded stacks and flamegraph, no admin (#428)
 scripts/bench-frame-cadence-macos.sh                # macOS and Linux: display-frame cadence and Engine tick rate
 scripts/bench-wakeups-linux.sh                      # Linux: CPU% and wakeups per process, X11 or Wayland
@@ -162,8 +180,8 @@ Only the window server can answer these. Run the app, then confirm:
 5. **Motion is continuous:** Watch it fall. It slides rather than jumps, and does not judder at a window's edge.
 6. **The art is crisp:** On a Retina display the pixels are hard squares, all the same size. Blur means the integer scale or nearest-neighbour filtering was lost.
 7. **It rests on the Dock, not behind it:** Its feet stand on the Dock's top edge. Turn on Dock auto-hiding: within a poll it falls to the bottom of the screen. Turn it off and it is lifted again.
-8. **Declared cadence is honoured:** Give a copy of Black Mage a faster idle `fps`. The idle is visibly faster than at the declared 1.
-9. **A click makes it react:** Click once without moving. It plays `react` for about half a second, then resumes.
+8. **Declared cadence is honoured:** Give a copy of Black Mage a faster idle `fps`. The idle is visibly faster than at the declared 2.
+9. **A click makes it react:** Click once without moving. It plays `react` through once, at least half a second, then resumes.
 10. **Press and drag picks it up:** The pressed point stays under the pointer. Release over a window and it lands on that window's top edge.
 11. **A flick throws it:** Release while moving and it leaves on an arc. Hold still before releasing and it drops straight down.
 12. **It can be put down over the Dock, and does not stay there:** Drop it over the Dock. It settles back onto the Dock's top edge, fully visible.
@@ -196,9 +214,11 @@ Search paths, in order. An earlier directory wins when two packages share a name
 | Linux | `$XDG_DATA_HOME/fidget/characters`, or `~/.local/share/fidget/characters` when that variable is unset | each `$XDG_DATA_DIRS` entry plus `/fidget/characters`. Unset or empty is `/usr/local/share/fidget/characters`, then `/usr/share/fidget/characters` | bundled `characters/` |
 | Windows | `%APPDATA%\fidget\characters` | none | bundled `characters/` |
 
-The user directory is the same per-platform data directory as `settings.json`, with `characters` under it. The Settings window's Character picker shows that path.
+The user directory is the same per-platform data directory as `settings.json`, with `characters` under it. The Settings window's Character picker shows that path. Right after it comes `imported-characters` in the same data directory, where Settings keeps the Characters it imported. A package you place in the user directory by hand wins over an imported copy of the same name.
 
-Ten characters ship: **Buddy Bot** (default), BMO, Nim, Black Mage, Cat, Jotaro Kujo, Rubber Duck, Timber Wolf, Trump, Tux.
+For ordinary use, open **Settings > Character > Character Imports** and select **Import from zip** or **Import from folder**. The native picker accepts a Character Package ZIP or a folder laid out the same way; either may wrap the package in one folder. Fidget reads it with the same loader it uses for the Character folders, so symlinks are skipped, never followed, and the same size limits apply. Fidget validates it, then keeps a clean ZIP of its own in `imported-characters` beside the user directory, and never writes to, moves, or deletes the source. Restart Fidget to select the new Character. Remove, allowed when no running or selected Instance uses it, deletes only Fidget's copy; packages you place in the user directory by hand are not listed there. No environment variables are required. A notice under the buttons warns that a Character's `personality.txt` becomes AI prompt content: only install packages from trusted authors. An import with an invalid manifest or missing art reports the validation error; archive name collisions with installed or built-in Characters are refused. Character package manifests are still evolving, so older packages may need updating before they can be imported. Only local ZIPs and folders are supported here, not URLs or a gallery.
+
+Eleven characters ship: **Buddy Bot** (default), BMO, Nim, Black Mage, Cat, Jotaro Kujo, Rubber Duck, Timber Wolf, Trump, Tux, Tuxedo Bean.
 
 ### Writing a Character
 
@@ -216,7 +236,7 @@ A Character Package is a directory or `.zip` holding a `character.manifest`, an 
 
    `FIDGET_CHARACTERS` is searched first and the other directories stay, so this copy wins when names collide and the shipped characters remain available. Drop a package in the user directory from the table above and leave the variable unset to have it read from there.
 
-2. Replace the PNGs in `frames/` with your own 8-bit RGBA art, facing right. Keep one size per Animation.
+2. Replace the PNGs in `frames/` with your own 8-bit RGBA art. Keep one size per Animation. If your art faces left, say so with `facing`, as [Which way the art faces](#which-way-the-art-faces) describes.
 3. Edit `character.manifest`: set `name`, point each Animation's `frames` at your files, and delete `[source]` or rewrite it for your art.
 4. Rewrite `personality.txt`, as [Writing a personality](#writing-a-personality) describes.
 5. Start it by folder name:
@@ -237,6 +257,11 @@ A Character Package is a directory or `.zip` holding a `character.manifest`, an 
 | `render_mode` | No | `"pixelated"` keeps hard pixels when scaling; `"smooth"` filters drawn art. | `"pixelated"` |
 | `scale` | No | Whole number from 1 to 4: the factor the art is drawn at. | 4 |
 | `gravity` | No | Number from 0.25 to 2: how hard the Character falls, as a multiple of the default. Below 1, falls are slower and Jumps and Throws go higher. | 1 |
+| `facing` | No | `"left"` or `"right"`: the way the Character's frames face as drawn. See [Which way the art faces](#which-way-the-art-faces). | `"right"` |
+| `idle_gesture_every_s` | No | `[min, max]` in seconds, inclusive, each end from 5 to 60. How long the Engine plays an idle loop before one idle-gesture. | `[10, 30]` |
+| `sleep_after_s` | No | `[min, max]` in seconds, inclusive. Untouched Grounded or Perched time before sleep, plus awake Behavior time off its feet. Unscripted air and being held pause it. A Behavior does not reset it. | `[120, 600]` |
+| `sleep_for_s` | No | `[min, max]` in seconds, inclusive. How long sleep lasts before the sprite wakes into an idle loop. | `[300, 600]` |
+| `[frame_facing]` | No | Frame files that face the other way from `facing`. | |
 | `[source]` | No | Where the art came from. See [Declaring where the art came from](#declaring-where-the-art-came-from). | |
 | `[director]` | No | How proactive model calls space themselves. | |
 | `[cursor]` | No | How the Character reacts to the cursor. | |
@@ -247,44 +272,69 @@ A Character Manifest is at most 1 MiB. A package is at most 64 MiB, 4096 files, 
 
 #### Animations
 
-Every Character supplies these nine: `idle`, `walk`, `fall`, `land`, `sit`, `sleep`, `react`, `talk`, and `hold`. The Engine also asks for three optional ones, and draws a stand-in when a package omits them:
+Every Character supplies these nine: `idle`, `walk`, `fall`, `land`, `sit`, `sleep`, `react`, `talk`, and `hold`. The Engine also asks for four optional ones, and draws a stand-in when a package omits them:
 
 | Animation | Plays when | Without it |
 |---|---|---|
 | `grab` | The user drags the sprite | `fall` |
 | `climb` | The sprite climbs | `walk` |
 | `jump` | A Behavior plays the `jump` Primitive | `fall` |
+| `possessed` | The user possesses the fidget | `react` |
 
-Any other name draws only as a Variant or a Left Strip of one of these.
+Any other name draws only as a Variant, an idle-gesture, or a Left Strip of one of these.
 
 | Key | Required | Value | Default |
 |---|---|---|---|
-| `frames` | Yes | Frame file paths relative to the package root, in play order. 1 to 256 entries. | |
+| `frames` | Yes, unless `same_as` | Frame file paths relative to the package root, in play order. 1 to 256 entries. | |
 | `fps` | No | Whole number from 1 to 60. | 8 |
 | `loop` | No | `"forever"` repeats; `"once"` holds the last frame. | `"forever"` |
-| `variant_of` | No | Another Animation's name. Starting that base draws one member of its ring by weight: the base or any of its Variants. | |
-| `weight` | No | Whole number: this Animation's share of its Variant ring. Read only in a ring. | 10 |
+| `variant_of` | No | Another Animation's name, or the category `"idle-gesture"`. `variant_of = "idle"` is a calm loop of the declared `idle` Animation. `variant_of = "idle-gesture"` marks this Animation as an idle-gesture. That is a category, not a Behavior type, and the Animation keeps its own name. Every other ring draws one member until the Animation changes. | |
+| `weight` | No | Whole number: this Animation's share of its ring, loop or gesture. Read only there. | 10 |
 | `left_of` | No | Another Animation's name. This strip draws in place of the base when the sprite travels left. | |
+| `same_as` | No | Another Animation's name. This one plays that Animation's frames, fps and loop, and declares no other key. It joins no ring and is not an idle-gesture. Use it when a required slot's clip is another Animation's, played the same way. | |
 
 The loader checks each frame against the art:
 
 - Every frame is an 8-bit RGBA PNG in the package, at most 1024 pixels on either side, and every frame of one Animation is the same size.
 - All of a package's distinct frames add up to at most 256 megapixels (256 × 1024 × 1024 pixels). A frame two Animations share counts once.
 - A `variant_of` base is declared, is not itself a Variant, and both it and the variant loop `"forever"`.
+- Idle loops and idle-gestures share the base `idle` frame size. They swap in the middle of a stretch. A walk or talk ring is drawn once and may differ.
+- The Engine's own idle starts on a weighted idle loop at frame 0, waits a seeded gap inside `idle_gesture_every_s`, plays one weighted idle-gesture for a single pass (`frames / fps`), then picks a loop again. Every idle stretch starts on a loop, including after a landing, a talk, a poke, or a perched idle. A Behavior's `idle` Primitive still draws one loop-ring member and loops it, unless the Behavior sets `type = "idle"`.
+- A `same_as` names a declared Animation with frames of its own, never another `same_as`. No `variant_of` or `left_of` names a `same_as`. The same frame files under two Animations at different fps or loop stay allowed.
 - A `left_of` base is declared and is not itself a Left Strip. The strip has as many frames as its base, at the same size, and only one strip faces each base.
 
-Draw every Animation facing right. The renderer mirrors it for leftward travel unless another Animation declares `left_of` for it. Pixels with alpha below 128 do not catch clicks.
+Pixels with alpha below 128 do not catch clicks.
+
+#### Which way the art faces
+
+Each frame faces left or right, declared in two layers:
+
+1. `facing` at the top of the manifest is the Character's default, `"right"` when unset.
+2. `[frame_facing]` overrides it for single frames, keyed by the frame's path as `frames` lists it.
+
+```toml
+facing = "left"
+
+[frame_facing]
+"frames/walk-0.png" = "right"
+"frames/walk-1.png" = "right"
+```
+
+The renderer mirrors a frame exactly when its facing is not the way the sprite travels. One Animation may mix left- and right-facing frames. A frame belongs to the file, not the Animation, so a frame two Animations share faces one way in both. A Left Strip draws in place of its base for leftward travel and mirrors by the same rule, so declare its frames `"left"` unless the default already is. A frame facing the viewer needs no declaration: mirroring it changes nothing anyone sees.
+
+The loader rejects any other value, and a `[frame_facing]` entry naming a frame no Animation plays.
 
 #### Behaviors
 
-A Behavior is a named sequence of Primitives that the Static Director picks by weight, or that a model proposes. A Character composes Behaviors from Primitives and cannot define new ones. Every Character gets a weight-0 Behavior named after each askable Primitive (`jump`, `sit`, `sleep`, `react`, `chase`, `walk`) unless the package already declares that name or already plays that Primitive. `land` and `hold` stay Engine-owned; `talk` and `idle` are not injected (Engine plays talk while Dialogue shows; idle is ambient).
+A Behavior is a named play list that the Static Director picks by weight, or that a model proposes. `play` is either an ordinary sequence of Primitives, or one named idle-gesture Animation that plays one pass — not a mixed list and not more than one Animation. A Character composes Behaviors from those and cannot define new Primitives. Every Character gets a weight-0 Behavior named after each askable Primitive (`jump`, `sit`, `sleep`, `react`, `chase`, `walk`) unless the package already declares that name or already plays that Primitive. `land` and `hold` stay Engine-owned; `talk` and `idle` are not injected (Engine plays talk while Dialogue shows; idle is ambient).
 
 | Key | Required | Value | Default |
 |---|---|---|---|
-| `play` | No | A list of Primitives, played in order. A Behavior with none plays nothing. | `[]` |
-| `then` | No | The name of the Behavior that follows this one. | |
+| `play` | No | Either a list of Primitives in order, or one idle-gesture Animation name that plays one pass. Mixed lists and multi-Animation lists are refused. A Behavior with none plays nothing. | `[]` |
+| `then` | No | The name of the Behavior that follows this one. A Behavior playing an Animation continues its `then` after one pass. When a Primitive chain reaches a Behavior playing an Animation, or one with a different `type`, that Behavior starts after the Primitives finish. | |
 | `weight` | No | Whole number: how likely the Static Director is to pick this Behavior against its siblings. 0 leaves it reachable only through `then` or a model proposal. | 10 |
 | `when` | No | The condition that must hold before the Behavior is picked. | Any time |
+| `type` | No | `"idle"` makes this Behavior's `idle` Primitives use the Engine's idle loops and idle-gestures. | |
 
 The Primitives, and the Animation each plays:
 
@@ -293,6 +343,8 @@ The Primitives, and the Animation each plays:
 | `idle`, `walk`, `land`, `sit`, `sleep`, `react`, `talk`, `hold` | The Animation of the same name |
 | `chase` | `walk`, steered toward the cursor's x along the ground |
 | `jump` | `jump`, or `fall` without it |
+
+`react` and `possessed` play their art through once, even art that loops forever, and never for less than the 600 ms turn every other Primitive gets. A second Poke plays `react` again from its first frame.
 
 `when` takes one of three forms. A duration is a whole number followed by `s` or `m`.
 
@@ -342,13 +394,18 @@ frames = [
 fps = 5
 weight = 20
 
+[animations.idle-listen]
+frames = ["frames/idle-listen-0.png"]
+fps = 8
+variant_of = "idle-gesture"
+
 [animations.idle-blink]
 frames = [
   "frames/idle-blink-0.png",
   # ... frames/idle-blink-1.png to frames/idle-blink-5.png
 ]
 fps = 8
-variant_of = "idle"
+variant_of = "idle-gesture"
 
 [animations.land]
 frames = [
@@ -383,7 +440,7 @@ weight = 40
 when = "idle over 2m"
 ```
 
-Buddy Bot is drawn art at its own size, so it renders `smooth` at scale 1. Its proactive calls keep their first wait, two minutes by default, instead of backing off. `idle` weighs 20 against 10 for each of its three variants (`idle-blink` is one), so a bare idle draws on two turns in five. `land` plays once and holds its last frame into idle. `greet` hands over to `stroll`, and `settle` hands over to `nap`, which ends the chain. Buddy Bot declares no `grab`, so a drag plays its `fall`.
+Buddy Bot is drawn art at its own size, so it renders `smooth` at scale 1. Its proactive calls keep their first wait, two minutes by default, instead of backing off. `idle-blink`, `idle-breathe`, and `idle-listen` are one idle-gesture family, one pass between calm loops. `land` plays once and holds its last frame into idle. `greet` hands over to `stroll`, and `settle` hands over to `nap`, which ends the chain. Buddy Bot declares no `grab`, so a drag plays its `fall`.
 
 #### Declaring where the art came from
 
@@ -439,7 +496,7 @@ Translate [Pets Codex](https://petscodex.com/), [petdex](https://petdex.dev/), o
 uv venv --python 3.11 && uv pip install -r scripts/requirements-import.txt
 ```
 
-The importer writes the frames and a `character.manifest` to the `-o` directory, and `--force` replaces one that exists. It then runs `character::load` on the output and fails if the loader rejects it. It prints the pack's license and warns when none is declared.
+The importer writes the frames and a `character.manifest` to the `-o` directory, and `--force` replaces one that exists. It then runs `character::load` on the output and fails if the loader rejects it. It prints the pack's license and warns when none is declared. Two Animations cut to byte-identical frames are written once: when their fps and loop match too, the later one is `same_as` the earlier (an elective owns the frames over a required slot, `idle` over `hold`); otherwise it keeps its own table on the owner's frame files.
 
 The result is a naive but valid Character Package. It loads and plays, but it is not yet the character. Tune it by hand:
 
@@ -458,7 +515,7 @@ npx petscodex install labubu
 uv run scripts/import-pet.py ~/.codex/pets/labubu --format petscodex -o characters/labubu
 ```
 
-`[source]` is filled from the pet's `pet.json`, with `url` pointing at its page. Also check every animation reads as its name, and that walk heads right. A pet whose art strays from petdex's row semantics is recut with `--walk-row`, `--mirror-walk`, or `--map`.
+`[source]` is filled from the pet's `pet.json`, with `url` pointing at its page. Also check every animation reads as its name, and that every frame faces the way the manifest declares. The importer keeps the art as drawn: it declares the walk facing the way its row is drawn (row 2 right, row 1 left) and leaves the rest at the default `"right"`, and prints what it declared. Correct `facing` or `[frame_facing]` where the art says otherwise; see [Which way the art faces](#which-way-the-art-faces). A pet whose art strays from petdex's row semantics is recut with `--walk-row` or `--map`.
 
 Inspect the sheet row by row before choosing mappings. A person or coding agent
 can construct an import command for the art instead of adding a character-specific
@@ -519,6 +576,38 @@ The `fall`, `land`, and `hold` animations reuse hop poses. `react` reuses the
 salute. `sit` and `sleep` reuse the seated and closed-eye poses from row 6;
 the source has no dedicated sleep loop.
 
+### Tuxedo Bean row map
+
+Tuxedo Bean uses all nine rows of the `tuxedo-bean` sheet. The manifest tunes
+timing and behaviors after import. Row numbers below start at zero.
+
+| Row | Animation | Motion |
+| --- | --- | --- |
+| 0 | `look-around` | Standing glances |
+| 1 | `walk` | Trot right |
+| 2 | `walk-left` | Trot left |
+| 3 | `wave` | Seated paw wave |
+| 4 | `jump` | Crouch, pounce, and land |
+| 5 | `nod-off` | Head droops, then lifts again |
+| 6 | `idle` | Seated glances, ear flick, and blink |
+| 7 | `talk` | Paw to chin, then a raised paw to speak |
+| 8 | `review` | Looks at a page, then paws at it |
+
+To recut Tuxedo Bean's 57 source frames while keeping its authored manifest and prompt:
+
+```sh
+uv run scripts/import-pet.py ~/.codex/pets/tuxedo-bean --format petscodex -o characters/tuxedo-bean \
+  --frames-only --only-mapped --stand 91 \
+  --map idle=6 --map walk=1 --map walk-left=2 --map wave=3 --map jump=4 \
+  --map nod-off=5 --map look-around=0 --map talk=7 --map review=8
+```
+
+The `jump` Behavior lets the Static Director pick the pounce after 30 seconds
+idle, so row 4 plays without a model. The `fall` and `land` animations reuse
+pounce poses. `hold` is `same_as` the idle loop, so a perched or held Bean just
+sits. `react` is `same_as` the wave. `sit` reuses the first seated pose. The source has no
+dedicated sleep loop, so `sleep` holds the lowest nod-off pose.
+
 ### Shimeji Shop
 
 Download the pack's `.zip` from its gallery page. The importer wants per-pose PNGs named `shime1.png`, `shime2.png`, and so on, together in one folder at the pack's root or under it. Without an `actions.xml` it assumes Shimeji-ee's standard conf, which reads `shime1`-`shime14` and `shime18`-`shime21`. Pass the zip as is:
@@ -527,7 +616,7 @@ Download the pack's `.zip` from its gallery page. The importer wants per-pose PN
 uv run scripts/import-pet.py ~/Downloads/my-pet.zip --format shimeji -o characters/my-pet
 ```
 
-Every frame is mirrored to head right, and the manifest's leading comment records which Shimeji action fed each animation. Also edit:
+Frames are kept as drawn. Shimeji art faces left, so the manifest declares `facing = "left"` and the renderer mirrors it for rightward travel. The manifest's leading comment records which Shimeji action fed each animation. Also edit:
 
 - `name` is the zip's file name. Set the display name.
 - `[source]` has no `url` and a generic `art` line. Add the gallery page's URL and say what the art is.
@@ -542,7 +631,7 @@ sudo apt install libayatana-appindicator3-dev
 
 ### Install packages (tray, cue audio, AppImage)
 
-**Tray.** The tray icon is how you reach Settings, Character, Memory, and Quit, so the `.deb` depends on `libayatana-appindicator3-1` (the older `libappindicator3-1` is not accepted). The AppImage carries its own copy. Showing the icon also needs a StatusNotifier host, which the desktop provides and no package can declare: GNOME Shell, KDE Plasma, and XFCE's Status Tray plugin are hosts; Plank and a Wayland compositor with no tray protocol are not. Without a host, the sprite's right-click menu is the same menu.
+**Tray.** The tray icon is how you reach Settings, Character, and Quit, so the `.deb` depends on `libayatana-appindicator3-1` (the older `libappindicator3-1` is not accepted). The AppImage carries its own copy. Showing the icon also needs a StatusNotifier host, which the desktop provides and no package can declare: GNOME Shell, KDE Plasma, and XFCE's Status Tray plugin are hosts; Plank and a Wayland compositor with no tray protocol are not. Without a host, the sprite's right-click menu is that menu without Bring to this display.
 
 **Cue audio** is Web Audio in WebKitGTK, played through GStreamer. `libwebkit2gtk-4.1-0` already depends on `gstreamer1.0-plugins-base` and `gstreamer1.0-plugins-good` (which ships `pulsesink`), enough under PipeWire-pulse or PulseAudio. An ALSA-only machine also needs `gstreamer1.0-alsa`. With no sound device the fidget stays silent and still draws the visual cue.
 
@@ -587,6 +676,10 @@ A stable Release also goes to [itch.io](https://omesser.itch.io/fidget). After t
 The push needs the `BUTLER_API_KEY` repo secret, an API key from [itch.io's API keys page](https://itch.io/user/settings/api-keys). Without it the job skips with a notice. An itch failure never touches the GitHub Release: no job waits on the push, and a Release run stays green with the failed job marked.
 
 To push a tag that is already published, dispatch the itch.io workflow with that tag, for example `v0.6.3`. A failure there shows red.
+
+## Crate Versions
+
+After a stable Release builds, the Release workflow runs `scripts/bump-crate-versions.sh` with its tag and opens or updates a `crate-version-bump/<branch>` pull request against the branch the Release targets, which sets `[workspace.package] version` and `Cargo.lock` to that tag. A tag the crates already carry opens nothing. The job fails if the tag isn't on the branch the Release targets, so set the target when you publish from another branch. A prerelease doesn't run the job. The package job stamps the shipping version into the workspace before it builds, so the binaries report that version over ACP and MCP. The pull request only keeps the checked-in version current.
 
 ## Release Notes
 

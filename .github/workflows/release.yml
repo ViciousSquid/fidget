@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       version-override:
-        description: 'Stamp this version on the bundles. Leave empty to use the tag on the chosen commit, else <latest tag>-dev.g<sha>.'
+        description: 'Stamp this version on the bundles and binaries. Leave empty to use the tag on the chosen commit, else <latest tag>-dev.g<sha>.'
         type: string
         required: false
         default: ''
@@ -33,7 +33,7 @@ on:
         default: ''
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.release.tag_name || github.ref }}
@@ -79,11 +79,14 @@ jobs:
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 45
+    permissions:
+      contents: write
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
         with:
+          persist-credentials: false
           # The version comes from tags. Not fetch-depth: 0, the history is
           # ~900 MB.
           fetch-tags: true
@@ -124,13 +127,6 @@ jobs:
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          workspaces: .
-          key: release-${{ matrix.os }}
-          cache-on-failure: true
-
       - name: Install the Linux system packages
         # patchelf is what the AppImage bundler patches with. The .deb's
         # Depends follows the appindicator linked here, and docs/DEVELOPMENT.md
@@ -144,15 +140,24 @@ jobs:
 
       - name: Set up Node
         # tauri-action installs @tauri-apps/cli through npm.
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        uses: actions/setup-node@v7.1.0
         with:
           node-version: 'lts/*'
+          package-manager-cache: false
+
+      - name: Stamp the crates
+        # CARGO_PKG_VERSION compiles into the ACP client info and MCP
+        # serverInfo, and --config below reaches only the bundle.
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: scripts/bump-crate-versions.sh "v$VERSION"
 
       - name: Build the packages
         # Empty release inputs tell the action there is no Release to attach
         # to. No signing secrets: createUpdaterArtifacts is false until #200,
         # and signingIdentity "-" is ad-hoc.
-        uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1.0.0
+        uses: tauri-apps/tauri-action@v1.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -198,7 +203,8 @@ jobs:
           fi
 
       - name: Check out the default branch
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: ignore[artipacked] publish-homebrew-cask.sh git-pushes the cask bump to this repo
+        uses: actions/checkout@v7.0.1
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 1
@@ -220,7 +226,8 @@ jobs:
           scripts/verify-homebrew-cask.sh
 
       - name: Check out the tap
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        # zizmor: ignore[artipacked] later git-pushes the bumped cask to the tap with this deploy key
+        uses: actions/checkout@v7.0.1
         with:
           repository: omesser/homebrew-fidget
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
@@ -279,6 +286,92 @@ jobs:
               --title "$title" --body-file /tmp/homebrew-pr.md
           fi
 
+  # A leaf after package, like itch: a failure here leaves the Release as
+  # published.
+  crate-versions:
+    needs: package
+    if: |
+      github.event_name == 'release' &&
+      github.event.release.prerelease == false &&
+      needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: write
+      pull-requests: write
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      BASE: ${{ github.event.release.target_commitish }}
+      # Per base, so a Release on one branch can't overwrite another's open bump.
+      PR_BRANCH: crate-version-bump/${{ github.event.release.target_commitish }}
+    steps:
+      - name: Check out the Release's branch
+        # zizmor: ignore[artipacked] later git-pushes the crate-version bump branch
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.release.target_commitish }}
+          fetch-depth: 0
+
+      # target_commitish reads the default branch for a tag pushed first, and
+      # can be a commit. Neither is the branch this job has to bump.
+      - name: Check the tag is on that branch
+        run: |
+          if [ -z "$(git for-each-ref --contains "refs/tags/$TAG" "refs/remotes/origin/$BASE")" ]; then
+            echo "::error::${TAG} is not on a branch named '${BASE}'"
+            exit 1
+          fi
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Bump the crates
+        id: bump
+        run: |
+          scripts/bump-crate-versions.sh "$TAG"
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open or update the pull request
+        if: steps.bump.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="build: Bump the Rust crates to ${TAG}"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -C "$PR_BRANCH"
+          git commit -am "$title"
+          # The branch belongs to this job, so a rerun replaces it.
+          git push --force origin "HEAD:$PR_BRANCH"
+          {
+            echo '## Why'
+            echo
+            echo "The ${TAG} Release shipped, and the workspace crates still carry the previous version."
+            echo
+            echo '## What changed'
+            echo
+            echo "Cargo.toml and the fidget entries in Cargo.lock move to ${TAG}."
+            echo
+            echo '## How to verify'
+            echo
+            echo 'PR Tests runs on this branch.'
+          } > /tmp/crate-versions-pr.md
+          # A merged bump keeps its branch name, so only an open one is reused.
+          open_pr="$(gh pr list --head "$PR_BRANCH" --state open --json number --jq '.[0].number // ""')"
+          if [ -n "$open_pr" ]; then
+            gh pr edit "$open_pr" --title "$title" --body-file /tmp/crate-versions-pr.md
+          else
+            gh pr create --base "$BASE" --head "$PR_BRANCH" --label maintenance \
+              --title "$title" --body-file /tmp/crate-versions-pr.md
+          fi
+          # A pull request opened with this token starts no workflow. A dispatch
+          # does, and tests.yml runs in full for one.
+          gh workflow run tests.yml --ref "$PR_BRANCH"
+
   # A leaf after package: no job needs it, and it never touches the Release, so
   # an itch failure leaves the Release as published. A `uses:` job cannot take
   # continue-on-error; itch.yml's job carries it for Release runs.
@@ -290,7 +383,7 @@ jobs:
       needs.package.result == 'success'
     permissions:
       contents: read
-    uses: ./.github/workflows/itch.yml
+    uses: ./.github/workflows/itch.yml # zizmor: ignore[self-repository] ./ is the documented local reusable-workflow form; $/ is untested on this Release leaf
     with:
       tag: ${{ github.event.release.tag_name }}
     secrets:

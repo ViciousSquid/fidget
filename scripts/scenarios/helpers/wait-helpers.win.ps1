@@ -1,5 +1,5 @@
 # Shared waits for Windows scenario leaves. Each re-checks on a wake (a line
-# on Fidget's piped stderr, a file change, a UI Automation event) and gives up
+# on Fidget's piped stderr, a file change, a window event) and gives up
 # after its seconds. Nothing sleeps or polls.
 
 . (Join-Path $PSScriptRoot "..\..\uia-signal-win.ps1")
@@ -77,6 +77,7 @@ function Start-FidgetPiped([string]$Bin, [string[]]$Arguments, [string]$StdoutLo
     $start.StandardOutputEncoding = New-Object System.Text.UTF8Encoding $false
     $start.StandardErrorEncoding = New-Object System.Text.UTF8Encoding $false
     $process = [System.Diagnostics.Process]::Start($start)
+    [FidgetTrail]::Arm($FidgetStallSeconds, $process.Id)
     [FidgetSignal]::Tee($process, $false, $StdoutLog)
     [FidgetSignal]::Tee($process, $true, $StderrLog)
     return $process
@@ -149,8 +150,16 @@ function Wait-ForMarks([double]$Seconds, [string]$MarksFile, [string]$Pattern) {
 # Fidget is up at its `overlay:` line, before it attaches a Harness or takes a
 # taskbar click; a first wait starting here gets its whole budget. Pass the
 # piped stderr log, whose lines carry no seconds prefix.
-function Wait-ForUp([double]$Seconds, [string]$ErrLog) {
-    return (Wait-ForLine $Seconds $ErrLog '^overlay: ')
+# A cold WebKit on a hosted runner can draw the overlay seconds late. A fixed
+# 5 s missed on slow runners (#1765, `anchor-taskbar`); 30 s matches the macOS
+# warm-up budget, and the leaf's own cap still bounds a launch that never gets up.
+$FidgetStartupWaitSeconds = 30
+# Seconds with no step: past the slowest whole leaf (~41 s), so only a
+# blocked call trips it, and under the job's 3 min per leaf with its build.
+$FidgetStallSeconds = 90
+
+function Wait-ForUp([string]$ErrLog) {
+    return (Wait-ForLine $FidgetStartupWaitSeconds $ErrLog '^overlay: ')
 }
 
 function Wait-ForFile([double]$Seconds, [string]$FilePath) {
@@ -179,11 +188,14 @@ function Wait-Until([double]$Seconds, [scriptblock]$Probe) {
 $script:AxScript = Join-Path $PSScriptRoot "..\..\ax-window-win.ps1"
 function Invoke-AxWin([string]$OutFile, [hashtable]$AxArgs) {
     $global:LASTEXITCODE = 0
+    [FidgetTrail]::Mark("ax $($AxArgs.Command) $($AxArgs.Arg3)")
     try {
         & $script:AxScript @AxArgs 2>&1 | Out-File -FilePath $OutFile -Encoding utf8
     } catch {
         $_ | Out-File -FilePath $OutFile -Encoding utf8 -Append
         return $false
+    } finally {
+        [FidgetTrail]::Mark("ax $($AxArgs.Command) returned")
     }
     return ($LASTEXITCODE -eq 0)
 }
@@ -205,15 +217,16 @@ function Wait-ForAxDump([double]$Seconds, [int]$ProcessId, [string]$Title, [stri
 }
 
 # The sprite's position when it is at rest, else $null: the newest five frame
-# lines are all Grounded or Perched, not walking or falling, in one spot (within 2 px).
-# Frames land every draw, so this needs no second look after a pause.
+# lines are Grounded or Perched, on an idle loop, in one spot (within 2 px).
+# A gesture, a sit, or a walk is not rest. The frame index may change.
 function Get-SpriteAtRest([string]$TraceFile) {
     if (-not (Test-Path -LiteralPath $TraceFile)) { return $null }
     $frames = @(Get-Content -LiteralPath $TraceFile | Where-Object { $_ -match '^\d+\.?\d* frame: ' } | Select-Object -Last 5)
     if ($frames.Count -lt 5) { return $null }
     $at = $null
     foreach ($line in $frames) {
-        if ($line -match 'walk#|Falling' -or $line -notmatch ' (?:Grounded|Perched) .* sprite\((-?\d+),(-?\d+)\) ') { return $null }
+        if ($line -notmatch ' (?:Grounded|Perched) ' -or $line -notmatch ' idle#\d+' -or $line -match 'walk#|gesture#|sit#|Falling') { return $null }
+        if ($line -notmatch ' sprite\((-?\d+),(-?\d+)\) ') { return $null }
         $here = @{ X = [int]$Matches[1]; Y = [int]$Matches[2] }
         # Within 2 px of the first frame, so a slow drift is not rest.
         if ($at -and ([Math]::Abs($here.X - $at.X) -gt 2 -or [Math]::Abs($here.Y - $at.Y) -gt 2)) { return $null }
@@ -230,8 +243,29 @@ function Get-LastSpriteSpot([string]$TraceFile) {
     return @{ X = [int]$Matches[1]; Y = [int]$Matches[2] }
 }
 
-# Wait for the sprite to rest. Each move restarts the 3 s window; 10 s from
-# the start is the ceiling if it never stops. Return the rest the check saw.
+# The newest frame's sprite origin once that frame is Grounded or Perched, else
+# $null after $Seconds. A falling sprite moves ~60 px a frame, so a click aimed
+# at it misses; a walk moves a few px, so it is not waited out.
+function Wait-ForGrounded([string]$TraceFile, [double]$Seconds = 10) {
+    $dir = Split-Path -Parent $TraceFile
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { $dir = $script:WatchDir }
+    $script:groundedAt = $null
+    $null = Wait-OnChanges $Seconds $dir {
+        if (-not (Test-Path -LiteralPath $TraceFile)) { return $false }
+        $line = Get-Content -LiteralPath $TraceFile | Where-Object { $_ -match '^\d+\.?\d* frame: ' } | Select-Object -Last 1
+        if ($line -match ' (?:Grounded|Perched) .*sprite\((-?\d+),(-?\d+)\) ') {
+            $script:groundedAt = @{ X = [int]$Matches[1]; Y = [int]$Matches[2] }
+        }
+        [bool]$script:groundedAt
+    }
+    if (-not $script:groundedAt) { [Console]::Error.WriteLine("the sprite did not land within $Seconds s") }
+    return $script:groundedAt
+}
+
+# Wait for the sprite to rest. Each move restarts the 3 s window;
+# $FidgetRestWaitSeconds from the start is the ceiling if it never stops.
+# Return the rest the check saw.
+$FidgetRestWaitSeconds = 10
 function Wait-ForRest([string]$TraceFile) {
     $dir = Split-Path -Parent $TraceFile
     if (-not $dir -or -not (Test-Path -LiteralPath $dir)) { $dir = $script:WatchDir }
@@ -240,8 +274,8 @@ function Wait-ForRest([string]$TraceFile) {
     $start = Get-NowMs
     while ($true) {
         if ($at = Get-SpriteAtRest $TraceFile) { return $at }
-        if ((Get-NowMs) - $start -ge 10000) {
-            [Console]::Error.WriteLine("sprite never came to rest within 10s")
+        if ((Get-NowMs) - $start -ge $FidgetRestWaitSeconds * 1000) {
+            [Console]::Error.WriteLine("sprite never came to rest within ${FidgetRestWaitSeconds}s")
             return $null
         }
         $script:restDecision = "wait"
@@ -256,13 +290,6 @@ function Wait-ForRest([string]$TraceFile) {
         if ($script:restDecision -ceq "done") { return $script:restAt }
         if ($script:restDecision -cne "progress") { return $null }
     }
-}
-
-function In-State([string]$LogFile, [string]$StatePattern) {
-    if (-not (Test-Path -LiteralPath $LogFile)) { return $false }
-    $frame = Get-Content -LiteralPath $LogFile | Where-Object { $_ -match '^frame: ' } | Select-Object -Last 1
-    if (-not $frame) { return $false }
-    return $frame -match " ($StatePattern) "
 }
 
 # Cleanup for a finally block: kill Fidget and every process under it, then

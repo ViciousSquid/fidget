@@ -28,6 +28,7 @@
 mod acp_wire;
 mod action_log;
 mod caffeinate;
+mod character_import;
 mod chat_surface;
 mod completer;
 mod consent;
@@ -38,6 +39,7 @@ mod dev_flags;
 mod frame_loop;
 mod glass;
 mod harness;
+mod i18n;
 mod login_item;
 #[cfg(unix)]
 mod login_path;
@@ -50,6 +52,7 @@ mod package;
 mod pi_mcp;
 mod pill_focus;
 mod platform;
+mod possession;
 #[cfg_attr(not(unix), allow(dead_code))] // see the note on `consent`
 mod secrets;
 mod session_log;
@@ -79,7 +82,9 @@ use fidget_core::character::{Character, Primitive};
 use fidget_core::director::{
     app_instructions, happened_cell, Happened, ModelDirector, Pace, Recency, Seeded, StaticDirector,
 };
-use fidget_core::engine::{Cue, Point, SpriteFootprint, State, Verb};
+use fidget_core::engine::{
+    AnimationSource, Cue, Dialogue, Frame, Point, SpriteFootprint, State, Verb,
+};
 use fidget_core::input::Pointer;
 use fidget_core::memory;
 use fidget_core::overlay::{display_index_for, SpriteRect};
@@ -397,15 +402,9 @@ struct DirectorRun {
 /// than the one this tick is about to produce.
 struct Drawn {
     rect: SpriteRect,
-    animation: &'static str,
-    animation_ms: u32,
-    /// The variant draw the art was picked with, so the hit-test measures the
-    /// strip the user saw rather than whatever the next draw lands on.
-    variant_draw: u64,
-    /// Which way the sprite was pointed, so the hit-test resolves the strip
-    /// the art was drawn from and mirrors it the same way — this tick's
-    /// facing may already differ.
-    facing: f64,
+    /// The tick's Frame, so the hit-test resolves the art, variant draw,
+    /// beat and facing the user saw. This tick's may already differ.
+    frame: Frame,
 }
 
 /// What the last `engine:` line said about an Instance. Trace prints on
@@ -440,6 +439,9 @@ struct InstanceState {
     /// told when newest-wins throws that answer away (ADR-0016). `Slots` knows
     /// only that a call is out, and the wake clears `happened` as it sends.
     chat_turn: bool,
+    /// A line the user sent this tick. Taken into the Engine's snapshot so a
+    /// chat resets sleep, then cleared. The chat channel is the signal.
+    chat_said: bool,
     /// The `Happened` that drove the last session wake, as `happened_cell`
     /// names it. `None` until one has: nothing has been asked here yet.
     happened_last: Option<&'static str>,
@@ -450,7 +452,7 @@ struct InstanceState {
     happened: Happened,
     pointer: Pointer,
     /// The last line spoken and which overlay showed it, so a crossing
-    /// carries it. See `carry_line`.
+    /// carries it. See `draw_response`.
     spoken: Option<Spoken>,
     speech: SpeechBubble,
     drawn_last: Option<Drawn>,
@@ -478,6 +480,9 @@ struct InstanceState {
     /// falls a millisecond per millisecond and the window subtracts for itself;
     /// only a deadline that *moved* is worth a push.
     status_wake_ms: Option<u64>,
+    /// Whether this Instance's clock waits for its overlay's first draw: an
+    /// Instance that comes up with the app waits, a later Summon runs.
+    first_draw: FirstDraw,
 }
 
 /// One open menu, from the frame loop's side.
@@ -506,6 +511,37 @@ struct MenuChannel {
     sender: mpsc::Sender<MenuSignal>,
     receiver: mpsc::Receiver<MenuSignal>,
     quit_generation: Arc<AtomicU64>,
+}
+
+/// The next frame tells every overlay why the quick-message pill should yield.
+/// Taken once, so a choice does not dismiss the pill on every later tick.
+#[derive(Default)]
+struct QuickMessageAside(Mutex<Option<&'static str>>);
+
+impl QuickMessageAside {
+    fn note(&self, reason: &'static str) {
+        if let Ok(mut slot) = self.0.lock() {
+            *slot = Some(reason);
+        }
+    }
+
+    fn take(&self) -> Option<&'static str> {
+        self.0.lock().ok().and_then(|mut slot| slot.take())
+    }
+}
+
+#[cfg(test)]
+mod quick_message_aside_slot {
+    use super::QuickMessageAside;
+
+    #[test]
+    fn a_choice_is_told_once() {
+        let slot = QuickMessageAside::default();
+        assert_eq!(slot.take(), None);
+        slot.note("settings");
+        assert_eq!(slot.take(), Some("settings"));
+        assert_eq!(slot.take(), None, "the next frame does not repeat it");
+    }
 }
 
 /// Settings plus the live roster the settings window reads.
@@ -543,6 +579,8 @@ struct SettingsState {
     /// the one the opening turn names.
     behavior_names: Arc<BTreeMap<String, Vec<String>>>,
     instances: Arc<Mutex<Vec<InstanceRow>>>,
+    /// The frame loop locks `settings` then this. Never hold this while you
+    /// take `settings`, or the two threads deadlock.
     inspect: Arc<Mutex<model::DirectorInspect>>,
     ops: mpsc::Sender<SettingsOp>,
     rules: Arc<Mutex<HideRules>>,
@@ -608,6 +646,9 @@ struct SpritePlacement<'a> {
     /// it once Chat has closed. Bubble owner only, like the pill. False during
     /// a pointer gesture.
     hovered: bool,
+    /// This Instance's menu is open, so the pill does not arm under it.
+    /// Bubble owner only, like `hovered`.
+    menu_open: bool,
     /// Whether this overlay draws this Instance's bubble (`bubble_owner`).
     /// Still sent to the overlays that lost, which drop the bubble they were
     /// showing on the tick the answer changes.
@@ -625,6 +666,15 @@ struct SpritePlacement<'a> {
     /// The open quick-message draft. `None` off the bubble owner, so exactly one
     /// overlay draws the pill and the text follows the Instance across a seam.
     qm: Option<&'a fidget_core::quick_message::QmDraft>,
+    /// The user possesses this Instance. Only the bubble owner draws the card.
+    possessed: bool,
+    /// Focus left. The card asks for a click, and the keys were dropped.
+    paused: bool,
+    /// Jump bar fill, from 0 to 1, while Space is held. `None` hides the bar.
+    charge: Option<f64>,
+    /// Digit-row labels, one joined name string per key. Only the bubble
+    /// owner, and only while possessed: the card is not drawn anywhere else.
+    digits: &'a [String],
 }
 
 /// What the Chat button and the menu row show.
@@ -673,12 +723,21 @@ impl<'a> SpritePlacement<'a> {
             thinking: bubble && instance.thinking,
             asking: bubble && instance.asking,
             hovered: bubble && instance.hovered,
+            menu_open: bubble && instance.menu_open,
             bubble,
             cue: instance.cue.filter(|_| bubble).map(Cue::name),
             ripple_x: contact.map(|c| c.point.x.round() as i32 - display.x.round() as i32),
             ripple_y: contact.map(|c| c.point.y.round() as i32 - display.y.round() as i32),
             ripple_normal: contact.map(|c| c.normal),
             qm: instance.qm.as_ref().filter(|_| bubble),
+            possessed: bubble && instance.possessed,
+            paused: bubble && instance.paused,
+            charge: instance.charge.filter(|_| bubble),
+            digits: if bubble && instance.possessed {
+                instance.digits.as_slice()
+            } else {
+                &[]
+            },
         }
     }
 }
@@ -701,10 +760,32 @@ struct Placement<'a> {
     /// How long a hover waits before the quick message pill opens, in ms. On
     /// every frame, so a change in Settings lands on the next hover.
     hover_delay_ms: u64,
+    /// Do Not Disturb, on every frame, so the overlay sees the switch.
+    do_not_disturb: bool,
+    /// A menu choice that dismisses the quick-message pill, for this tick only.
+    aside: Option<&'static str>,
+    /// The Chat UI and Light/Dark the Possession card wears, on every frame,
+    /// so a switch in Settings repaints an open card on the next tick.
+    chat_ui: &'a str,
+    chat_appearance: ChatAppearance,
+    /// The display's usable area in this overlay's coordinates. The window
+    /// covers the whole frame, so a card inset from (0, 0) sits on the menu bar.
+    work_area: WorkArea,
+}
+
+/// Usable area in one overlay's coordinates. See `usable_in_overlay`.
+#[derive(Clone, Copy, Serialize)]
+struct WorkArea {
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
 }
 
 struct Spoken {
-    line: String,
+    /// The line and its producer, so a replay speaks for whoever said it and
+    /// not for whatever the current Frame or proposal holds.
+    line: Dialogue,
     at: Instant,
     owner: Option<usize>,
 }
@@ -714,22 +795,25 @@ struct Spoken {
 /// so it is never carried.
 const CARRY_WINDOW: Duration = Duration::from_secs(8);
 
-/// Dialogue this tick: the Engine's new line, or the last one re-pulsed to a
-/// new owner. Only the overlay that owns the bubble latches the one-tick
-/// pulse, so a seam crossing mid-line would otherwise lose it.
-fn carry_line(
+/// Dialogue this tick: the Engine's new line, or the last one re-pulsed to an
+/// owner that hasn't heard it, after a seam crossing or once its page listens.
+/// Only the bubble owner latches the one-tick pulse, so either would lose it.
+fn draw_response(
     spoken: &mut Option<Spoken>,
-    said: Option<&str>,
+    said: Option<&Dialogue>,
     owner: Option<usize>,
+    listening: bool,
     now: Instant,
-) -> Option<String> {
+) -> Option<Dialogue> {
+    let unheard = owner.is_some() && !listening;
+    let owner = owner.filter(|_| listening);
     if let Some(line) = said {
         *spoken = Some(Spoken {
-            line: line.to_string(),
+            line: line.clone(),
             at: now,
             owner,
         });
-        return Some(line.to_string());
+        return (!unheard).then(|| line.clone());
     }
     let carried = spoken.as_mut()?;
     if carried.owner == owner || now.duration_since(carried.at) > CARRY_WINDOW {
@@ -737,6 +821,50 @@ fn carry_line(
     }
     carried.owner = owner;
     Some(carried.line.clone())
+}
+
+/// The longest a launch Instance waits for its first draw. A page whose
+/// `character` load failed never draws, and WebView2 can listen seconds late.
+/// A calibration knob: hold plus fall must fit `wait_for_rest`'s ceiling.
+const FIRST_DRAW_CEILING: Duration = Duration::from_secs(3);
+
+/// Whether an Instance's clock runs yet. A launch Instance waits until the
+/// overlay under its feet has drawn its art, so the user first sees the spawn
+/// pose, not a sprite halfway down its fall. `Running` is terminal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FirstDraw {
+    /// Spawned with the app and not yet seen. `held` is wall time spent waiting.
+    Waiting {
+        held: Duration,
+    },
+    Running,
+}
+
+impl FirstDraw {
+    /// Whether this Instance's clocks advance this tick. The releasing tick
+    /// runs on that tick's time only, so the drop starts from rest. The release
+    /// traces why: the owner overlay drew it, nobody can see it, or the ceiling.
+    fn runs(&mut self, id: &str, elapsed: Duration, owner_drew: bool, visible: bool) -> bool {
+        let FirstDraw::Waiting { held } = *self else {
+            return true;
+        };
+        let held = held + elapsed;
+        let why = if owner_drew {
+            "drew"
+        } else if !visible {
+            "hidden"
+        } else if held >= FIRST_DRAW_CEILING {
+            "ceiling"
+        } else {
+            *self = FirstDraw::Waiting { held };
+            return false;
+        };
+        *self = FirstDraw::Running;
+        if dev_flags::TRACE_FRAMES.is_on() {
+            eprintln!("first-draw: {id} {why} after {}ms", held.as_millis());
+        }
+        true
+    }
 }
 
 /// What one Instance's tick decided to draw, in the space every display
@@ -755,6 +883,7 @@ struct Placed {
     thinking: bool,
     asking: bool,
     hovered: bool,
+    menu_open: bool,
     cue: Option<Cue>,
     /// Where this tick's landing touched, in the space every display shares.
     contact: Option<fidget_core::engine::RippleContact>,
@@ -763,6 +892,12 @@ struct Placed {
     owner: Option<usize>,
     /// The open quick-message draft, carried to the bubble owner like `dialogue`.
     qm: Option<fidget_core::quick_message::QmDraft>,
+    possessed: bool,
+    paused: bool,
+    charge: Option<f64>,
+    /// What digits 1 to 9 play, so the card can label them. A merge
+    /// joins the names with `/`.
+    digits: Vec<String>,
     #[cfg_attr(target_os = "macos", allow(dead_code))]
     mask: fidget_core::overlay::AlphaMask,
 }
@@ -806,23 +941,37 @@ struct ArtUrls {
     characters: BTreeMap<String, CharacterArt>,
 }
 
-/// Cached `ArtUrls` JSON. A newtype so managed state cannot collide with another String.
-struct ArtJson(String);
-
-fn encode_art_json(art: &ArtUrls) -> ArtJson {
-    ArtJson(serde_json::to_string(art).expect("ArtUrls always serializes"))
+/// `ArtUrls` and its JSON, encoded once by whichever asks first: setup's own
+/// thread, or a `character` call that arrives before it is done.
+struct ArtJson {
+    art: ArtUrls,
+    json: std::sync::OnceLock<String>,
 }
 
-fn character_response(json: &ArtJson) -> tauri::ipc::Response {
-    tauri::ipc::Response::new(json.0.clone())
+impl ArtJson {
+    fn new(art: ArtUrls) -> Self {
+        Self {
+            art,
+            json: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn json(&self) -> &str {
+        self.json
+            .get_or_init(|| serde_json::to_string(&self.art).expect("ArtUrls always serializes"))
+    }
+}
+
+fn character_response(art: &ArtJson) -> tauri::ipc::Response {
+    tauri::ipc::Response::new(art.json().to_owned())
 }
 
 /// The art of every Character on screen, fetched once when the webview
 /// loads. A command rather than an event: setup would race the overlay's
-/// listener. Encoded once; the art does not change while the app runs.
+/// listener. Async, so waiting on the encode never holds the main thread.
 #[tauri::command]
-fn character(json: tauri::State<'_, ArtJson>) -> tauri::ipc::Response {
-    character_response(json.inner())
+async fn character(art: tauri::State<'_, Arc<ArtJson>>) -> Result<tauri::ipc::Response, ()> {
+    Ok(character_response(art.inner()))
 }
 
 /// The Settings window's handle on the running app. `SettingsSession::apply`
@@ -932,23 +1081,35 @@ struct PickFills {
 }
 
 #[cfg(test)]
-mod overlay_page_load_tests {
-    use super::overlay_page_loaded_line;
+mod page_load_tests {
+    use super::page_loaded_line;
 
     // A scenario chains its startup waits on this line: the overlay's own
     // document has loaded, between the first frame and the first draft report.
     #[test]
     fn only_the_overlay_document_finishing_is_traced() {
         assert_eq!(
-            overlay_page_loaded_line("overlay-0", true, "http://tauri.localhost/").as_deref(),
+            page_loaded_line("overlay", "overlay-0", true, "http://tauri.localhost/").as_deref(),
             Some("overlay: overlay-0 page loaded")
         );
         assert_eq!(
-            overlay_page_loaded_line("overlay-0", false, "http://tauri.localhost/"),
+            page_loaded_line("overlay", "overlay-0", false, "http://tauri.localhost/"),
             None
         );
         assert_eq!(
-            overlay_page_loaded_line("overlay-0", true, "about:blank"),
+            page_loaded_line("overlay", "overlay-0", true, "about:blank"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_chat_document_finishing_is_traced_under_chat() {
+        assert_eq!(
+            page_loaded_line("chat", "chat-a", true, "http://tauri.localhost/chat.html").as_deref(),
+            Some("chat: chat-a page loaded")
+        );
+        assert_eq!(
+            page_loaded_line("chat", "chat-a", true, "about:blank"),
             None
         );
     }
@@ -1108,6 +1269,10 @@ mod settings_event_tests {
             self.note("open_memory")
         }
 
+        fn open_action_log(&self) -> Result<(), String> {
+            self.note("open_action_log")
+        }
+
         fn wipe_memory(&self) -> Result<(), String> {
             self.note("wipe_memory")
         }
@@ -1157,6 +1322,18 @@ mod settings_event_tests {
             Ok(SettingsEventResponse::Refresh)
         );
         assert_eq!(session.ran(), ["open_memory", "wipe_memory"]);
+    }
+
+    #[test]
+    fn opening_the_action_log_runs_here_and_does_not_cross_to_the_page() {
+        use settings::form::RowOperation;
+
+        let session = Recorded::default();
+        assert_eq!(
+            run_operation(&session, &RowOperation::OpenActionLog, &no_fields()),
+            Ok(SettingsEventResponse::Nothing)
+        );
+        assert_eq!(session.ran(), ["open_action_log"]);
     }
 
     /// `AiDraft` carries neither the name nor the Character, so they
@@ -1209,7 +1386,7 @@ mod settings_event_tests {
         assert_eq!(
             run_operation(&session, &RowOperation::CopyByoSnippet, &no_fields()),
             Ok(SettingsEventResponse::Run {
-                operation: "copy_byo_snippet".to_string()
+                operation: RowOperation::CopyByoSnippet,
             })
         );
         assert!(session.ran().is_empty());
@@ -1275,13 +1452,13 @@ mod settings_event_tests {
     fn response_run_uses_stable_wire_format() {
         use settings::form::RowOperation;
         let response = SettingsEventResponse::Run {
-            operation: RowOperation::Spawn.as_str().to_string(),
+            operation: RowOperation::Spawn,
         };
         let json = serde_json::to_string(&response).expect("should serialize");
         assert_eq!(json, r#"{"action":"run","operation":"spawn"}"#);
 
         let response = SettingsEventResponse::Run {
-            operation: RowOperation::NewSession.as_str().to_string(),
+            operation: RowOperation::NewSession,
         };
         let json = serde_json::to_string(&response).expect("should serialize");
         assert_eq!(json, r#"{"action":"run","operation":"new_session"}"#);
@@ -1432,11 +1609,7 @@ mod settings_event_tests {
                     applied += 1;
                     Ok(())
                 },
-                |op| {
-                    Ok(SettingsEventResponse::Run {
-                        operation: op.as_str().to_string(),
-                    })
-                },
+                |op| Ok(SettingsEventResponse::Run { operation: op }),
             )
         };
         let patch = settings::SettingsPatch::default();
@@ -1474,7 +1647,7 @@ mod settings_event_tests {
         assert_eq!(
             respond_counting(Outcome::Run(RowOperation::Spawn)),
             Ok(SettingsEventResponse::Run {
-                operation: "spawn".to_string()
+                operation: RowOperation::Spawn,
             })
         );
         assert_eq!(applied, 1, "only Commit(Some) wrote");
@@ -1510,7 +1683,7 @@ enum SettingsEventResponse {
     ClearKey,
     Reset,
     Run {
-        operation: String,
+        operation: settings::form::RowOperation,
     },
 }
 
@@ -1677,6 +1850,7 @@ fn respond(
 /// seam a test cannot see a press that reaches no method at all.
 trait Operations {
     fn open_memory(&self) -> Result<(), String>;
+    fn open_action_log(&self) -> Result<(), String>;
     fn wipe_memory(&self) -> Result<(), String>;
     fn spawn(&self, character: String, name: String);
     fn dismiss(&self, id: String);
@@ -1685,6 +1859,10 @@ trait Operations {
 impl Operations for settings::SettingsSession {
     fn open_memory(&self) -> Result<(), String> {
         settings::SettingsSession::open_memory(self)
+    }
+
+    fn open_action_log(&self) -> Result<(), String> {
+        settings::SettingsSession::open_action_log(self)
     }
 
     fn wipe_memory(&self) -> Result<(), String> {
@@ -1729,6 +1907,9 @@ fn run_operation(
         RowOperation::OpenMemory => session
             .open_memory()
             .map(|()| SettingsEventResponse::Nothing),
+        RowOperation::OpenActionLog => session
+            .open_action_log()
+            .map(|()| SettingsEventResponse::Nothing),
         // The file is gone, so the window redraws from what is left.
         RowOperation::WipeMemory => session
             .wipe_memory()
@@ -1743,7 +1924,7 @@ fn run_operation(
             Ok(SettingsEventResponse::Nothing)
         }
         _ => Ok(SettingsEventResponse::Run {
-            operation: op.as_str().to_string(),
+            operation: op.clone(),
         }),
     }
 }
@@ -1955,6 +2136,9 @@ fn dispatch_settings(app: tauri::AppHandle, reload: bool) {
         eprintln!("settings: opened before the shell was ready");
         return;
     }
+    if let Some(slot) = app.try_state::<QuickMessageAside>() {
+        slot.note("settings");
+    }
 
     // Same clone-then-post as `open_chat`: the closure takes the handle,
     // `run_on_main_thread` still borrows `app`.
@@ -2130,8 +2314,24 @@ fn overlay_report_qm_draft(
             (flips, clear)
         })
         .unwrap_or((Vec::new(), true));
+    apply_keyboard_flips(window.app_handle(), flips, process_empty);
+    if dev_flags::TRACE_BUBBLE.is_on() {
+        match &payload {
+            Some(draft) => eprintln!(
+                "overlay: draft instance={instance} text={:?} focused={}",
+                draft.text, draft.focused
+            ),
+            None => eprintln!("overlay: draft instance={instance} closed"),
+        }
+    }
+    platform::set_qm_draft(instance, payload);
+}
+
+/// Focusable follows whoever holds the keyboard, a pill or a possession card. A
+/// close hands it back only when nothing in the process still holds it.
+fn apply_keyboard_flips(app: &tauri::AppHandle, flips: Vec<(String, bool)>, process_empty: bool) {
     for (label, open) in flips {
-        let Some(overlay) = window.app_handle().get_webview_window(&label) else {
+        let Some(overlay) = app.get_webview_window(&label) else {
             continue;
         };
         if platform::overlay_focus_follows_pill() {
@@ -2155,16 +2355,17 @@ fn overlay_report_qm_draft(
             });
         }
     }
-    if dev_flags::TRACE_BUBBLE.is_on() {
-        match &payload {
-            Some(draft) => eprintln!(
-                "overlay: draft instance={instance} text={:?} focused={}",
-                draft.text, draft.focused
-            ),
-            None => eprintln!("overlay: draft instance={instance} closed"),
-        }
+}
+
+/// An overlay heard a possession key. Every overlay sends its keyups; the frame
+/// loop's session drops any for a key it never saw go down.
+#[tauri::command]
+fn overlay_possession_key(window: tauri::Window, key: String, down: bool) {
+    if dev_flags::TRACE_FRAMES.is_on() {
+        let edge = if down { "down" } else { "up" };
+        eprintln!("possession: key {} {key} {edge}", window.label());
     }
-    platform::set_qm_draft(instance, payload);
+    possession::push_key(window.label(), &key, down);
 }
 
 /// The overlay heard the right button: the same witness as the primary's,
@@ -2201,7 +2402,7 @@ pub(crate) const HOVER_DELAY_MS_VAR: &str = "FIDGET_HOVER_DELAY_MS";
 /// How long the pointer rests on the Character before the quick message pill
 /// opens, in ms. The only default: the row's placeholder names it, and every
 /// frame carries the delay in force to the overlay.
-const HOVER_DELAY_MS: u64 = 1500;
+const HOVER_DELAY_MS: u64 = 2500;
 
 /// The hover delay in force: the variable, then the Development row, then the default.
 pub(crate) fn hover_delay_ms() -> u64 {
@@ -2233,6 +2434,26 @@ fn overlay_cadence(window: tauri::Window, frames: Vec<(f64, bool, Option<f64>, f
 #[tauri::command]
 fn overlay_rects(window: tauri::Window, rects: Vec<fidget_core::overlay_region::OverlayRect>) {
     platform::set_overlay_rects(window.label(), rects);
+}
+
+/// The overlay's page now hears frames; until then its reply line is kept.
+#[tauri::command]
+fn overlay_listening(window: tauri::Window) {
+    platform::set_overlay_listening(window.label(), true);
+}
+
+/// The overlay's page has put this Instance's art on screen, so a launch
+/// Instance under it may start moving.
+#[tauri::command]
+fn overlay_drew(window: tauri::Window, id: String) {
+    platform::set_overlay_drew(window.label(), &id);
+}
+
+/// A page that starts loading again no longer hears frames until it says so.
+fn overlay_page_loading(label: &str, event: tauri::webview::PageLoadEvent) {
+    if event == tauri::webview::PageLoadEvent::Started {
+        platform::overlay_page_load_started(label);
+    }
 }
 
 /// Trace frontend bubble events to stderr when FIDGET_TRACE_BUBBLE is on.
@@ -2348,7 +2569,7 @@ fn overlay_has_foreground(window: tauri::Window) -> bool {
 /// SetForegroundWindow to a background thread, so the overlay borrows the
 /// foreground thread's input for the call.
 #[tauri::command]
-fn overlay_request_focus(window: tauri::Window) -> Result<(), String> {
+fn overlay_request_focus(window: tauri::WebviewWindow) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -2437,10 +2658,11 @@ fn cover_display(window: &tauri::WebviewWindow, display: Rect) -> Result<(), tau
     window.set_position(LogicalPosition::new(display.x, display.y))
 }
 
-/// The trace once the overlay's own document loads, between its first frame
-/// and its first draft report. `about:blank` finishes first and is skipped.
-fn overlay_page_loaded_line(label: &str, finished: bool, url: &str) -> Option<String> {
-    (finished && !url.starts_with("about:")).then(|| format!("overlay: {label} page loaded"))
+/// The trace once a window's own document loads. Scenarios chain on the
+/// overlay's, between its first frame and first draft report. `about:blank`
+/// finishes first and is skipped.
+fn page_loaded_line(who: &str, label: &str, finished: bool, url: &str) -> Option<String> {
+    (finished && !url.starts_with("about:")).then(|| format!("{who}: {label} page loaded"))
 }
 
 /// X11: build the overlay refusing focus, or the window manager focuses it at
@@ -2475,12 +2697,13 @@ fn build_overlay(
         .skip_taskbar(true)
         .visible(false)
         .on_page_load(|webview, payload| {
+            overlay_page_loading(webview.label(), payload.event());
             if !dev_flags::TRACE_BUBBLE.is_on() {
                 return;
             }
             let finished = payload.event() == tauri::webview::PageLoadEvent::Finished;
             if let Some(line) =
-                overlay_page_loaded_line(webview.label(), finished, payload.url().as_str())
+                page_loaded_line("overlay", webview.label(), finished, payload.url().as_str())
             {
                 eprintln!("{line}");
             }
@@ -2491,6 +2714,16 @@ fn build_overlay(
     // show). On Windows/macOS, the native handle exists while hidden.
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     platform::set_overlay_click_through(&window, true)?;
+
+    #[cfg(not(unix))]
+    {
+        let watched = window.clone();
+        window.on_window_event(move |event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) {
+                platform::cleanup_overlay_window(&watched);
+            }
+        });
+    }
 
     // X11: the window manager may put the overlay somewhere other than asked
     // (xfwm4 pushes it out of a desktop panel's reserved strip). Heard before
@@ -2507,11 +2740,25 @@ fn build_overlay(
                 }
                 platform::set_overlay_origin(&owner, (at.x, at.y));
             }
+            tauri::WindowEvent::Focused(focused) => {
+                possession::push_focus(&owner, *focused);
+            }
             #[cfg(all(unix, not(target_os = "macos")))]
             tauri::WindowEvent::Destroyed => {
                 platform::cleanup_overlay_window(&watched);
             }
             _ => {}
+        });
+    }
+
+    // macOS and Windows have no move watcher. Focus loss is what pauses possession.
+    #[cfg(not(all(unix, not(target_os = "macos"))))]
+    {
+        let owner = label.to_string();
+        window.on_window_event(move |event| {
+            if let tauri::WindowEvent::Focused(focused) = event {
+                possession::push_focus(&owner, *focused);
+            }
         });
     }
 
@@ -2546,32 +2793,42 @@ fn build_overlay(
     Ok(())
 }
 
-/// Build one Instance's Chat surface. No overlay flags: click-through would
+/// Build one Instance's hidden Chat. No overlay flags: click-through would
 /// swallow the caret click; always-on-top would follow the user out of the app.
 /// Stays under the overlay as a Perch; typing reaches it via key focus.
 fn build_chat(
     app: &tauri::AppHandle,
     label: &str,
     title: &str,
-    at: Option<(f64, f64)>,
 ) -> Result<tauri::WebviewWindow, tauri::Error> {
     let _spawned_ctrl_c = platform::SpawnedCtrlC::hold();
-    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("chat.html".into()))
+    let started = Instant::now();
+    let builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("chat.html".into()))
         .title(title)
         .inner_size(CHAT_SIZE.0, CHAT_SIZE.1)
         .min_inner_size(320.0, 320.0)
         // See-through only where it draws right: some X11 setups lose an
         // unrepainted see-through page to black or to the desktop.
         .transparent(platform::see_through_draws())
-        .focused(true);
-    if let Some((x, y)) = at {
-        builder = builder.position(x, y);
-    }
-    let started = Instant::now();
+        .visible(false)
+        .focused(false)
+        // The page loads off the main thread, so `built in` leaves it out.
+        .on_page_load(move |webview, payload| {
+            if !dev_flags::TRACE_BUBBLE.is_on() {
+                return;
+            }
+            let finished = payload.event() == tauri::webview::PageLoadEvent::Finished;
+            if let Some(line) =
+                page_loaded_line("chat", webview.label(), finished, payload.url().as_str())
+            {
+                eprintln!(
+                    "{line} {:.1}ms after the build began",
+                    millis(started.elapsed())
+                );
+            }
+        });
     let window = builder.build()?;
-    if dev_flags::TRACE_BUBBLE.is_on() {
-        eprintln!("chat: {label} built in {}ms", started.elapsed().as_millis());
-    }
+    let created = started.elapsed();
     glass::wear(&window, &chat_ui_now(app.try_state().as_deref()));
     let (handle, label) = (app.clone(), label.to_string());
     let observer = platform::observe_minimize(&window, {
@@ -2586,6 +2843,20 @@ fn build_chat(
     .ok();
     let observer = std::cell::Cell::new(observer);
     window.on_window_event(move |event| {
+        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            // Keep the native webview warm; rebuilding it holds the main thread.
+            if let Some(window) = handle.get_webview_window(&label) {
+                match window.hide() {
+                    Ok(()) => {
+                        api.prevent_close();
+                        if dev_flags::TRACE_BUBBLE.is_on() {
+                            eprintln!("chat: {label} is closed");
+                        }
+                    }
+                    Err(why) => eprintln!("chat: {label} could not be hidden: {why}"),
+                }
+            }
+        }
         if matches!(event, tauri::WindowEvent::Destroyed) {
             observer.take();
         }
@@ -2610,7 +2881,21 @@ fn build_chat(
             eprintln!("chat: {label} level: {why}");
         }
     });
+    if dev_flags::TRACE_BUBBLE.is_on() {
+        let built = started.elapsed();
+        eprintln!(
+            "chat: {} built in {:.1}ms (webview {:.1}ms, setup {:.1}ms)",
+            window.label(),
+            millis(built),
+            millis(created),
+            millis(built - created),
+        );
+    }
     Ok(window)
+}
+
+fn millis(span: std::time::Duration) -> f64 {
+    span.as_secs_f64() * 1000.0
 }
 
 /// A new Chat window's inner size, in points.
@@ -2674,9 +2959,9 @@ fn chat_ui_now(state: Option<&SettingsState>) -> String {
         .unwrap_or_else(|| "minimal".to_string())
 }
 
-/// Open this Instance's Chat surface, or raise the one it has, beside `feet`
-/// when known. The lookup posts to the main thread too: Ok from
-/// `run_on_main_thread` means queued, so two Summons would each build.
+/// Show this Instance's Chat beside `feet`, building it on first use. The
+/// lookup posts to the main thread: Ok from `run_on_main_thread` means queued,
+/// so two Summons would each build.
 fn open_chat(app: &tauri::AppHandle, id: &InstanceId, title: String, feet: Option<Point>) {
     let label = chat_label(id);
     let at = feet
@@ -2690,10 +2975,9 @@ fn open_chat(app: &tauri::AppHandle, id: &InstanceId, title: String, feet: Optio
                 if let Err(why) = window.set_title(&title) {
                     eprintln!("chat: {label} could not be retitled: {why}");
                 }
-                let _ = window.unminimize();
                 window
             }
-            None => match build_chat(&handle, &label, &title, at) {
+            None => match build_chat(&handle, &label, &title) {
                 Ok(window) => window,
                 Err(why) => {
                     eprintln!("chat: {label}: {why}");
@@ -2701,8 +2985,19 @@ fn open_chat(app: &tauri::AppHandle, id: &InstanceId, title: String, feet: Optio
                 }
             },
         };
-        // Both paths: `focused(true)` only orders within this app. Activate for
-        // typing, but keep Chat under the overlay so it stays a Perch.
+        if !window.is_visible().unwrap_or(false) {
+            if let Some((x, y)) = at {
+                if let Err(why) = window.set_position(LogicalPosition::new(x, y)) {
+                    eprintln!("chat: {label} could not be placed: {why}");
+                }
+            }
+        }
+        let _ = window.unminimize();
+        if let Err(why) = window.show() {
+            eprintln!("chat: {label} could not be shown: {why}");
+            return;
+        }
+        // Keep Chat under the overlay so it stays a Perch while typing.
         if let Err(why) = platform::activate_for_typing(&window) {
             eprintln!("chat: {label} could not be raised: {why}");
         }
@@ -2714,16 +3009,16 @@ fn open_chat(app: &tauri::AppHandle, id: &InstanceId, title: String, feet: Optio
     }
 }
 
-/// Shut the Chat surface belonging to `id`, if it has one. Nothing else
-/// closes a `chat-*`: they sit outside the `overlay-` namespace
-/// `place_overlays` sweeps. Main thread only, for `open_chat`'s reason.
+/// Destroy a dismissed Instance's Chat, bypassing the user-close handler that
+/// keeps it for the next Summon. Nothing else ends a `chat-*`: they sit outside
+/// the `overlay-` namespace `place_overlays` sweeps. Main thread only.
 fn close_chat(app: &tauri::AppHandle, id: &InstanceId) {
     let label = chat_label(id);
     let handle = app.clone();
     if let Err(why) = app.run_on_main_thread(move || {
         if let Some(window) = handle.get_webview_window(&label) {
-            if let Err(why) = window.close() {
-                eprintln!("chat: {label} could not be closed: {why}");
+            if let Err(why) = window.destroy() {
+                eprintln!("chat: {label} could not be destroyed: {why}");
             }
         }
     }) {
@@ -2969,8 +3264,8 @@ struct ChatOpening {
     /// Which Chat UI design the user picked: "minimal", "terminal", or "glass".
     chat_ui: String,
     chat_appearance: ChatAppearance,
-    /// `std::env::consts::OS`. Glass tints harder on "linux", where the
-    /// webview cannot blur the desktop behind Chat.
+    /// `std::env::consts::OS`. Glass tints harder on "linux" and "windows",
+    /// where the webview cannot blur the desktop behind Chat.
     platform: &'static str,
     /// A Harness is attached but not signed in. Names the login command for
     /// the user's own terminal.
@@ -3085,7 +3380,12 @@ fn chat_opening_layers(
             .harness
             .as_ref()
             .map(|attached| attached.name.clone()),
-        instructions: app_instructions(behaviors, blank),
+        instructions: app_instructions(
+            behaviors,
+            blank,
+            inspect.harness.is_some(),
+            i18n::reply_language(),
+        ),
         personality: if blank {
             String::new()
         } else {
@@ -3136,10 +3436,12 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
         .unwrap_or_default();
     // Re-read on every opening: a login the user ran mid-session moves the
     // Harness out of the not-authenticated state, and nothing else pushes it.
-    if let Ok(mut inspect) = state.inspect.lock() {
-        inspect.harness = harness::attached().map(|session| session.inspect());
-    }
-    let inspect = state.inspect.lock().ok();
+    // A copy, not the guard: the frame loop locks settings then inspect, so
+    // holding inspect into the settings reads below deadlocks.
+    let inspect = state.inspect.lock().ok().map(|mut guard| {
+        guard.harness = harness::attached().map(|session| session.inspect());
+        guard.clone()
+    });
     let blank = model::blank();
     ChatOpening {
         instructions: app_instructions(
@@ -3149,6 +3451,8 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
                 .map(|rows| declared_behaviors(&rows, &state.behavior_names, &instance))
                 .unwrap_or_default(),
             blank,
+            inspect.as_ref().is_some_and(|read| read.harness.is_some()),
+            i18n::reply_language(),
         ),
         personality: if blank {
             String::new()
@@ -3163,7 +3467,7 @@ fn chat_opening(instance: String, state: tauri::State<'_, SettingsState>) -> Cha
         character,
         configured: inspect.as_ref().is_some_and(|read| read.configured),
         enabled: inspect.as_ref().is_some_and(|read| read.enabled),
-        harness: inspect.as_ref().and_then(|read| chat_harness(read)),
+        harness: inspect.as_ref().and_then(chat_harness),
         model: inspect
             .as_ref()
             .map(|read| read.model.clone())
@@ -3459,7 +3763,7 @@ struct ChatReply {
     /// silent turn. Naming the wake reads as a cause rather than a bug.
     #[serde(default)]
     superseded_by: Option<&'static str>,
-    /// Streaming answer-so-far from Speech, not the final reply. The turn
+    /// Streaming answer-so-far from Dialogue, not the final reply. The turn
     /// stays open; the row replaces content instead of appending.
     #[serde(default)]
     streaming: bool,
@@ -3493,7 +3797,11 @@ struct ChatStatus {
     /// or a startle no Director proposed. The bar draws a dash, as the trace does.
     behavior: Option<String>,
     primitive: Option<Primitive>,
-    animation: &'static str,
+    /// The Animation whose art is on screen, as `Character::draw` resolved it.
+    animation: String,
+    /// The name the Engine asked with. A variant, a fallback or a Left Strip
+    /// makes it differ from `animation`, and the bar shows both.
+    asked_animation: &'static str,
     state: State,
     /// What drove the last wake, in `happened_cell`'s word for it.
     happened: Option<&'static str>,
@@ -3504,6 +3812,45 @@ struct ChatStatus {
     /// A turn is on the wire, and the character is not waiting on the user.
     /// The thinking ellipsis draws from this.
     thinking: bool,
+    /// Who owns the art on screen, as `source_key` spells it. Part of the
+    /// equality, so a change of owner over the same art still pushes.
+    source: &'static str,
+}
+
+/// The wire spelling of an Animation source. The core type stays free of a
+/// JSON shape; `chat-status.js` maps these keys to the labels the bar shows.
+fn source_key(source: AnimationSource) -> &'static str {
+    match source {
+        AnimationSource::IdleLoop => "idle_loop",
+        AnimationSource::Engine => "engine",
+        AnimationSource::LocalDirector => "local_director",
+        AnimationSource::AiRequested => "ai_requested",
+        AnimationSource::AiMcp => "ai_mcp",
+        AnimationSource::UserInvoked => "user_invoked",
+        AnimationSource::AiFeedback => "ai_feedback",
+        AnimationSource::Onboarding => "onboarding",
+    }
+}
+
+/// One tick's status for the bar, from the Engine's frame and the Animation
+/// `Character::draw` resolved it to.
+fn chat_status(
+    frame: &fidget_core::engine::Frame,
+    drawn_animation: &str,
+    happened: Option<&'static str>,
+    thinking: bool,
+) -> ChatStatus {
+    ChatStatus {
+        behavior: frame.playing_behavior.clone(),
+        primitive: frame.playing_primitive,
+        animation: drawn_animation.to_string(),
+        asked_animation: frame.animation,
+        state: frame.state,
+        happened,
+        facing: frame.facing as i8,
+        thinking,
+        source: source_key(frame.animation_source),
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -3564,7 +3911,7 @@ fn replayed_reply(turn: session_log::Turn) -> ChatReply {
 }
 
 /// A Chat surface reporting that it is listening. Events only reach windows
-/// that existed, so this session's turns wait here too, Speech as well as
+/// that existed, so this session's turns wait here too, Dialogue as well as
 /// permission asks that arrived before this window existed.
 #[tauri::command]
 fn chat_ready(
@@ -3692,27 +4039,27 @@ fn place_overlays(app: &tauri::AppHandle, displays: &[Rect]) -> Result<(), Strin
     }
 }
 
-/// The hide-hotkey Shortcut. Three modifiers, because a global shortcut is
-/// taken from every application on the machine and B alone belongs to most
-/// of them.
-fn shortcut_from_spec(spec: &str) -> Option<Shortcut> {
-    let parsed = settings::parse_hotkey(spec)
-        .or_else(|| settings::parse_hotkey(settings::DEFAULT_HIDE_HOTKEY))?;
-    let code: Code = settings::key_code_name(parsed.key)?.parse().ok()?;
+/// The global shortcut for the configured hide chord.
+fn shortcut_from_hotkey(hotkey: &settings::Hotkey) -> Shortcut {
+    let hotkey = hotkey.in_force();
+    let code: Code = settings::key_code_name(hotkey.key)
+        .expect("effective hotkeys always use supported letters")
+        .parse()
+        .expect("KeyA through KeyZ are shortcut codes");
     let mut modifiers = Modifiers::empty();
-    if parsed.control {
+    if hotkey.control {
         modifiers |= Modifiers::CONTROL;
     }
-    if parsed.option {
+    if hotkey.option {
         modifiers |= Modifiers::ALT;
     }
-    if parsed.shift {
+    if hotkey.shift {
         modifiers |= Modifiers::SHIFT;
     }
-    if parsed.command {
+    if hotkey.command {
         modifiers |= Modifiers::SUPER;
     }
-    Some(Shortcut::new(Some(modifiers), code))
+    Shortcut::new(Some(modifiers), code)
 }
 
 fn install_hide_hotkey(
@@ -3747,17 +4094,19 @@ fn install_hide_hotkey(
 /// Bind the hide hotkey. A hotkey another application already holds is
 /// reported and let go: losing it costs one way to hide the Character, which
 /// is not worth losing the Character over.
-fn bind_hide_hotkey(app: &tauri::AppHandle, spec: &str) {
+fn bind_hide_hotkey(app: &tauri::AppHandle, hotkey: &settings::Hotkey) {
     if app
         .try_state::<tauri_plugin_global_shortcut::GlobalShortcut<tauri::Wry>>()
         .is_none()
     {
         return;
     }
-    let Some(shortcut) = shortcut_from_spec(spec) else {
-        eprintln!("hotkey: {spec} could not be parsed");
-        return;
-    };
+    let effective = hotkey.in_force();
+    let spec = effective.display(settings::ModifierWords::current());
+    if effective != hotkey {
+        eprintln!("hotkey: unsupported key {:?}; using {spec}", hotkey.key);
+    }
+    let shortcut = shortcut_from_hotkey(effective);
     let gs = app.global_shortcut();
     if let Err(why) = gs.unregister_all() {
         eprintln!("hotkey: could not drop the previous binding: {why}");
@@ -3866,8 +4215,8 @@ fn stand_roster(
     }
 }
 
-// One over the clippy cap. Settings, hide rules, and the Director each have
-// to hear the same click, and folding them would mix persist with proposal.
+// Clippy's cap is 7. These are the live objects one click writes.
+// A struct with no other caller would only rename them.
 #[allow(clippy::too_many_arguments)]
 fn apply_menu_action(
     action: menu::MenuAction,
@@ -3886,7 +4235,12 @@ fn apply_menu_action(
     cursor: Point,
     monitors: &[Rect],
     floors: &[Rect],
-) {
+) -> MenuEffect {
+    if let Some(reason) = menu::quick_message_aside(&action) {
+        if let Some(slot) = app.try_state::<QuickMessageAside>() {
+            slot.note(reason);
+        }
+    }
     match action {
         menu::MenuAction::SwitchCharacter(name) => {
             if let Some(character) = characters.get(&name).cloned() {
@@ -3945,32 +4299,6 @@ fn apply_menu_action(
                 );
             }
         }
-        menu::MenuAction::ToggleDirector => {
-            let enabled = if let Ok(mut guard) = settings.lock() {
-                guard.director_enabled = !guard.director_enabled;
-                let chat_ui = guard.chat_ui.clone();
-                let chat_appearance = guard.chat_appearance;
-                config.apply_switch(guard.director_enabled);
-                if let Ok(mut inspect) = inspect.lock() {
-                    inspect.enabled = config.enabled;
-                    push_chat_openings(
-                        app,
-                        roster,
-                        &inspect,
-                        characters,
-                        &chat_ui,
-                        chat_appearance,
-                    );
-                }
-                Some(guard.director_enabled)
-            } else {
-                None
-            };
-            if let Some(enabled) = enabled {
-                persist_settings(settings, settings_path);
-                eprintln!("menu: Director {}", if enabled { "on" } else { "off" });
-            }
-        }
         menu::MenuAction::ToggleDnd => {
             if let Some(instance) = roster.get_mut(instance_id) {
                 let new_state = !instance.do_not_disturb();
@@ -3981,6 +4309,31 @@ fn apply_menu_action(
                     persist_settings(settings, settings_path);
                 }
                 eprintln!("menu: DND {}", if new_state { "on" } else { "off" });
+            }
+        }
+        menu::MenuAction::TogglePossession => {
+            let turning_on = roster
+                .get(instance_id)
+                .is_some_and(|instance| !instance.possessed());
+            if turning_on {
+                // One possessed Instance. The one this click names keeps it.
+                let others: Vec<String> = roster
+                    .list()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .filter(|id| id != instance_id)
+                    .collect();
+                for id in others {
+                    if let Some(other) = roster.get_mut(&id) {
+                        other.set_possessed(false);
+                    }
+                }
+            }
+            if let Some(instance) = roster.get_mut(instance_id) {
+                let next = !instance.possessed();
+                instance.set_possessed(next);
+                eprintln!("menu: possession {}", if next { "on" } else { "off" });
+                return MenuEffect::Possession(next);
             }
         }
         menu::MenuAction::Hide => {
@@ -3997,6 +4350,9 @@ fn apply_menu_action(
                     persist_settings(settings, settings_path);
                 }
                 eprintln!("menu: {}", if away { "away" } else { "back" });
+                if away {
+                    return MenuEffect::Hide;
+                }
             }
         }
         menu::MenuAction::BringToThisDisplay => {
@@ -4009,28 +4365,6 @@ fn apply_menu_action(
                 .collect();
             bring_roster_to_display(roster, &widths, monitors, floors, cursor);
             eprintln!("menu: bring to this display");
-        }
-        menu::MenuAction::ToggleFullscreenHide => {
-            if let Ok(mut r) = rules.lock() {
-                let next = !r.hide_in_fullscreen();
-                r.set_hide_in_fullscreen(next);
-                let saved = if let Ok(mut guard) = settings.lock() {
-                    guard.hide_in_fullscreen = r.hide_in_fullscreen();
-                    true
-                } else {
-                    false
-                };
-                drop(r);
-                if saved {
-                    persist_settings(settings, settings_path);
-                }
-            }
-        }
-        menu::MenuAction::OpenMemory => {
-            let _ = platform::open_path(&memory::shared_path());
-        }
-        menu::MenuAction::OpenActionLog => {
-            let _ = platform::open_path(&action_log::current_path());
         }
         menu::MenuAction::OpenSettings => present_settings(app.clone()),
         menu::MenuAction::ToggleCaffeinate => {
@@ -4045,8 +4379,19 @@ fn apply_menu_action(
                 eprintln!("menu: Summon");
             }
         }
-        menu::MenuAction::Quit => quit_now(),
+        menu::MenuAction::Quit => return MenuEffect::Quit,
     }
+    MenuEffect::None
+}
+
+/// What a menu click asks of the frame loop beyond the action itself.
+enum MenuEffect {
+    None,
+    /// This Instance is possessed after the click, or it is not.
+    Possession(bool),
+    /// The Character was just sent away.
+    Hide,
+    Quit,
 }
 
 /// Leave without AppKit's `terminate:`. `PredefinedMenuItem::quit` deadlocks
@@ -4093,31 +4438,23 @@ fn quit_actions(orderly_platform: bool, already_quitting: bool) -> &'static [Qui
 }
 
 /// Ctrl+C is not `RunEvent::Exit`. The Harness child is in its own process
-/// group so that signal does not dump inside Node; this then kills it.
-/// Isolation waits until the handler is installed, or a failed catch leaves a tree Ctrl+C cannot reap.
+/// group so that signal does not dump inside Node; this then kills it. The
+/// handler goes in first, or `own_interrupt` refuses to isolate the child.
 fn quit_harness_on_interrupt(app: tauri::AppHandle) {
-    match ctrlc::set_handler(move || {
+    crate::harness::own_interrupt(move || {
         let already = crate::harness::interrupt_already_quitting();
         for action in quit_actions(cfg!(windows), already) {
             perform_quit_action(*action, &mut AppQuit(&app));
         }
-    }) {
-        Ok(()) => crate::harness::own_interrupt(),
-        Err(why) => eprintln!(
-            "harness: could not catch interrupt: {why}; child stays in this process group"
-        ),
-    }
+    });
 }
 
 /// What [`perform_quit_action`] asks the host to do. Tests record the calls.
-/// `close_webview` is `Webview::close`. `close_window` exists only in tests,
-/// so a recording can show Ctrl+C did not take that path.
+/// `close_webview` is `Webview::close`.
 trait QuitHost {
     fn announce(&mut self);
     fn shutdown_harness(&mut self);
     fn close_webview(&mut self);
-    #[cfg(test)]
-    fn close_window(&mut self);
     fn exit_event_loop(&mut self);
     fn exit_process(&mut self);
 }
@@ -4145,17 +4482,6 @@ impl QuitHost for AppQuit<'_> {
 
     fn close_webview(&mut self) {
         close_webviews_for_quit(self.0);
-    }
-
-    #[cfg(test)]
-    fn close_window(&mut self) {
-        // Not what Ctrl+C calls. Window close destroys the parent HWND
-        // before `Controller::Close`, which is the 1411 path.
-        for (label, window) in self.0.webview_windows() {
-            if let Err(why) = window.close() {
-                eprintln!("quit: {label} window could not be closed: {why}");
-            }
-        }
     }
 
     fn exit_event_loop(&mut self) {
@@ -4194,9 +4520,8 @@ pub(crate) fn paced(config: &model::DirectorConfig, character: &Character) -> Pa
     )
 }
 
-// One over the clippy cap, for the same reason `apply_menu_action` is: the new
-// session belongs beside the `retarget_model` that opens it, and the Chat
-// surface it has to tell is reached through the app handle.
+// One over the clippy cap. Roster, Completer, and Chat all hear one switch,
+// and splitting them would hide that they move together.
 #[allow(clippy::too_many_arguments)]
 fn switch_instance(
     roster: &mut Roster,
@@ -4213,18 +4538,17 @@ fn switch_instance(
         live.character = character;
         live.director = StaticDirector::new(live.character.behaviors.clone(), 0);
         live.pace = paced(config, &live.character);
-        // The old session is the previous Character's. A Wake still on the
-        // wire would propose as them; drop it and ask for this opening turn.
-        completer::retarget_model(
+        // The previous Character's Harness session stays. It is keyed by
+        // Character, so switching back still has it.
+        frame_loop::replace_session(
+            app,
             slots,
-            instance_id,
-            &mut live.model,
-            live.character.behaviors.keys().cloned(),
-            live.character.name.clone(),
+            live,
             settings,
             config.configured,
+            "the Character changed",
+            frame_loop::HarnessSession::Keep,
         );
-        session_log::new_session(app, instance_id, "the Character changed");
         live.recent.clear();
         live.happened = Happened::Proactive;
         live.addressed = true;
@@ -4285,6 +4609,7 @@ fn spawn_live(
         addressed: false,
         happened: Happened::Proactive,
         chat_turn: false,
+        chat_said: false,
         pointer: Pointer::with_double_click_ms(platform::double_click_interval_ms()),
         spoken: None,
         speech: SpeechBubble::default(),
@@ -4297,6 +4622,7 @@ fn spawn_live(
         happened_last: None,
         verbs: Vec::new(),
         menu_hold: None,
+        first_draw: FirstDraw::Running,
         character,
     });
 }
@@ -4370,25 +4696,25 @@ fn describe_menu(
     current: &str,
     roster: &Roster,
     instance_id: &str,
-    settings: &Settings,
     rules: &HideRules,
     caffeinate: menu::CaffeinateRow,
+    surface: menu::MenuSurface,
 ) -> menu::MenuDescription {
     let instances = roster.list();
-    let hide_hotkey = settings::display_hotkey(&settings.hide_hotkey);
     menu::describe(menu::MenuSnapshot {
+        surface,
         installed,
         current_character: current,
         instances: &instances,
-        director_enabled: model::director_in_force(settings.director_enabled),
-        director_env_owned: model::env_switch(model::ENABLED).is_some(),
         do_not_disturb: roster
             .get(instance_id)
             .map(|instance| instance.do_not_disturb())
             .unwrap_or(false),
+        possessed: roster
+            .get(instance_id)
+            .map(|instance| instance.possessed())
+            .unwrap_or(false),
         hidden: rules.is_away(),
-        hide_in_fullscreen: rules.hide_in_fullscreen(),
-        hide_hotkey: &hide_hotkey,
         caffeinate,
     })
 }
@@ -4426,28 +4752,70 @@ fn load_all_characters(
         .resource_dir()
         .ok()
         .map(|dir| dir.join(BUNDLED_CHARACTERS));
-    let search_paths = package::search_paths(bundled);
+    characters_in(&package::search_paths(bundled))
+}
+
+fn characters_in(
+    search_paths: &[PathBuf],
+) -> (
+    BTreeMap<String, CharacterArt>,
+    BTreeMap<String, Arc<Character>>,
+) {
+    // Earlier directories win, so a package the user added is the one a
+    // switch loads. Grouped by name before any load, so a shadowed copy's art
+    // is decoded only when every earlier copy fails to load.
+    let mut groups: Vec<(Option<String>, Vec<_>)> = Vec::new();
+    for path in package::installed(search_paths) {
+        let Ok(files) = package::read(&path) else {
+            continue;
+        };
+        let name = fidget_core::character::declared_name(&files);
+        match groups
+            .iter_mut()
+            .find(|(seen, _)| name.is_some() && *seen == name)
+        {
+            Some((_, copies)) => copies.push(files),
+            None => groups.push((name, vec![files])),
+        }
+    }
+
+    // One thread per Character: decoding every installed Character's art one
+    // after another is most of a debug launch on a CI runner (#1765).
+    let loaded: Vec<_> = std::thread::scope(|scope| {
+        let loads: Vec<_> = groups
+            .iter()
+            .map(|(_, copies)| {
+                scope.spawn(|| {
+                    let character = copies
+                        .iter()
+                        .find_map(|files| fidget_core::character::load(files).ok())?;
+                    Some((art_urls(&character), character))
+                })
+            })
+            .collect();
+        loads
+            .into_iter()
+            .map(|load| {
+                load.join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+            .collect()
+    });
+
     let mut art = BTreeMap::new();
     let mut cache = BTreeMap::new();
-    for path in package::installed(&search_paths) {
-        let files = match package::read(&path) {
-            Ok(files) => files,
-            Err(_) => continue,
-        };
-        if let Ok(character) = fidget_core::character::load(&files) {
-            // Earlier directories win, so a package the user added is the one a switch loads.
-            if cache.contains_key(&character.name) {
-                continue;
-            }
-            art.insert(
-                character.name.clone(),
-                CharacterArt {
-                    art: art_urls(&character),
-                    smooth: character.smooth,
-                },
-            );
-            cache.insert(character.name.clone(), Arc::new(character));
+    for (urls, character) in loaded.into_iter().flatten() {
+        if cache.contains_key(&character.name) {
+            continue;
         }
+        art.insert(
+            character.name.clone(),
+            CharacterArt {
+                art: urls,
+                smooth: character.smooth,
+            },
+        );
+        cache.insert(character.name.clone(), Arc::new(character));
     }
     (art, cache)
 }
@@ -4598,6 +4966,7 @@ fn spawn_instances(
             addressed: false,
             happened: Happened::Proactive,
             chat_turn: false,
+            chat_said: false,
             pointer: Pointer::with_double_click_ms(platform::double_click_interval_ms()),
             spoken: None,
             speech: SpeechBubble::default(),
@@ -4610,6 +4979,9 @@ fn spawn_instances(
             happened_last: None,
             verbs: Vec::new(),
             menu_hold: None,
+            first_draw: FirstDraw::Waiting {
+                held: Duration::ZERO,
+            },
         });
     }
 
@@ -4882,7 +5254,7 @@ fn build_anchor_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error:
         return Err(format!("anchor: module: {}", std::io::Error::last_os_error()).into());
     }
 
-    let icon = anchor_icon().unwrap_or(std::ptr::null_mut());
+    let (icon, small_icon) = anchor_icons();
     let class_name = windows_sys::w!("FidgetAnchor");
     let class = WNDCLASSEXW {
         cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
@@ -4896,7 +5268,7 @@ fn build_anchor_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error:
         hbrBackground: std::ptr::null_mut(),
         lpszMenuName: std::ptr::null(),
         lpszClassName: class_name,
-        hIconSm: icon,
+        hIconSm: small_icon,
     };
     if unsafe { RegisterClassExW(&class) } == 0 {
         let err = std::io::Error::last_os_error();
@@ -4929,10 +5301,12 @@ fn build_anchor_window(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error:
         return Err(format!("anchor: create window: {}", std::io::Error::last_os_error()).into());
     }
 
-    if !icon.is_null() {
-        unsafe {
+    unsafe {
+        if !icon.is_null() {
             SendMessageW(hwnd, WM_SETICON, ICON_BIG as usize, icon as isize);
-            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, icon as isize);
+        }
+        if !small_icon.is_null() {
+            SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small_icon as isize);
         }
     }
 
@@ -5019,47 +5393,46 @@ unsafe extern "system" fn anchor_wndproc(
     DefWindowProcW(hwnd, msg, wparam, lparam)
 }
 
-/// Taskbar icon from the same PNG the bundle uses. The class stores the handle
-/// until process exit, and `DestroyIcon` would blank the button.
+/// Taskbar icons, big and small, from the `.ico` tauri-build links into the exe.
+/// The class keeps both handles until process exit, and `DestroyIcon` would
+/// blank the button. A null handle leaves that slot to the system default.
 #[cfg(target_os = "windows")]
-fn anchor_icon() -> Option<windows_sys::Win32::UI::WindowsAndMessaging::HICON> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::CreateIcon;
+fn anchor_icons() -> (
+    windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+    windows_sys::Win32::UI::WindowsAndMessaging::HICON,
+) {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetSystemMetrics, LoadImageW, IMAGE_ICON, LR_DEFAULTCOLOR, SM_CXSMICON, SM_CYSMICON,
+    };
+    const APP_ICON: windows_sys::core::PCWSTR =
+        tauri::utils::platform::WINDOWS_APP_ICON_RESOURCE_ID as usize as windows_sys::core::PCWSTR;
+    // The shell's largest icon slot; a bigger one only costs memory.
+    const JUMBO: i32 = 256;
 
-    let decoded = match image::load_from_memory(include_bytes!("../icons/icon.png")) {
-        Ok(decoded) => decoded,
-        Err(why) => {
-            eprintln!("anchor: icon: {why}");
-            return None;
+    // Not LR_SHARED: it caches one handle per resource, so the second size could be the first.
+    let load = |width, height| {
+        let icon = unsafe {
+            LoadImageW(
+                GetModuleHandleW(std::ptr::null()),
+                APP_ICON,
+                IMAGE_ICON,
+                width,
+                height,
+                LR_DEFAULTCOLOR,
+            )
+        };
+        if icon.is_null() {
+            eprintln!(
+                "anchor: icon {width}x{height}: {}",
+                std::io::Error::last_os_error()
+            );
         }
+        icon
     };
-    // The PNG is 512. The shell's jumbo slot is 256, and a larger icon is only memory.
-    let rgba = decoded.thumbnail(256, 256).to_rgba8();
-    let (width, height) = rgba.dimensions();
-    let mut pixels = rgba.into_raw();
-    let mut mask = Vec::with_capacity(pixels.len() / 4);
-    // CreateIcon's color plane is BGRA. The mask byte is inverted alpha so a
-    // transparent pixel stays transparent on the taskbar.
-    for chunk in pixels.as_chunks_mut::<4>().0 {
-        mask.push(chunk[3].wrapping_sub(u8::MAX));
-        chunk.swap(0, 2);
-    }
-    let icon = unsafe {
-        CreateIcon(
-            std::ptr::null_mut(),
-            width as i32,
-            height as i32,
-            1,
-            32,
-            mask.as_ptr(),
-            pixels.as_ptr(),
-        )
-    };
-    if icon.is_null() {
-        eprintln!("anchor: icon: {}", std::io::Error::last_os_error());
-        None
-    } else {
-        Some(icon)
-    }
+    let (small_width, small_height) =
+        unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+    (load(JUMBO, JUMBO), load(small_width, small_height))
 }
 
 fn main() {
@@ -5093,12 +5466,14 @@ fn main() {
     login_path::adopt();
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             character,
             overlay_primary,
             overlay_secondary,
             overlay_composing,
             overlay_report_qm_draft,
+            overlay_possession_key,
             overlay_rects,
             overlay_trace_bubble,
             overlay_hit_tests_hotspots,
@@ -5113,6 +5488,8 @@ fn main() {
             chat_send,
             chat_prompt,
             chat_ready,
+            overlay_listening,
+            overlay_drew,
             names_hint_act,
             permission_answer,
             elicitation_answer,
@@ -5122,7 +5499,11 @@ fn main() {
             show_settings,
             show_ai_source,
             settings_snapshot,
-            settings_event
+            settings_event,
+            character_import::character_import_list,
+            character_import::character_import_zip,
+            character_import::character_import_folder,
+            character_import::character_import_remove
         ])
         .setup(|app| {
             // No Character means no overlay. Reported and exited rather than
@@ -5133,6 +5514,7 @@ fn main() {
             // Before anything reads a development switch: the frame loop and
             // the overlay panel load them from `dev_flags`, not the env.
             dev_flags::seed(&settings);
+            i18n::apply(&settings.language);
             // The WebKitGTK this process loaded, which an AppImage bundles.
             #[cfg(target_os = "linux")]
             if let Ok(version) = tauri::webview_version() {
@@ -5175,13 +5557,21 @@ fn main() {
                         smooth: character.smooth,
                     });
             }
-            app.manage(encode_art_json(&ArtUrls { characters }));
+            // Off the main thread: a debug build spends ~300 ms on the JSON,
+            // and the overlay page asks for it only after it loads.
+            let art = Arc::new(ArtJson::new(ArtUrls { characters }));
+            app.manage(Arc::clone(&art));
+            std::thread::spawn(move || {
+                art.json();
+            });
             let installed: Vec<String> = character_cache.keys().cloned().collect();
 
             // Show in the Dock so users have a findable anchor when the menu
             // bar is crowded. The tray icon remains the settings door.
             #[cfg(target_os = "macos")]
             app.set_activation_policy(tauri::ActivationPolicy::Regular);
+            #[cfg(target_os = "macos")]
+            platform::watch_delivered_presses();
 
             // Windows and Linux get an off-screen taskbar anchor that opens Settings, like
             // the Dock icon. Hold Ctrl+C until the quit handler is in, so the gap between
@@ -5223,7 +5613,15 @@ fn main() {
             if covered.is_empty() {
                 return Err("no displays reported".into());
             }
+            // The first show is when AppKit activates a launched app, which
+            // would take the keyboard from what the user is typing in.
+            #[cfg(target_os = "macos")]
+            let front = platform::other_app_in_front();
             place_overlays(app.handle(), &covered)?;
+            #[cfg(target_os = "macos")]
+            if let Some(pid) = front {
+                platform::give_front_back(pid);
+            }
 
             // The sprite size is the first Instance's idle Animation, blown
             // up. Here because scripts/verify-overlay.sh crops a screenshot
@@ -5419,8 +5817,8 @@ fn main() {
                 let spec = settings
                     .lock()
                     .ok()
-                    .map(|s| s.hide_hotkey.clone())
-                    .unwrap_or_default();
+                    .map(|s| s.hide_hotkey)
+                    .unwrap_or(settings::DEFAULT_HIDE_HOTKEY);
                 bind_hide_hotkey(app.handle(), &spec);
             }
             let instance_rows = Arc::new(Mutex::new(Vec::new()));
@@ -5459,6 +5857,7 @@ fn main() {
                 rebuild_after_destroy: AtomicBool::new(false),
             });
             app.manage(Arc::clone(&rules));
+            app.manage(QuickMessageAside::default());
 
             // Dev/test hook: open settings immediately if FIDGET_OPEN_SETTINGS=1.
             // For verify/smoke scripts that need the settings window on launch.
@@ -5498,9 +5897,9 @@ fn main() {
                     &current,
                     &roster,
                     &id,
-                    &settings_now,
                     rules_now.as_deref().unwrap_or(&HideRules::default()),
                     menu_caffeinate(&settings_now, None),
+                    menu::MenuSurface::Tray,
                 );
                 #[cfg(target_os = "macos")]
                 platform::seed_tray_position();
@@ -5529,9 +5928,12 @@ fn main() {
             let live_quit = Arc::clone(&quit_generation);
             app.handle().on_menu_event(move |_app, event| {
                 let id = event.id().0.clone();
-                // Native Quit ids are per tray draw. A dismiss rebuilds the
-                // tray and muda can click the item it just dropped; that id
-                // is the previous draw's, so it must not call quit_now.
+                eprintln!("menu: event {id}");
+                // Native Quit ids are per tray draw. Off Windows, a dismiss
+                // rebuilds the tray and muda can click the item it just
+                // dropped; that id is the previous draw's, so it must not call
+                // quit_now. muda on Windows matches a click against the menu
+                // attached now, so a dropped tray row never lands here.
                 if menu::is_live_quit(&id, live_quit.load(Ordering::SeqCst)) {
                     quit_now();
                 }
@@ -5577,8 +5979,84 @@ fn main() {
         });
 }
 
+#[cfg(all(test, target_os = "windows"))]
+mod anchor_icon_tests {
+    use windows_sys::Win32::Graphics::Gdi::{DeleteObject, GetObjectW, BITMAP};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetIconInfo, GetSystemMetrics, HICON, ICONINFO, SM_CXSMICON, SM_CYSMICON,
+    };
+
+    fn icon_size(icon: HICON) -> (i32, i32) {
+        let mut info: ICONINFO = unsafe { std::mem::zeroed() };
+        assert_ne!(unsafe { GetIconInfo(icon, &mut info) }, 0, "GetIconInfo");
+        let mut bitmap: BITMAP = unsafe { std::mem::zeroed() };
+        let read = unsafe {
+            GetObjectW(
+                info.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                (&raw mut bitmap).cast(),
+            )
+        };
+        unsafe {
+            DeleteObject(info.hbmColor);
+            DeleteObject(info.hbmMask);
+        }
+        assert_ne!(read, 0, "GetObjectW");
+        (bitmap.bmWidth, bitmap.bmHeight)
+    }
+
+    #[test]
+    fn the_taskbar_gets_a_256px_icon_and_a_small_icon_sized_for_the_shell() {
+        let (big, small) = super::anchor_icons();
+        assert!(!big.is_null() && !small.is_null());
+        assert_eq!(icon_size(big), (256, 256));
+        let small_size = unsafe { (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON)) };
+        assert_eq!(icon_size(small), small_size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// Production change that would fail this: a reload that leaves the page
+    /// marked listening, so a reply line goes out before its listener is back.
+    #[test]
+    fn a_reloaded_page_is_not_listening_until_it_says_so_again() {
+        use tauri::webview::PageLoadEvent;
+        let label = "overlay-reload-test";
+        // First navigation lands normally: Started, then the page listens.
+        super::overlay_page_loading(label, PageLoadEvent::Started);
+        assert!(!super::platform::overlay_listening(label));
+        super::platform::set_overlay_listening(label, true);
+        super::overlay_page_loading(label, PageLoadEvent::Finished);
+        assert!(super::platform::overlay_listening(label));
+        let loads = super::platform::overlay_page_loads(label);
+        assert!(loads >= 1);
+        // Reload: Started clears it until the new page listens.
+        super::overlay_page_loading(label, PageLoadEvent::Started);
+        assert!(!super::platform::overlay_listening(label));
+        assert_eq!(super::platform::overlay_page_loads(label), loads + 1);
+        super::platform::set_overlay_listening(label, true);
+        assert!(super::platform::overlay_listening(label));
+    }
+
+    /// Production change that would fail this: the first Started clearing a
+    /// listen that landed on load 0 (WebView2 can send ContentLoading late),
+    /// so the page never listens again and its reply lines are never shown.
+    #[test]
+    fn the_first_started_keeps_a_listen_that_landed_on_load_zero() {
+        use tauri::webview::PageLoadEvent;
+        let label = "overlay-started-after-listen";
+        assert_eq!(super::platform::overlay_page_loads(label), 0);
+        super::platform::set_overlay_listening(label, true);
+        super::overlay_page_loading(label, PageLoadEvent::Started);
+        assert!(super::platform::overlay_listening(label));
+        assert_eq!(super::platform::overlay_page_loads(label), 1);
+        // A later Started is a reload and still clears.
+        super::overlay_page_loading(label, PageLoadEvent::Started);
+        assert!(!super::platform::overlay_listening(label));
+        assert_eq!(super::platform::overlay_page_loads(label), 2);
+    }
+
     #[test]
     fn an_overlay_label_is_the_prefix_chat_and_settings_do_not_share() {
         assert!(super::is_overlay_label(&super::overlay_label(0)));
@@ -5738,15 +6216,15 @@ mod tests {
     fn the_hover_delay_in_force_is_the_setting_or_the_default() {
         model::tests::with_env(None, None, None, || {
             dev_flags::seed(&settings::Settings::default());
-            assert_eq!(hover_delay_ms(), 1500);
-            assert_eq!(hover_delay_placeholder(), "1500");
+            assert_eq!(hover_delay_ms(), 2500);
+            assert_eq!(hover_delay_placeholder(), "2500");
 
             for unset in ["", "0", "abc"] {
                 dev_flags::seed(&settings::Settings {
                     hover_delay_ms: unset.into(),
                     ..settings::Settings::default()
                 });
-                assert_eq!(hover_delay_ms(), 1500, "{unset:?} leaves the default");
+                assert_eq!(hover_delay_ms(), 2500, "{unset:?} leaves the default");
             }
 
             dev_flags::seed(&settings::Settings {
@@ -5788,6 +6266,7 @@ mod tests {
             title: None,
             kind: None,
             content: Vec::new(),
+            marks: Vec::new(),
             input: None,
             locations: Vec::new(),
             options: Vec::new(),
@@ -5931,7 +6410,8 @@ mod tests {
 
     use fidget_core::character::{
         Character, CursorReaction, GravityScale, PackageBytes, CHARACTER_MANIFEST_FILE,
-        DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, REQUIRED_ANIMATIONS,
+        DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+        DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, REQUIRED_ANIMATIONS,
     };
 
     fn stub_character(name: &str) -> Character {
@@ -5948,6 +6428,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }
@@ -6271,7 +6754,7 @@ mod tests {
     /// button list, not a value recomputed while asserting.
     #[test]
     fn a_login_opening_carries_agent_sign_in_and_omits_it_otherwise() {
-        use agent_client_protocol::schema::v1::{AuthMethod, AuthMethodAgent, AuthMethodTerminal};
+        use agent_client_protocol::v1::schema::{AuthMethod, AuthMethodAgent, AuthMethodTerminal};
         use std::collections::HashMap;
 
         let mut roster = Roster::new();
@@ -6542,6 +7025,59 @@ mod tests {
     }
 
     #[test]
+    fn an_earlier_directory_shadows_a_later_character_of_the_same_name() {
+        let user = tempfile::tempdir().expect("temp dir");
+        let copy = user.path().join("bmo");
+        let shipped = shipped_characters().join("bmo");
+        std::fs::create_dir_all(copy.join("frames")).expect("package dir");
+        for entry in std::fs::read_dir(shipped.join("frames")).expect("frames") {
+            let frame = entry.expect("frame").path();
+            std::fs::copy(
+                &frame,
+                copy.join("frames").join(frame.file_name().expect("name")),
+            )
+            .expect("copy frame");
+        }
+        let manifest: String = std::fs::read_to_string(shipped.join("character.manifest"))
+            .expect("manifest")
+            .lines()
+            .filter(|line| !line.starts_with("render_mode"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        std::fs::write(copy.join("character.manifest"), manifest).expect("manifest");
+
+        let (art, cache) = characters_in(&[user.path().to_path_buf(), shipped_characters()]);
+        assert!(
+            !cache["BMO"].smooth,
+            "the user's pixel copy, not the shipped smooth one"
+        );
+        assert!(!art["BMO"].smooth);
+    }
+
+    #[test]
+    fn a_later_copy_stands_in_for_an_earlier_one_that_fails_to_load() {
+        let user = tempfile::tempdir().expect("temp dir");
+        let broken = user.path().join("bmo");
+        std::fs::create_dir_all(&broken).expect("package dir");
+        std::fs::copy(
+            shipped_characters().join("bmo").join("character.manifest"),
+            broken.join("character.manifest"),
+        )
+        .expect("manifest without its frames");
+
+        let (art, cache) = characters_in(&[user.path().to_path_buf(), shipped_characters()]);
+        assert!(
+            cache["BMO"].smooth,
+            "the shipped copy, since the user's has no art"
+        );
+        assert!(art["BMO"].smooth);
+        assert!(
+            cache.contains_key("Buddy Bot"),
+            "every other Character still loads"
+        );
+    }
+
+    #[test]
     fn an_installed_character_is_the_one_that_starts() {
         let chosen = choose_character(&[shipped_characters()], Some(OsStr::new("bmo")))
             .expect("bmo is shipped");
@@ -6569,11 +7105,25 @@ mod tests {
 
     /// A rebound hide hotkey must register the letter the user named, not B.
     #[test]
-    fn a_rebound_spec_registers_its_letter() {
-        let shortcut = shortcut_from_spec("Control-Shift-H").expect("parses");
+    fn a_rebound_hotkey_registers_its_letter() {
+        let shortcut = shortcut_from_hotkey(&settings::Hotkey {
+            control: true,
+            option: false,
+            shift: true,
+            command: false,
+            key: 'H',
+        });
         assert_eq!(shortcut.key, Code::KeyH);
-        let shipped = shortcut_from_spec(settings::DEFAULT_HIDE_HOTKEY).expect("default");
+        let shipped = shortcut_from_hotkey(&settings::DEFAULT_HIDE_HOTKEY);
         assert_eq!(shipped.key, Code::KeyB);
+        let unsupported = settings::Hotkey {
+            control: false,
+            option: false,
+            shift: true,
+            command: false,
+            key: '1',
+        };
+        assert_eq!(shortcut_from_hotkey(&unsupported), shipped);
     }
 
     /// A 2x2 RGBA frame whose top-left pixel is transparent.
@@ -6648,8 +7198,8 @@ mod tests {
         }
     }
 
-    /// `character` copies this string onto the wire. Encoding it on each invoke
-    /// is 90–118 ms on the main thread in a debug build (as of 2026-10).
+    /// `character` copies this string onto the wire, encoded once by the first
+    /// call: the art does not change while the app runs.
     #[test]
     fn characters_response_matches_the_json_of_the_bundled_art() {
         let characters = bundled_character_art();
@@ -6668,7 +7218,7 @@ mod tests {
             );
         }
         let expected = serde_json::json!({ "characters": named });
-        let response = character_response(&encode_art_json(&ArtUrls { characters }));
+        let response = character_response(&ArtJson::new(ArtUrls { characters }));
         let body: serde_json::Value =
             serde_json::from_str(&character_json_body(response)).expect("character returns JSON");
         assert_eq!(body, expected);
@@ -7045,6 +7595,87 @@ mod tests {
         );
     }
 
+    /// The bar's push rides on status equality, so a source-only change is
+    /// one push, and its key is the stable spelling the renderer maps.
+    #[test]
+    fn the_status_names_the_animation_source_by_a_stable_key() {
+        let mut frame =
+            fidget_core::engine::Engine::new(Point { x: 0.0, y: 0.0 }).tick(&Default::default());
+        let keys = [
+            (AnimationSource::IdleLoop, "idle_loop"),
+            (AnimationSource::Engine, "engine"),
+            (AnimationSource::LocalDirector, "local_director"),
+            (AnimationSource::AiRequested, "ai_requested"),
+            (AnimationSource::AiMcp, "ai_mcp"),
+            (AnimationSource::UserInvoked, "user_invoked"),
+            (AnimationSource::AiFeedback, "ai_feedback"),
+            (AnimationSource::Onboarding, "onboarding"),
+        ];
+        let mut seen = Vec::new();
+        for (source, key) in keys {
+            frame.animation_source = source;
+            // A variant or a Left Strip draws another name than the one asked.
+            let status = chat_status(&frame, "fall-left", None, false);
+            let pushed = serde_json::to_value(ChatStatusPush {
+                status: &status,
+                wake_ms: None,
+            })
+            .expect("a status serializes");
+            assert_eq!(pushed["source"], key, "{source:?}");
+            assert!(
+                !seen.contains(&status),
+                "{source:?} must differ from every other source's status"
+            );
+            seen.push(status);
+        }
+        frame.animation_source = AnimationSource::Engine;
+        assert!(
+            chat_status(&frame, "fall", None, false) == chat_status(&frame, "fall", None, false),
+            "an unchanged status is no new push"
+        );
+    }
+
+    fn said(text: &str) -> Dialogue {
+        Dialogue {
+            text: text.to_string(),
+            source: AnimationSource::AiRequested,
+        }
+    }
+
+    /// The carried line keeps the source it was said with. The same words
+    /// from another producer are a new pulse, since nothing deduplicates text.
+    #[test]
+    fn a_carried_line_replays_with_the_source_it_was_said_with() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let toured = Dialogue {
+            text: "hi".to_string(),
+            source: AnimationSource::Onboarding,
+        };
+        let mut spoken = None;
+        draw_response(&mut spoken, Some(&said("hi")), Some(0), true, t0);
+        assert_eq!(
+            draw_response(&mut spoken, Some(&toured), Some(0), true, at(1)),
+            Some(toured.clone()),
+            "the same text again is a new pulse, and replaces the source"
+        );
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(1), true, at(2)),
+            Some(toured.clone()),
+            "the new owner hears the stored line with its stored source"
+        );
+
+        let mut spoken = None;
+        draw_response(&mut spoken, Some(&toured), Some(0), false, t0);
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(0), true, at(1)),
+            Some(toured),
+            "an unheard line keeps its source until the page listens"
+        );
+        let late = t0 + CARRY_WINDOW + Duration::from_secs(1);
+        assert_eq!(draw_response(&mut spoken, None, Some(1), true, late), None);
+    }
+
     /// A line said on one display and carried across the seam is said
     /// again to the new owner, once, while it could still be showing — and
     /// never to the owner that already heard it.
@@ -7054,30 +7685,59 @@ mod tests {
         let mut spoken = None;
 
         assert_eq!(
-            carry_line(&mut spoken, Some("Yare yare daze."), Some(0), t0).as_deref(),
+            draw_response(
+                &mut spoken,
+                Some(&said("Yare yare daze.")),
+                Some(0),
+                true,
+                t0
+            )
+            .map(|line| line.text)
+            .as_deref(),
             Some("Yare yare daze."),
             "the pulse itself goes to the owner of the tick"
         );
         assert_eq!(
-            carry_line(&mut spoken, None, Some(0), t0 + Duration::from_secs(1)),
+            draw_response(
+                &mut spoken,
+                None,
+                Some(0),
+                true,
+                t0 + Duration::from_secs(1)
+            ),
             None,
             "the same owner is not told twice"
         );
         assert_eq!(
-            carry_line(&mut spoken, None, Some(1), t0 + Duration::from_secs(2)).as_deref(),
+            draw_response(
+                &mut spoken,
+                None,
+                Some(1),
+                true,
+                t0 + Duration::from_secs(2)
+            )
+            .map(|line| line.text)
+            .as_deref(),
             Some("Yare yare daze."),
             "mid-reading, the new owner is told the line"
         );
         assert_eq!(
-            carry_line(&mut spoken, None, Some(1), t0 + Duration::from_secs(3)),
+            draw_response(
+                &mut spoken,
+                None,
+                Some(1),
+                true,
+                t0 + Duration::from_secs(3)
+            ),
             None,
             "and then not again while it stays there"
         );
         assert_eq!(
-            carry_line(
+            draw_response(
                 &mut spoken,
                 None,
                 Some(0),
+                true,
                 t0 + CARRY_WINDOW + Duration::from_secs(1)
             ),
             None,
@@ -7085,22 +7745,65 @@ mod tests {
         );
 
         let mut spoken = None;
-        carry_line(&mut spoken, Some("first"), Some(0), t0);
+        draw_response(&mut spoken, Some(&said("first")), Some(0), true, t0);
         assert_eq!(
-            carry_line(
+            draw_response(
                 &mut spoken,
-                Some("second"),
+                Some(&said("second")),
                 Some(0),
+                true,
                 t0 + Duration::from_secs(1)
             )
+            .map(|line| line.text)
             .as_deref(),
             Some("second"),
             "a new line replaces the remembered one"
         );
         assert_eq!(
-            carry_line(&mut spoken, None, Some(1), t0 + Duration::from_secs(2)).as_deref(),
+            draw_response(
+                &mut spoken,
+                None,
+                Some(1),
+                true,
+                t0 + Duration::from_secs(2)
+            )
+            .map(|line| line.text)
+            .as_deref(),
             Some("second"),
             "and it is the new line that crosses"
+        );
+    }
+
+    /// Production change that would fail this: a reply line pulsed to an
+    /// overlay page that isn't listening yet and never pulsed again (#2037).
+    #[test]
+    fn a_reply_said_before_the_page_listens_is_shown_once_it_listens() {
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let mut spoken = None;
+        assert_eq!(
+            draw_response(&mut spoken, Some(&said("hi")), Some(0), false, t0),
+            None
+        );
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(0), false, at(1)),
+            None
+        );
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(0), true, at(2))
+                .map(|line| line.text)
+                .as_deref(),
+            Some("hi")
+        );
+        assert_eq!(draw_response(&mut spoken, None, Some(0), true, at(3)), None);
+
+        let mut spoken = None;
+        draw_response(&mut spoken, Some(&said("hi")), Some(0), false, t0);
+        let late = t0 + CARRY_WINDOW + Duration::from_secs(1);
+        assert_eq!(
+            draw_response(&mut spoken, None, Some(0), true, late),
+            None,
+            "a page that listens after the line would have expired never shows it"
         );
     }
 
@@ -7109,13 +7812,73 @@ mod tests {
         let t0 = Instant::now();
         let mut spoken = None;
 
-        let dialogue = carry_line(&mut spoken, Some("hello there"), Some(0), t0);
+        let dialogue = draw_response(&mut spoken, Some(&said("hello there")), Some(0), true, t0);
 
         assert_eq!(
-            dialogue.as_deref(),
+            dialogue.map(|line| line.text).as_deref(),
             Some("hello there"),
-            "under DND, dialogue still reaches carry_line and the bubble"
+            "under DND, dialogue still reaches draw_response and the bubble"
         );
+    }
+
+    #[test]
+    fn a_launch_instance_waits_for_its_overlay_to_draw_then_runs_for_good() {
+        let tick = Duration::from_millis(16);
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        assert!(!hold.runs("bmo", tick, false, true), "not drawn: no time");
+        assert!(!hold.runs("bmo", tick, false, true));
+        assert!(
+            hold.runs("bmo", tick, true, true),
+            "the draw releases it on that tick"
+        );
+        assert_eq!(hold, FirstDraw::Running);
+        assert!(
+            hold.runs("bmo", tick, false, true),
+            "a reload's lost witness re-holds nothing"
+        );
+    }
+
+    #[test]
+    fn a_launch_instance_nobody_can_see_does_not_wait() {
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        assert!(hold.runs("bmo", Duration::from_millis(16), false, false));
+        assert_eq!(hold, FirstDraw::Running);
+    }
+
+    #[test]
+    fn a_draw_that_never_comes_releases_at_the_ceiling() {
+        let mut hold = FirstDraw::Waiting {
+            held: Duration::ZERO,
+        };
+        let tick = Duration::from_millis(100);
+        let waited = (0..)
+            .take_while(|_| !hold.runs("bmo", tick, false, true))
+            .count();
+        assert_eq!(tick * waited as u32 + tick, FIRST_DRAW_CEILING);
+        assert_eq!(hold, FirstDraw::Running);
+    }
+
+    #[test]
+    fn a_summoned_instance_never_waits() {
+        assert!(FirstDraw::Running.runs("bmo", Duration::from_millis(16), false, true));
+    }
+
+    /// One overlay drawing one Character does not release another Instance
+    /// whose art it has not decoded yet.
+    #[test]
+    fn a_draw_counts_only_for_the_instance_and_overlay_that_reported_it() {
+        let label = "overlay-drew-test";
+        super::platform::set_overlay_drew(label, "first-drawn");
+        assert!(super::platform::overlay_drew(label, "first-drawn"));
+        assert!(!super::platform::overlay_drew(label, "not-yet-drawn"));
+        assert!(!super::platform::overlay_drew(
+            "overlay-other-test",
+            "first-drawn"
+        ));
     }
 
     /// Every overlay is told about every Instance, and only the
@@ -7146,6 +7909,7 @@ mod tests {
             thinking: true,
             asking: true,
             hovered: true,
+            menu_open: true,
             cue: Some(Cue::Drop),
             contact: Some(fidget_core::engine::RippleContact {
                 point: fidget_core::engine::Point {
@@ -7156,11 +7920,20 @@ mod tests {
             }),
             owner: Some(1),
             qm: None,
+            possessed: true,
+            paused: false,
+            charge: None,
+            digits: vec!["nod-off".to_string(), "wave".to_string()],
             mask: fidget_core::overlay::AlphaMask::from_png(PATCHY, 128)
                 .expect("the 2x2 fixture decodes"),
         };
 
         let owner = SpritePlacement::new(&placed, right, 1);
+        assert_eq!(
+            owner.digits,
+            ["nod-off".to_string(), "wave".to_string()],
+            "the card numbers the list the shell mapped"
+        );
         assert_eq!(owner.dialogue.as_deref(), Some("Yare yare daze."));
         assert!(owner.thinking);
         assert!(owner.asking);
@@ -7177,6 +7950,10 @@ mod tests {
         );
 
         let elsewhere = SpritePlacement::new(&placed, left, 0);
+        assert!(
+            elsewhere.digits.is_empty(),
+            "one card, on the display that owns the bubble"
+        );
         assert_eq!(elsewhere.dialogue, None, "no line to latch off the owner");
         assert!(!elsewhere.thinking, "no indicator to arm off the owner");
         assert!(
@@ -7202,6 +7979,8 @@ mod tests {
             !elsewhere.hovered,
             "or a second display opens its own pill and takes the keyboard"
         );
+        assert!(owner.menu_open, "the pill's overlay knows the menu is open");
+        assert!(!elsewhere.menu_open, "like the hover it suspends");
 
         assert_eq!(
             (elsewhere.animation, elsewhere.frame_index, elsewhere.mirror),
@@ -7247,10 +8026,15 @@ mod tests {
             thinking: false,
             asking: false,
             hovered: false,
+            menu_open: false,
             cue: None,
             contact: None,
             owner: Some(1),
             qm: Some(draft.clone()),
+            possessed: false,
+            paused: false,
+            charge: None,
+            digits: Vec::new(),
             mask: fidget_core::overlay::AlphaMask::from_png(PATCHY, 128)
                 .expect("the 2x2 fixture decodes"),
         };
@@ -7542,7 +8326,6 @@ mod tests {
         Announce,
         ShutdownHarness,
         CloseWebview,
-        CloseWindow,
         ExitEventLoop,
         ExitProcess,
     }
@@ -7560,25 +8343,12 @@ mod tests {
         fn close_webview(&mut self) {
             self.0.push(Recorded::CloseWebview);
         }
-        fn close_window(&mut self) {
-            self.0.push(Recorded::CloseWindow);
-        }
         fn exit_event_loop(&mut self) {
             self.0.push(Recorded::ExitEventLoop);
         }
         fn exit_process(&mut self) {
             self.0.push(Recorded::ExitProcess);
         }
-    }
-
-    /// The recorder has to be able to name a window close, or the quit test
-    /// could not tell that path from `Webview::close`.
-    #[test]
-    fn the_recorder_names_a_window_close_separately_from_a_webview_close() {
-        let mut host = Recording::default();
-        host.close_window();
-        host.close_webview();
-        assert_eq!(host.0, vec![Recorded::CloseWindow, Recorded::CloseWebview]);
     }
 
     fn recorded(orderly: bool, already: bool) -> Vec<Recorded> {

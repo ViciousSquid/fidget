@@ -257,7 +257,7 @@ pub fn endpoint_from(settings: &DirectorSettings) -> Option<Endpoint> {
         url: completions_url(&settings.base_url),
         model: settings.model.clone(),
         timeout: timeout_for(),
-        max_tokens: max_tokens_for(),
+        max_tokens: max_tokens(),
         cap_pinned: crate::dev_flags::director_max_tokens().is_some(),
         effort: effort_for(),
         session: Mutex::new(Session::default()),
@@ -425,7 +425,7 @@ fn timeout_for() -> Duration {
 /// The cap a turn goes out with, before `wire_budget` may swap in the think
 /// ceiling. Decided in `dev_flags::seed`, like the timeout, where a zero cap
 /// counts as unset because it leaves no room to answer.
-fn max_tokens_for() -> u32 {
+fn max_tokens() -> u32 {
     crate::dev_flags::director_max_tokens().unwrap_or(TURN_CEILING)
 }
 
@@ -856,7 +856,7 @@ impl Endpoint {
                 "{url}: streamed reply had no text content"
             ))),
             Streamed::Truncated(what) => {
-                // Parseable is the one `Truncation` that is still Speech: a full Behavior
+                // Parseable is the one `Truncation` that is still Dialogue: a full Behavior
                 // / sayable line, marked. The other three are Unsent.
                 if let Truncation::Parseable(content) = what {
                     Ok(Reply::truncated(content))
@@ -1467,18 +1467,18 @@ impl Unsent {
 }
 
 /// What arrived when the Completer hit the token cap. A variant per outcome, so
-/// Speech policy is a match, not a pile of emptiness checks. Marked reasoning
-/// is routed later; nothing here dumps thinking into Speech.
+/// Dialogue policy is a match, not a pile of emptiness checks. Marked reasoning
+/// is routed later; nothing here dumps thinking into Dialogue.
 #[derive(Debug, PartialEq, Eq)]
 enum Truncation {
-    /// Marked reasoning, no answer text. Action Log only. Never Speech.
+    /// Marked reasoning, no answer text. Action Log only. Never Dialogue.
     ThinkingOnly,
     /// Answer text that still parses to a Behavior / sayable line. Spoken
     /// and marked. The other three rows are refused.
     Parseable(String),
     /// Answer started but will not parse, so it is neither spoken nor half-parsed.
     MidSentence(String),
-    /// Bytes in `content` with no reasoning mark. Not Speech. No v1
+    /// Bytes in `content` with no reasoning mark. Not Dialogue. No v1
     /// heuristic onto the Thinking row.
     Unmarked(String),
 }
@@ -2355,7 +2355,7 @@ pub(crate) mod tests {
         Some(String::from_utf8_lossy(&body).to_string())
     }
 
-    /// The Model API Director's Speech reaches the bubble delta by delta,
+    /// The Model API Director's Dialogue reaches the bubble delta by delta,
     /// and the Behavior name never does.
     #[test]
     fn a_model_api_answer_is_spoken_as_its_deltas_land() {
@@ -2370,7 +2370,7 @@ pub(crate) mod tests {
         let heard = std::cell::RefCell::new(Vec::new());
 
         let woken = director.wake_request(
-            director.request(&crate::completer::tests::wake_context()),
+            director.request(&crate::completer::tests::wake_context(), None),
             &|line| heard.borrow_mut().push(line),
         );
 
@@ -2380,6 +2380,8 @@ pub(crate) mod tests {
             fidget_core::director::Wake::Proposed(fidget_core::engine::BehaviorProposal {
                 behavior: "stroll".to_string(),
                 dialogue: Some("hey there".to_string()),
+                direction: None,
+                source: fidget_core::engine::AnimationSource::AiRequested,
             })
         );
     }
@@ -2758,7 +2760,7 @@ pub(crate) mod tests {
     /// Which half of the wire a delta is, one shape at a time. Every field
     /// name here is one a server in scope sends.
     #[test]
-    fn a_marked_reasoning_delta_is_a_thought_and_content_is_still_speech() {
+    fn a_marked_reasoning_delta_is_a_thought_and_content_is_still_dialogue() {
         let read = |payload| {
             let event = read_event(payload);
             (event.thought, event.delta)
@@ -3077,7 +3079,7 @@ pub(crate) mod tests {
 
     /// Best effort is the `Truncation` table, not "any nonempty string". Thinking
     /// only and unparsable cuts stay Unsent. A parseable Behavior is spoken and
-    /// marked. Unmarked content is not Speech and is not heuristically split.
+    /// marked. Unmarked content is not Dialogue and is not heuristically split.
     #[test]
     fn a_truncation_follows_the_best_effort_table() {
         let endpoint = Endpoint {
@@ -3125,7 +3127,7 @@ pub(crate) mod tests {
             )),
         );
         let Err(Unsent::Truncated(why)) = unmarked else {
-            panic!("unmarked thinking is not Speech");
+            panic!("unmarked thinking is not Dialogue");
         };
         assert!(
             why.contains("unmarked content") && why.contains("not spoken"),
@@ -3199,7 +3201,7 @@ pub(crate) mod tests {
     }
 
     /// Anthropic `/v1/messages` names the cap `stop_reason: "max_tokens"`. Empty
-    /// text at that stop is ThinkingOnly, never Speech, and the thinking was on the
+    /// text at that stop is ThinkingOnly, never Dialogue, and the thinking was on the
     /// strip while it was spent.
     #[test]
     fn an_anthropic_max_tokens_stop_is_a_truncation() {
@@ -3236,7 +3238,7 @@ pub(crate) mod tests {
     }
 
     /// Whole-body Qwen: thought in `content`, no reasoning field, `length`.
-    /// Not Speech, and not a thought-strip heuristic.
+    /// Not Dialogue, and not a thought-strip heuristic.
     #[test]
     fn an_unmarked_whole_body_length_finish_is_not_spoken() {
         let body = r#"{"choices":[{"message":{"role":"assistant",
@@ -4232,13 +4234,13 @@ pub(crate) mod tests {
             };
             crate::dev_flags::seed(&file);
             assert_eq!(timeout_for(), Duration::from_secs(45));
-            assert_eq!(max_tokens_for(), 300);
+            assert_eq!(max_tokens(), 300);
 
             std::env::set_var(TIMEOUT_SECS, "7");
             std::env::set_var(MAX_TOKENS, "11");
             crate::dev_flags::seed(&file);
             assert_eq!(timeout_for(), Duration::from_secs(7));
-            assert_eq!(max_tokens_for(), 11);
+            assert_eq!(max_tokens(), 11);
             std::env::remove_var(TIMEOUT_SECS);
             std::env::remove_var(MAX_TOKENS);
         });
@@ -4298,14 +4300,14 @@ pub(crate) mod tests {
     }
 
     /// One guard for every wake and host. Only `THINK_CEILING` and a pinned cap
-    /// move it, each tested above. Under the env lock, as `max_tokens_for` reads
+    /// move it, each tested above. Under the env lock, as `max_tokens` reads
     /// `dev_flags` values another test sets.
     #[test]
     fn one_runaway_guard_caps_every_wake_on_every_host() {
         with_env(None, None, None, || {
             crate::dev_flags::seed(&crate::settings::Settings::default());
             assert_eq!(timeout_for(), TIMEOUT, "timeout no longer splits on URL");
-            assert_eq!(max_tokens_for(), 1024, "and the cap no longer does either");
+            assert_eq!(max_tokens(), 1024, "and the cap no longer does either");
 
             for base in ["http://localhost:11434", "https://api.openai.com"] {
                 let endpoint = endpoint_from(&resolve(base, "gemma4", Some("sk-test")))
@@ -4585,12 +4587,15 @@ pub(crate) mod tests {
         let personality =
             "Cat claimed the desktop. It has been heard to say: \"Show me that one.\"";
         let director = ModelDirector::new(Silent, ["stroll", "nap"], "fidget", "Cat", false);
-        let today = director.prompt(&Context {
-            personality: personality.to_string(),
-            happened: Happened::Poke,
-            standing: "the display floor".to_string(),
-            ..crate::completer::tests::wake_context()
-        });
+        let today = director.prompt(
+            &Context {
+                personality: personality.to_string(),
+                happened: Happened::Poke,
+                standing: "the display floor".to_string(),
+                ..crate::completer::tests::wake_context()
+            },
+            None,
+        );
 
         assert_eq!(reframed(&today, personality, Framing::Today), today);
 
@@ -4694,12 +4699,12 @@ pub(crate) mod tests {
             (Happened::Proactive, State::Grounded, "the top of the Dock"),
         ];
 
-        let (mut accepted, mut speech, mut failed) = (0usize, 0usize, 0usize);
+        let (mut accepted, mut dialogue, mut failed) = (0usize, 0usize, 0usize);
         // A reply whose first line names a declared Behavior in the wrong
         // case is the contract kept and our matcher refusing it. `knows`
         // compares exactly, so this bucket is ours, not the model's.
         let mut case_only = 0usize;
-        // Prose that is a sample line handed back. A subset of `speech`,
+        // Prose that is a sample line handed back. A subset of `dialogue`,
         // because a reply that names a Behavior kept the contract whatever
         // its dialogue borrowed.
         let mut quoted = 0usize;
@@ -4731,7 +4736,7 @@ pub(crate) mod tests {
                     accepted += 1;
                 }
                 Wake::Proposed(proposal) => {
-                    // `as_speech` hands back the whole reply, so its first
+                    // `as_dialogue` hands back the whole reply, so its first
                     // line is the name the model actually offered.
                     let said = proposal.dialogue.unwrap_or_default();
                     let offered = said
@@ -4748,7 +4753,7 @@ pub(crate) mod tests {
                     if near {
                         case_only += 1;
                     } else {
-                        speech += 1;
+                        dialogue += 1;
                         if quote.is_some() {
                             quoted += 1;
                         }
@@ -4757,7 +4762,7 @@ pub(crate) mod tests {
                         let tag = match (near, quote.is_some()) {
                             (true, _) => "case-only",
                             (false, true) => "quoted",
-                            (false, false) => "speech",
+                            (false, false) => "dialogue",
                         };
                         examples.push(format!("  {tag}: {}", said.replace('\n', " | ")));
                     }
@@ -4783,8 +4788,8 @@ pub(crate) mod tests {
             percent(case_only)
         );
         println!(
-            "  speech:     {speech:>3}  ({:.0}%)  genuine prose",
-            percent(speech)
+            "  dialogue:   {dialogue:>3}  ({:.0}%)  genuine prose",
+            percent(dialogue)
         );
         println!(
             "  quoted:     {quoted:>3}  ({:.0}%)  of it a personality sample line",
@@ -4793,7 +4798,7 @@ pub(crate) mod tests {
         println!("  failed:     {failed:>3}  ({:.0}%)", percent(failed));
         println!(
             "  the model broke the contract on {:.0}% of wakes",
-            percent(speech + failed)
+            percent(dialogue + failed)
         );
         println!("  (sampling is the server's own; runs of one model wander a few points)");
         for line in &examples {
@@ -4801,7 +4806,7 @@ pub(crate) mod tests {
         }
 
         assert_eq!(
-            accepted + case_only + speech + failed,
+            accepted + case_only + dialogue + failed,
             wakes,
             "every wake lands in exactly one bucket"
         );

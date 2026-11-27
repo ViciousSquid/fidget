@@ -39,14 +39,14 @@ weight = 80
 [animations.sing]
 frames = ["frames/sing-0.png", "frames/sing-1.png", "frames/sing-2.png", "frames/sing-3.png"]
 fps = 3
-variant_of = "idle"
+variant_of = "idle-gesture"
 
 # Cruise, push, cruise, cheer — the bail frame stays in the pack: a board
 # that vanishes mid-loop reads as a glitch, not a trick.
 [animations.skate]
 frames = ["frames/skate-0.png", "frames/skate-1.png", "frames/skate-0.png", "frames/skate-2.png"]
 fps = 3
-variant_of = "idle"
+variant_of = "idle-gesture"
 
 # Dribbling the whole way is a mood rather than the usual walk: three plain
 # walks to each one that goes out with the football.
@@ -92,6 +92,12 @@ fps = 1
 frames = ["frames/react-0.png", "frames/react-1.png"]
 fps = 10
 loop = "once"
+
+# Possession start plays this, or `react` when a package draws none. The
+# pack's split flash: the screen breaks, then blanks.
+[animations.possessed]
+frames = ["frames/possessed-0.png", "frames/possessed-1.png"]
+fps = 6
 
 # Gesture and rest: talking hands, standing up. The pack's grinning
 # lean-back frames read as sitting and were mistaken for the sit.
@@ -157,5 +163,20 @@ when = "idle under 10s"
 # stand in for one. Still declared, so a Director can still ask for it. #490.
 [behaviors.jump]
 play = ["jump"]
+weight = 0
+when = "idle over 10s"
+
+# The fall is drawn turned the other way from the rest.
+[frame_facing]
+"frames/fall-0.png" = "left"
+"frames/fall-1.png" = "left"
+
+[behaviors.skate]
+play = ["skate"]
+weight = 0
+when = "idle over 10s"
+
+[behaviors.sing]
+play = ["sing"]
 weight = 0
 when = "idle over 10s"

@@ -55,7 +55,7 @@ const promptConfirm = document.getElementById("prompt-confirm");
 const promptCancel = document.getElementById("prompt-cancel");
 
 const cells = Object.fromEntries(
-  ["behavior", "primitive", "animation", "state", "facing", "director", "happened"].map(
+  ["behavior", "primitive", "animation", "state", "facing", "director", "happened", "source"].map(
     (name) => [name, document.getElementById(`s-${name}`)],
   ),
 );
@@ -81,6 +81,8 @@ function paint() {
   const drawn = statusCells(status, left);
   for (const [name, node] of Object.entries(cells)) {
     node.textContent = drawn[name];
+    // A narrow Chat ellipsizes a long value; hovering reads it whole.
+    node.title = drawn[name];
   }
   plainEl.textContent = plainStatus(status, left);
 }
@@ -165,7 +167,7 @@ function said(who, text, cls, at) {
   return add(row);
 }
 
-// A turn's answer, opened empty with a blinking caret. Speech updates grow
+// A turn's answer, opened empty with a blinking caret. Dialogue updates grow
 // the row via replaceReply, and the caret stays until the final reply lands.
 function opening_answer() {
   const row = said(them, "", "them");
@@ -502,6 +504,7 @@ const applyChatAppearance = mountChatAppearance(document.documentElement);
 // or the child never came up. The composer is disabled rather than hidden so
 // it reads as waiting, and method buttons rebuild so a dropped one cannot linger.
 const retry = document.getElementById("landing-retry");
+let signingIn = false;
 
 function setPickersDisabled(disabled) {
   for (const btn of document.querySelectorAll(".connect-btn")) {
@@ -518,6 +521,8 @@ function paintSignIn(actions, waiting) {
     button.className = "sign-in-btn";
     button.textContent = action.label;
     button.addEventListener("click", () => {
+      if (signingIn) return;
+      signingIn = true;
       const pending = document.createElement("p");
       pending.className = "hint sign-in-waiting";
       drawInline(pending, waiting);
@@ -529,6 +534,7 @@ function paintSignIn(actions, waiting) {
       invoke("sign_in", { instance, methodId: action.id })
         .catch((why) => note(String(why)))
         .finally(() => {
+          signingIn = false;
           pending.remove();
           button.disabled = false;
           retry.disabled = false;
@@ -789,6 +795,12 @@ promptConfirm.addEventListener("click", () => {
     });
 });
 
+function paintOpening(opening) {
+  showWho(opening);
+  attached(opening);
+  showPrompt(opening);
+}
+
 function showWho(opening) {
   them = opening.name;
   document.getElementById("name").textContent = opening.name;
@@ -934,7 +946,7 @@ function toolPiece(piece) {
       }) · full diff not drawn`;
       break;
     case "terminal":
-      line.textContent = `Terminal ${piece.id}`;
+      line.textContent = piece.label;
       break;
     case "mark":
       drawThought(line, piece.markdown);
@@ -1175,7 +1187,7 @@ async function start() {
       } else {
         hearPhase({ type: "news", at: Date.now() });
       }
-      if (outcome.action === "speech") {
+      if (outcome.action === "dialogue") {
         arrived(turn.them, outcome.said);
         if (!payload.streaming && outcome.reacting_to) {
           const label = turn.them.querySelector(".who-label");
@@ -1187,7 +1199,7 @@ async function start() {
           settled(turn.them);
         }
       } else if (outcome.action === "failure") {
-        if (turn.alreadyHasSpeechAhead) {
+        if (turn.alreadyHasDialogueAhead) {
           settled(turn.them);
           note(`Harness error: ${outcome.said}`);
         } else {
@@ -1196,7 +1208,7 @@ async function start() {
           harnessError(outcome.said);
         }
       } else if (outcome.action === "error") {
-        if (turn.alreadyHasSpeechAhead) {
+        if (turn.alreadyHasDialogueAhead) {
           settled(turn.them);
           note(outcome.note);
         } else {
@@ -1211,7 +1223,7 @@ async function start() {
       } else if (outcome.action === "silent") {
         settled(turn.them);
       } else {
-        if (turn.alreadyHasSpeechAhead) {
+        if (turn.alreadyHasDialogueAhead) {
           settled(turn.them);
         } else {
           endPhase(turn.them);
@@ -1331,9 +1343,7 @@ async function start() {
   await listen(
     "chat-opening",
     ({ payload }) => {
-      showWho(payload);
-      attached(payload);
-      showPrompt(payload);
+      paintOpening(payload);
     },
     { target: chat.label },
   );
@@ -1381,9 +1391,19 @@ async function start() {
   applyPlatform(document.documentElement, opening.platform);
   applyChatAppearance(opening.chat_appearance);
 
-  showWho(opening);
-  attached(opening);
-  showPrompt(opening);
+  paintOpening(opening);
+  await listen(
+    "tauri://focus",
+    async () => {
+      try {
+        const opening = await invoke("chat_opening", { instance });
+        if (!signingIn) paintOpening(opening);
+      } catch (why) {
+        console.error("chat: this opening could not be refreshed:", why);
+      }
+    },
+    { target: chat.label },
+  );
   line.focus();
 }
 

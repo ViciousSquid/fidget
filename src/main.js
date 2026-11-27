@@ -9,7 +9,20 @@ import {
   placeBubble,
   readableBubbleRect,
 } from "./bubble.js";
+import { mountChatAppearance } from "./chat-appearance.js";
+import { applyChatUiClass } from "./chat-ui-class.js";
 import { createCueMachine, cueAnchor, cueIo } from "./cue.js";
+import { possessionEdge } from "./possession-keys.js";
+import {
+  chargeFill,
+  draggedTo,
+  paintPossession,
+  placePossession,
+  possessionBounds,
+  possessionCard,
+  possessionRects,
+  wirePossessionCard,
+} from "./possession-card.js";
 import {
   CONNECT_HINT,
   applyQuickMessageGate,
@@ -28,6 +41,8 @@ const stage = document.getElementById("stage");
 // per platform lane, because it is the side that knows. False until `start`
 // asks, which is the safe way to be wrong.
 let clickableOffArt = false;
+// True while any sprite on this overlay is possessed, paused or not.
+let possessed = false;
 
 // Every Character's art as data: URLs, keyed by Character name and fetched
 // once. Art, not state, and one entry however many Instances draw from it.
@@ -42,6 +57,9 @@ let petDrag = null;
 let gestureActive = false;
 // The pill's dwell in ms, from the latest frame, so a Settings change lands on the next hover.
 let hoverDelayMs;
+// The shell's usable area for this overlay, in overlay coordinates. Absent
+// until the first frame, and then the card is inset from the menu bar.
+let workArea = null;
 
 const views = new Map();
 
@@ -101,6 +119,8 @@ function createView(id) {
   // written every tick, not by append order, which would put the first-seen
   // Instance at the back and send a reappearing id to the front.
   stage.append(bubble, sprite, cueLayer);
+  // A ghost's flight is reported when it is drawn and dropped when it is reaped.
+  new MutationObserver(reportOverlayRects).observe(cueLayer, { childList: true });
 
   const view = {
     id,
@@ -151,7 +171,7 @@ function createView(id) {
     };
   }
 
-  // One element in one of two modes makes bubble.js's rule (speech and the
+  // One element in one of two modes makes bubble.js's rule (the speech mode and the
   // indicator never coincide) true of the pixels. Only opacity gates it: an exit
   // timed by `fade_ms`, the Character's presence fade, kept dismissed bubbles up.
   function show(mode) {
@@ -178,7 +198,7 @@ function createView(id) {
   // Anchored when the cue fires rather than followed afterwards: a cue is a
   // burst where the gesture landed, and the sprite it marks may be halfway to
   // the cursor before it fades.
-  view.cues = createCueMachine(cueIo(cueLayer, () => cueAnchor(view.latest)));
+  view.cues = createCueMachine(cueIo(cueLayer, () => cueAnchor(view.latest), sprite));
 
   view.bubbles = createBubbleMachine({
     showSpeech(text, cutOff) {
@@ -214,7 +234,7 @@ function createView(id) {
     },
     showThinking() {
       // The same box in the other mode. main.css hides the control outside
-      // speech, so the attribute left over from the last line draws nothing.
+      // the speech mode, so the attribute left over from the last line draws nothing.
       show("thinking");
       traceBubble(`showThinking instance=${id}`);
     },
@@ -264,6 +284,71 @@ function speechRect(view) {
     width: view.bubble.offsetWidth,
     height: view.bubble.offsetHeight,
   };
+}
+
+const CHARGE_BAR_PX = 8;
+const POSSESSION_GAP_PX = 8;
+
+function chargeRectFor(fill, placed) {
+  if (fill == null) return null;
+  return [placed.bar.x, placed.bar.y, placed.bar.width, placed.bar.height];
+}
+
+function positionPossession(view, latest) {
+  const model = possessionCard({
+    possessed: Boolean(latest.possessed),
+    paused: Boolean(latest.paused),
+    digits: latest.digits,
+  });
+  const fill = chargeFill(latest.charge);
+  const rebuilt = paintPossession(view.card, view.bar, model, fill);
+  if (!model) {
+    view.cardSize = null;
+    view.possessionRect = null;
+    view.chargeRect = null;
+    view.possessionSeat = null;
+    view.cardAt = null;
+    view.cardFrom = null;
+    reportOverlayRects();
+    return;
+  }
+  const bounds = possessionBounds(workArea, currentDisplayBounds());
+  const seat = view.possessionSeat;
+  const sameSeat =
+    seat &&
+    seat.x === bounds.x &&
+    seat.y === bounds.y &&
+    seat.width === bounds.width &&
+    seat.height === bounds.height &&
+    seat.paused === model.paused &&
+    seat.at === view.cardAt;
+  // Skip the measure: a charge tick only widens the fill. Still publish the
+  // bar. Windows clips to the reported region, so a bar that appears after
+  // the card is seated stays invisible until its rect is sent.
+  if (!rebuilt && sameSeat && view.cardSize?.width) {
+    const placed = placePossession(view.cardSize, CHARGE_BAR_PX, POSSESSION_GAP_PX, bounds, view.cardAt);
+    view.chargeRect = chargeRectFor(fill, placed);
+    return;
+  }
+  if (rebuilt || !view.cardSize?.width) {
+    view.cardSize = { width: view.card.offsetWidth, height: view.card.offsetHeight };
+  }
+  const placed = placePossession(view.cardSize, CHARGE_BAR_PX, POSSESSION_GAP_PX, bounds, view.cardAt);
+  view.card.style.transform = `translate(${placed.card.x}px, ${placed.card.y}px)`;
+  view.bar.style.transform = `translate(${placed.bar.x}px, ${placed.bar.y}px)`;
+  view.bar.style.width = `${placed.bar.width}px`;
+  view.possessionSeat = {
+    x: bounds.x,
+    y: bounds.y,
+    width: bounds.width,
+    height: bounds.height,
+    paused: model.paused,
+    at: view.cardAt,
+  };
+  view.possessionRect = [placed.card.x, placed.card.y, view.cardSize.width, view.cardSize.height];
+  view.chargeRect = chargeRectFor(fill, placed);
+  reportOverlayRects();
+  traceBubble(`possession card at (${placed.card.x},${placed.card.y}) ${view.cardSize.width}x${view.cardSize.height} paused=${model.paused}`);
 }
 
 function positionQuick(view, spriteRect) {
@@ -388,6 +473,36 @@ function syncQuick(view) {
   arm();
 }
 
+// Possession, Do Not Disturb, the Character leaving the screen, or one tick
+// of `aside`. The next hover is the pointer already here, so the pill stays
+// down. The first frame only records the mode.
+function noteQuickMessageMode(view, sprite, payload) {
+  const mode = {
+    possessed: Boolean(sprite.possessed),
+    dnd: Boolean(payload.do_not_disturb),
+    visible: payload.visible !== false,
+  };
+  const prev = view.mode;
+  view.mode = mode;
+  const chose =
+    payload.aside ||
+    (prev &&
+      (mode.possessed !== prev.possessed ||
+        mode.dnd !== prev.dnd ||
+        (prev.visible && !mode.visible)));
+  if (chose) view.quickMachine.aside();
+}
+
+// The card and its bar are app chrome, so they wear the Chat UI and
+// Light/Dark the Shell sends on every frame. Repainted only on a change.
+function noteChatUi(view, payload) {
+  const key = `${payload.chat_ui}/${payload.chat_appearance}`;
+  if (view.chatUiKey === key) return;
+  view.chatUiKey = key;
+  for (const el of [view.card, view.bar]) applyChatUiClass(el, payload.chat_ui);
+  for (const apply of view.chatAppearance) apply(payload.chat_appearance);
+}
+
 // Click-through can drop the pointerleave. The next frame still knows the
 // cursor is gone, because :hover is clear once the window ignores it.
 // Runs before the pill is up too: a leave during the dwell cancels it.
@@ -467,6 +582,38 @@ function attachQuickMessage(view, id) {
   view.quick = quick;
   view.quickField = field;
   view.quickMirror = mirror;
+
+  const card = document.createElement("div");
+  card.className = "possession";
+  const bar = document.createElement("div");
+  bar.className = "possession-charge";
+  const charge = document.createElement("div");
+  charge.className = "possession-charge-fill";
+  bar.append(charge);
+  for (const el of [card, bar]) el.dataset.desktopBlur = "none";
+  wirePossessionCard(card, window.__TAURI__.core.invoke, {
+    move(dx, dy) {
+      const seat = view.possessionSeat;
+      if (!view.possessionRect || !seat) return;
+      const [x, y] = view.possessionRect;
+      view.cardFrom ??= { x, y };
+      view.cardAt = draggedTo(view.cardFrom, dx, dy, view.cardSize, seat);
+      positionPossession(view, view.latest);
+    },
+    drop() {
+      view.cardFrom = null;
+      reportOverlayRects();
+    },
+  });
+  stage.append(card, bar);
+  view.card = card;
+  view.bar = bar;
+  view.chatUiKey = null;
+  view.chatAppearance = [card, bar].map((el) => mountChatAppearance(el));
+  view.possessionRect = null;
+  view.cardAt = null;
+  view.cardFrom = null;
+  view.chargeRect = null;
 
   let machine;
   machine = createQuickMessage({
@@ -559,6 +706,18 @@ function reportOverlayRects() {
     if (view.hotspot) push(view.hotspot, true);
     if (view.quickHotspot) push(view.quickHotspot, true);
     if (view.bubbleRect) push(view.bubbleRect, false);
+    // The card stays where it was put. `follows` would sweep its rect along
+    // the sprite's trail. Mid-drag the whole usable area takes the pointer, so
+    // a drag that outruns the card does not fall through to the desktop.
+    const seat = view.possessionSeat;
+    const card = view.cardFrom && seat ? [seat.x, seat.y, seat.width, seat.height] : view.possessionRect;
+    for (const part of possessionRects(card, view.chargeRect)) {
+      rects.push({ rect: part.rect, clickable: part.clickable });
+    }
+    // Stays put: the ghost flies to where the sprite was when the cue drew.
+    for (const cue of view.cueLayer.children) {
+      if (cue.flight) rects.push({ rect: cue.flight, clickable: false, see_through: true });
+    }
   }
   const serialized = JSON.stringify(rects);
   if (serialized === reportedRects) return;
@@ -579,6 +738,8 @@ function removeView(id) {
   view.sprite.remove();
   view.bubble.remove();
   view.quick.remove();
+  view.card.remove();
+  view.bar.remove();
   view.cueLayer.remove();
   views.delete(id);
   // After the view is gone, so a scan cannot still name it. dispose already
@@ -596,7 +757,12 @@ function drawView(view, now) {
   // Whole pixels, so an integer-scaled sprite is not resampled onto a fractional
   // grid by the compositor. `mirror` comes from the Shell, not the
   // heading: a Character that draws its own left strip is sent as authored.
-  view.sprite.style.transform = `translate(${spriteX}px, ${spriteY}px) scaleX(${latest.mirror})`;
+  view.sprite.style.transform = `translate(${spriteX}px, ${spriteY}px)`;
+  // The possession shake's `rotate` applies after `transform`, so the origin
+  // tracks the drawn centre, and the mirror moves to `scale` to pivot there.
+  view.sprite.style.transformOrigin = `${spriteX + latest.width / 2}px ${spriteY + latest.height / 2}px`;
+  view.sprite.style.scale = `${latest.mirror} 1`;
+  view.sprite.dataset.mirror = latest.mirror;
 
   // Carried on every frame rather than announced on change: a change announced
   // while this file was still fetching its art is a change nobody heard.
@@ -613,6 +779,9 @@ function drawView(view, now) {
     // still `.visible`, so this is cleared here as well as in `hide`.
     view.hotspot = null;
     view.bubbleRect = null;
+    view.possessionRect = null;
+    view.chargeRect = null;
+    paintPossession(view.card, view.bar, null, null);
     reportOverlayRects();
     if (view.quickMachine.visible) view.quickMachine.dismiss();
     if (latest.fade_ms === 0) {
@@ -635,7 +804,16 @@ function drawView(view, now) {
     if (view.quickMachine.visible) {
       positionQuick(view, rect);
     }
+    positionPossession(view, latest);
+  } else {
+    view.possessionRect = null;
+    view.chargeRect = null;
+    paintPossession(view.card, view.bar, null, null);
   }
+
+  // Frames arrive before the art does. Drawing now would show an art-less box
+  // and record it as drawn; the redraw after the character load fills it.
+  if (!characters[latest.character]) return;
 
   const placement = `${latest.character} ${latest.animation}#${latest.frame_index} ${latest.width}x${latest.height}`;
   if (placement === view.drawn) {
@@ -654,12 +832,29 @@ function drawView(view, now) {
   const src = art?.art[latest.animation]?.[latest.frame_index];
   if (src) {
     view.sprite.src = src;
+    tellDrew(view);
   }
   view.sprite.style.width = `${latest.width}px`;
   view.sprite.style.height = `${latest.height}px`;
   view.sprite.dataset.animation = latest.animation;
   view.sprite.dataset.frameIndex = latest.frame_index;
   view.sprite.style.visibility = "visible";
+}
+
+// The Shell holds a launch sprite's drop until the overlay under it shows its
+// spawn pose. Once per view, a frame after its own decode, so the report follows
+// that sprite's paint. A failed decode reports too: it is not worth the ceiling.
+function tellDrew(view) {
+  if (view.toldDrew) return;
+  view.toldDrew = true;
+  view.sprite
+    .decode()
+    .catch(() => {})
+    .then(() =>
+      requestAnimationFrame(() =>
+        window.__TAURI__.core.invoke("overlay_drew", { id: view.sprite.dataset.instance }).catch(console.error),
+      ),
+    );
 }
 
 // Armed rather than looping. A looping overlay keeps a CVDisplayLink running
@@ -723,44 +918,26 @@ function flushCadence() {
 }
 
 async function start() {
-  characters = (await window.__TAURI__.core.invoke("character")).characters;
-  // Caught, because the overlay is worth more than the control: an unanswered
-  // question leaves `clickableOffArt` false, where an uncaught reject would
-  // abort the rest of `start` and there would be no sprite at all.
-  try {
-    clickableOffArt = await window.__TAURI__.core.invoke(
-      "overlay_hit_tests_hotspots",
-    );
-  } catch (err) {
-    console.error("overlay_hit_tests_hotspots", err);
-  }
-  try {
-    if (await window.__TAURI__.core.invoke("overlay_traces_cadence")) cadence = [];
-  } catch (err) {
-    console.error("overlay_traces_cadence", err);
-  }
-
   // One overlay per display, each told every sprite in its own coordinates. A
   // listener with no target is an `Any` listener that tauri hands every emit,
   // so without this each display would draw whichever overlay's frame came last.
   const overlay = window.__TAURI__.webviewWindow.getCurrentWebviewWindow();
 
-  // Same event Chat's composer freezes on. Addressed here too, because
-  // emit_to the Chat label does not reach this window, and Chat may not
-  // be open when the harness settles.
-  await window.__TAURI__.event.listen(
-    "chat-opening",
-    ({ payload }) => {
-      noteQuickOpening(payload);
-    },
-    { target: overlay.label },
-  );
-
   await window.__TAURI__.event.listen(
     "frame",
     ({ payload }) => {
       hoverDelayMs = payload.hover_delay_ms;
+      const area = payload.work_area;
+      const areaMoved =
+        Boolean(area) &&
+        (workArea?.x !== area.x ||
+          workArea?.y !== area.y ||
+          workArea?.width !== area.width ||
+          workArea?.height !== area.height);
+      if (area && area.width > 0 && area.height > 0) workArea = area;
       const seen = new Set();
+
+      possessed = payload.sprites.some((sprite) => sprite.possessed);
 
       payload.sprites.forEach((sprite, index) => {
         seen.add(sprite.id);
@@ -775,10 +952,12 @@ async function start() {
         // a line clamped onto the head near a display's top stays readable.
         view.bubble.style.zIndex = `${index * 2 + 1}`;
         view.quick.style.zIndex = `${index * 2 + 2}`;
+        view.card.style.zIndex = `${index * 2 + 3}`;
+        view.bar.style.zIndex = `${index * 2 + 3}`;
         view.sprite.style.zIndex = `${index * 2}`;
         view.cueLayer.style.zIndex = `${index * 2}`;
 
-        // One overlay owns each Instance's bubble. Speech hides on its reading
+        // One overlay owns each Instance's bubble. The Speech bubble hides on its reading
         // timer, not the next frame, so the overlay that lost ownership drops its
         // bubble once, on the change, and keeps the turn so a reply still shows.
         if (!sprite.bubble && view.latest?.bubble !== false) view.bubbles.hideButKeepTurn();
@@ -809,6 +988,9 @@ async function start() {
         // The pill goes where the bubble goes, carrying the Shell's draft.
         const owned = view.quickMachine.owner;
         view.quickMachine.setOwner(sprite.bubble, sprite.qm ?? null);
+        view.quickMachine.setMenu(Boolean(sprite.menu_open));
+        noteQuickMessageMode(view, sprite, payload);
+        noteChatUi(view, payload);
         if (!owned && view.quickMachine.owner && view.quickMachine.visible) {
           // A length, not the text: a trace is no place for what was typed.
           const chars = view.quickMachine.text.length;
@@ -816,7 +998,7 @@ async function start() {
         }
         notePointerLeft(view);
 
-        if (changed && needsFrame(view)) arm();
+        if (areaMoved || (changed && needsFrame(view))) arm();
       });
 
       // An id that stopped arriving was dismissed, so its elements go. The Rust
@@ -827,6 +1009,37 @@ async function start() {
           removeView(id);
         }
       }
+    },
+    { target: overlay.label },
+  );
+  // Rust keeps a reply line until this, then sends it. Before character and
+  // the other awaits, so a reply waits only on the listener, not on them.
+  window.__TAURI__.core.invoke("overlay_listening").catch(console.error);
+
+  characters = (await window.__TAURI__.core.invoke("character")).characters;
+  // Caught, because the overlay is worth more than the control: an unanswered
+  // question leaves `clickableOffArt` false, where an uncaught reject would
+  // abort the rest of `start` and there would be no sprite at all.
+  try {
+    clickableOffArt = await window.__TAURI__.core.invoke(
+      "overlay_hit_tests_hotspots",
+    );
+  } catch (err) {
+    console.error("overlay_hit_tests_hotspots", err);
+  }
+  try {
+    if (await window.__TAURI__.core.invoke("overlay_traces_cadence")) cadence = [];
+  } catch (err) {
+    console.error("overlay_traces_cadence", err);
+  }
+
+  // Same event Chat's composer freezes on. Addressed here too, because
+  // emit_to the Chat label does not reach this window, and Chat may not
+  // be open when the harness settles.
+  await window.__TAURI__.event.listen(
+    "chat-opening",
+    ({ payload }) => {
+      noteQuickOpening(payload);
     },
     { target: overlay.label },
   );
@@ -866,10 +1079,24 @@ async function start() {
   const reportPrimary = reporter("overlay_primary");
   const reportSecondary = reporter("overlay_secondary");
   // The webview's own menu is a browser menu. Ours is native and opened
-  // from Verb::Menu once the latch above is seen.
+  // from Verb::Menu once the latch above is seen. A macOS Control-click is a
+  // primary press, so its contextmenu is what holds the dwell for that menu.
   document.addEventListener("contextmenu", (event) => {
     event.preventDefault();
+    const sprite = event.target.closest?.(".sprite");
+    for (const view of views.values()) if (sprite && view.sprite === sprite) view.quickMachine.menuPress();
   });
+  const onPossessionKey = (event) => {
+    const inField = Boolean(event.target?.closest?.("textarea, input"));
+    const edge = possessionEdge(event.key, event.repeat, event.type === "keydown", event.code, inField, possessed);
+    if (!edge) return;
+    if (possessed && !inField) event.preventDefault();
+    window.__TAURI__.core.invoke("overlay_possession_key", { key: edge.key, down: edge.down }).catch((err) => {
+      console.error("overlay_possession_key", err);
+    });
+  };
+  document.addEventListener("keydown", onPossessionKey);
+  document.addEventListener("keyup", onPossessionKey);
   petDrag = null;
   gestureActive = false;
   // A window blur is only a cue to ask the Shell once whether the overlay is
@@ -904,6 +1131,7 @@ async function start() {
       });
       break;
     }
+    if (where === "character" && event.button === 2 && owner) owner.quickMachine.menuPress();
     if (where === "character" && event.button === 0 && owner) {
       petDrag = { x: event.clientX, y: event.clientY, id: event.pointerId };
       gestureActive = true;

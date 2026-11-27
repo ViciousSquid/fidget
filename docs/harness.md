@@ -48,7 +48,7 @@ Switches read the same words as the trace variables. Any other value is a typo: 
 | `FIDGET_DIRECTOR_API_KEY` | Required for a remote provider. For a local server, set it only when the server requires auth. Empty or unset with a remote URL means Static only. |
 | `FIDGET_DIRECTOR_BASE_URL` | Provider origin. Default `https://api.openai.com`. |
 | `FIDGET_DIRECTOR_MODEL` | Model name. Leave blank or whitespace to leave the model unset: HTTP omits the `model` field, and a Harness does not set one. A non-empty value is that string on the HTTP body, or `session/set_config_option` on the first option with category `model` when the Harness lists one. |
-| `FIDGET_DIRECTOR` | The Director on or off, whatever Settings saved. Off keeps Static even with a key; on still needs a key or a local server. The window and the tray name the variable and disable the toggle. |
+| `FIDGET_DIRECTOR` | The Director on or off, whatever Settings saved. Off keeps Static even with a key; on still needs a key or a local server. Settings names the variable and disables the toggle. |
 | `FIDGET_DIRECTOR_TIMEOUT_SECS` | Timeout for one HTTP Completer request, then Static. Default 30 seconds. Raise it for a cold local server. A Harness turn uses `FIDGET_HARNESS_TURN_TIMEOUT`. |
 | `FIDGET_DIRECTOR_MAX_TOKENS` | Ceiling on one HTTP Completer turn. A safeguard against a model that will not stop, not a reply-length budget. Default 1024, or 8192 once the endpoint has been seen to mark its thinking (#606). A value here outranks both. A Harness decides its own reply length. |
 | `FIDGET_DIRECTOR_BLANK` | Blank-AI mode, same as Settings → Development → "Blank AI". Empties the built-in Personality Prompt and the app-level instructions (voice rules, behavior list, reply contract) and still sends the Instance Prompt. The Prompt tab marks emptied layers Empty. With no contract the reply is prose, spoken without acting unless the Instance Prompt asks otherwise. The Harness lane keeps a separate session for this mode. |
@@ -238,10 +238,10 @@ What each named Harness keeps under an ACP attach, measured in the [tool-class p
 |---|---|
 | `claude` | Keeps shell, web search and fetch, filesystem, and user-scope MCP plus claude.ai connectors, loads local and project MCP only when `cwd` matches, and does not list `AskUserQuestion`. |
 | `codex` | Keeps shell, web search and fetch, filesystem, the user's own MCP servers, and `request_user_input`. |
-| `copilot` | Keeps shell (`bash`, with `read_bash`, `stop_bash` and `list_bash`), filesystem (`view`, `create`, `edit`, `grep`, `glob`), `web_fetch` and no web-search tool, its subagent set (`task`, `parallel`, `search_code_subagent`, `read_agent`, `list_agents`, `write_agent`), `skill`, `sql` and `session_store_sql`, and five tools from its bundled `github-mcp-server`, and lists no ask-user tool. It takes Fidget's own MCP over HTTP, and lists Fidget's eight tools alongside its own, under an `fidget-` prefix. |
+| `copilot` | Keeps shell (`bash`, with `read_bash`, `stop_bash` and `list_bash`), filesystem (`view`, `create`, `edit`, `grep`, `glob`), `web_fetch` and no web-search tool, its subagent set (`task`, `parallel`, `search_code_subagent`, `read_agent`, `list_agents`, `write_agent`), `skill`, `sql` and `session_store_sql`, and five tools from its bundled `github-mcp-server`, and lists no ask-user tool. It takes Fidget's own MCP over HTTP, and lists Fidget's nine tools alongside its own, under an `fidget-` prefix. |
 | `cursor-agent` | Keeps shell, web search and fetch, filesystem, and the user's own MCP servers, and lists no ask-user tool. |
 | `grok` | Keeps shell, web search and fetch, filesystem, and `ask_user_question`, and the user's own MCP servers were empty on a machine with none configured, and project scope keys off `cwd` per vendor docs. |
-| `goose` | Lists eighteen tools of its own: `shell`, the `developer` filesystem set (`edit`, `write`, `load`, `tree`, `read_image`), `analyze`, `delegate`, `load_skill`, and its `apps__`, `todo__` and `extensionmanager__` built-in extensions. No web tool, neither search nor fetch, and no ask-user tool. It takes Fidget's own MCP over HTTP, and lists Fidget's eight tools alongside its own, under an `fidget__` prefix. |
+| `goose` | Lists eighteen tools of its own: `shell`, the `developer` filesystem set (`edit`, `write`, `load`, `tree`, `read_image`), `analyze`, `delegate`, `load_skill`, and its `apps__`, `todo__` and `extensionmanager__` built-in extensions. No web tool, neither search nor fetch, and no ask-user tool. It takes Fidget's own MCP over HTTP, and lists Fidget's nine tools alongside its own, under an `fidget__` prefix. |
 | `opencode` | Keeps shell, web fetch, filesystem, and the user's own MCP servers, and lists no web-search tool and no ask-user tool. |
 | `hermes` | Keeps shell, web search and extract, filesystem, and the user's own MCP servers via the vendor mcp subcommand that the probe did not exercise, lists no ask-user tool, and lists browser tools that the start-up CDP check marks unavailable. |
 | `pi` | Keeps its own `read`, `bash`, `edit`, and `write` tools, has no web tool, and on `initialize` has `http` and `sse` both false. Handed Fidget's stdio server on `session/new`, it never asked for the tool list: `pi-acp` stores those servers and does not pass them to `pi` (#1019), which reads the project `.mcp.json` the app writes on Apply and the probe does not. |
@@ -358,7 +358,7 @@ Two transports, not to be conflated:
 1. **ACP** (Fidget ↔ Harness): always stdio. Fidget spawns the Harness and prompts it over newline-delimited JSON-RPC.
 2. **MCP** (Harness → Fidget): the Harness calls back so Behaviors, sensing, and Memory reach the fidget. It says things only in its reply (ADR-0040).
 
-The README lists the [tools and resources](../README.md#harness--mcp).
+The README lists the [tools and resources](../README.md#harness--mcp). `move` walks a Character Instance left or right by a distance or for a time, or to the x of a spot from `whereabouts`. The spot's y is optional and ignored.
 
 ### How it works
 
@@ -437,7 +437,7 @@ The port is OS-assigned and the token is minted in memory at every launch (ADR-0
 
 ### Not served
 
-- **Pixels:** `describe_screen` is window metadata only; Fidget takes no screenshots and runs no OCR or vision ([ADR-0031](./adr/0031-drop-capture-tiers.md)). Agents that need pixels use Harness-native computer use or an MCP server like cua-driver.
+- **Pixels:** `describe_screen` is window metadata only; Fidget takes no screenshots and runs no OCR or vision ([ADR-0031](./adr/0031-drop-capture-tiers.md)). Agents that need pixels use Harness-native computer use or an MCP server like [cua-driver](./computer-use.md).
 - **Input events:** No click, type, or mouse tools (ADR-0003). The Harness owns desktop control.
 - **Non-loopback MCP** (ADR-0023).
 

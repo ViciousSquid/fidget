@@ -88,6 +88,15 @@ def from_rust(source):
     }
 
 
+def idle_gesture(source):
+    """The `variant_of` value that marks an idle-gesture, from character.rs,
+    so a retyped copy here cannot drift from the loader's."""
+    found = re.search(r'pub const IDLE_GESTURE:\s*&str\s*=\s*"([^"]+)";', source)
+    if not found:
+        raise Malformed(f"{RUST.name} declares no IDLE_GESTURE")
+    return found.group(1)
+
+
 def source(package, declared):
     """What the package declares in `[source]`, or None.
 
@@ -161,7 +170,7 @@ def frame(package, declared, art_root):
     return {"src": f"characters/{package.name}/{declared}", "w": width, "h": height}
 
 
-def emit(package, name, animation, defaults, art_root, extra=None):
+def emit(package, name, animation, extra, defaults, art_root):
     """One Animation as the page plays it: frames on disk, fps/loop/weight as
     the loader would fill them. `extra` is for a Variant's `variant_of` — the
     field that says this tile is a ring member, not a Required Animation slot.
@@ -183,7 +192,19 @@ def emit(package, name, animation, defaults, art_root, extra=None):
     return tile
 
 
-def character(package, required, defaults, art_root):
+def owned(package, name, animation, animations):
+    """The table that holds `name`'s frames, and the `same_as` the tile carries.
+    A `same_as` slot plays its owner's frames, fps and loop, as the loader does."""
+    owner = animation.get("same_as")
+    if owner is None:
+        return animation, None
+    target = animations.get(owner)
+    if not isinstance(target, dict) or "same_as" in target:
+        raise Malformed(f"{package.name}: {name!r} is the same_as {owner!r}, which owns no frames")
+    return target, {"same_as": owner}
+
+
+def character(package, required, gesture_category, defaults, art_root):
     manifest = package / "character.manifest"
     try:
         text = manifest.read_text(encoding="utf-8")
@@ -201,19 +222,25 @@ def character(package, required, defaults, art_root):
         if animation is None:
             strip.append({"name": name, "missing": True})
             continue
-        strip.append(emit(package, name, animation, defaults, art_root))
+        strip.append(emit(package, name, *owned(package, name, animation, animations),
+                          defaults, art_root))
 
     # Nested on the base, never spliced into the required strip: a Variant is
-    # not a tenth Required Animation, and sing is not a climb.
+    # not a tenth Required Animation, and sing is not a climb. An idle-gesture's
+    # `variant_of` names a category with no tile to nest under: its own group.
     by_base = {}
+    gestures = []
     for name, animation in animations.items():
         if name in required:
             continue
         base = animation.get("variant_of")
         if not base:
             continue
+        if base == gesture_category:
+            gestures.append(emit(package, name, animation, None, defaults, art_root))
+            continue
         by_base.setdefault(base, []).append(
-            emit(package, name, animation, defaults, art_root, {"variant_of": base})
+            emit(package, name, animation, {"variant_of": base}, defaults, art_root)
         )
 
     for slot in strip:
@@ -227,7 +254,8 @@ def character(package, required, defaults, art_root):
         animation = animations.get(name)
         if animation is None or animation.get("variant_of"):
             continue
-        extra = emit(package, name, animation, defaults, art_root)
+        extra = emit(package, name, *owned(package, name, animation, animations),
+                     defaults, art_root)
         members = by_base.get(name)
         if members:
             extra["variants"] = members
@@ -240,11 +268,13 @@ def character(package, required, defaults, art_root):
         "scale": declared.get("scale", defaults["scale"]),
         "source": source(package, declared),
         "animations": strip,
+        "gestures": gestures,
     }
 
 
 def gallery(characters_root, rust_source, out):
     required, defaults = from_rust(rust_source)
+    gesture_category = idle_gesture(rust_source)
     packages = sorted(p for p in characters_root.iterdir() if (p / "character.manifest").is_file())
     if not packages:
         raise Malformed(f"{characters_root} holds no Character Package")
@@ -253,7 +283,7 @@ def gallery(characters_root, rust_source, out):
 
     art_root = out / "characters"
     data = {
-        "characters": [character(p, required, defaults, art_root) for p in packages],
+        "characters": [character(p, required, gesture_category, defaults, art_root) for p in packages],
         "required": required,
         "defaults": defaults,
     }
@@ -425,6 +455,56 @@ def self_check():
         names = [a["name"] for a in data["characters"][0]["animations"]]
         assert names[len(required):] == ["grab"], "declared grab did not follow the required strip"
 
+        # An idle-gesture names a category, not a base slot, so it has no
+        # tile to nest under. It gets its own group rather than vanishing.
+        gestures = scratch / "gestures"
+        package(
+            gestures / "gesturer",
+            f'name = "Gesturer"\n{body}\n'
+            "[animations.wave]\n"
+            'frames = ["frames/idle-0.png"]\n'
+            'variant_of = "idle-gesture"\n'
+            "weight = 3\n",
+            frames=complete,
+        )
+        data, page = gallery(gestures, rust_text, out)
+        ch = data["characters"][0]
+        names = [a["name"] for a in ch["animations"]]
+        assert names == required, "an idle-gesture changed the Required Animation strip"
+        assert not any(a.get("variants") for a in ch["animations"]), (
+            "an idle-gesture nested under a strip slot")
+        gesture = next((g for g in ch.get("gestures") or [] if g["name"] == "wave"), None)
+        assert gesture, "an idle-gesture never reached the page data"
+        assert gesture.get("weight") == 3, "an idle-gesture dropped its declared weight"
+        assert gesture.get("frames") and "fps" in gesture and "loop" in gesture
+        assert '"wave"' in page.read_text(encoding="utf-8"), "an idle-gesture never reached the page"
+
+        # A required slot `same_as` an idle-gesture plays the gesture's
+        # frames in its own tile, and the gesture keeps its one tile.
+        aliased = scratch / "aliased"
+        others = "\n".join(
+            f'[animations.{n}]\nframes = ["frames/{n}-0.png"]' for n in required if n != "react"
+        )
+        package(
+            aliased / "aliased",
+            f'name = "Aliased"\n{others}\n'
+            "[animations.wave]\n"
+            'frames = ["frames/idle-0.png"]\n'
+            "fps = 4\n"
+            'variant_of = "idle-gesture"\n'
+            "[animations.react]\n"
+            'same_as = "wave"\n',
+            frames=complete,
+        )
+        data, _ = gallery(aliased, rust_text, out)
+        ch = data["characters"][0]
+        react = next(a for a in ch["animations"] if a["name"] == "react")
+        assert react.get("same_as") == "wave", "a same_as slot lost its owner"
+        assert react["frames"][0]["src"].endswith("frames/idle-0.png") and react["fps"] == 4, (
+            "a same_as slot does not play its owner's frames and fps")
+        assert [g["name"] for g in ch["gestures"]] == ["wave"], (
+            "a same_as slot stole or doubled the idle-gesture tile")
+
         looks = scratch / "looks"
         package(
             looks / "shiny",
@@ -468,8 +548,8 @@ def main():
     except Malformed as broken:
         sys.exit(f"character gallery: {broken}")
 
-    frames = sum(len(a["frames"]) for c in data["characters"] for a in c["animations"]
-                 if not a.get("missing"))
+    frames = sum(len(a["frames"]) for c in data["characters"]
+                 for a in c["animations"] + c["gestures"] if not a.get("missing"))
     missing = sum(1 for c in data["characters"] for a in c["animations"] if a.get("missing"))
     print(f"{page}: {len(data['characters'])} Characters, {frames} frames"
           + (f", {missing} Required Animations missing" if missing else ""))

@@ -38,12 +38,13 @@ function drive(steps) {
 <script>
   ${pageWait()}
   const heard = {};
+  let currentOpening = ${JSON.stringify(OPENING)};
   window.__invoked = [];
   window.__TAURI__ = {
     core: {
       invoke(name, args) {
         window.__invoked.push({ name, args });
-        if (name === "chat_opening") return Promise.resolve(${JSON.stringify(OPENING)});
+        if (name === "chat_opening") return Promise.resolve(currentOpening);
         return Promise.resolve();
       },
     },
@@ -84,6 +85,12 @@ ${steps}
       })),
       anchors: document.querySelectorAll("#log a").length,
       opened: window.__invoked.filter((call) => call.name === "open_link").map((call) => call.args.url),
+      name: document.getElementById("name").textContent,
+      mind: document.getElementById("mind-text").textContent,
+      draft: document.getElementById("line").value,
+      promptDraft: document.getElementById("prompt-text").value,
+      readyCalls: window.__invoked.filter((call) => call.name === "chat_ready").length,
+      openingCalls: window.__invoked.filter((call) => call.name === "chat_opening").length,
     }));
   }
   window.addEventListener("load", () => run().catch((why) => {
@@ -116,6 +123,32 @@ const DRAWN = [
   { kind: "plan-steps", label: "Plan", open: null, stamped: false, text: "Read the roster" },
   { kind: "restored", label: "Buddy Bot", open: null, stamped: false, text: "Done." },
 ];
+
+test(
+  "refocusing a retained Chat refreshes metadata without replaying its transcript or replacing drafts",
+  { skip: chromeSkip, timeout: 60000 },
+  async () => {
+    const report = await drive(`
+    await ready("tauri://focus");
+    emit("chat-restored", ${JSON.stringify(HISTORY)});
+    document.getElementById("line").value = "still writing";
+    document.getElementById("prompt-text").value = "an unsaved prompt";
+    currentOpening = { ...currentOpening, name: "Atlas", harness: { ...currentOpening.harness, session: "resumed-session" } };
+    await heard["tauri://focus"]({ payload: null });
+    await heard["tauri://focus"]({ payload: null });`);
+    assert.equal(report.error, undefined, report.error);
+    assert.equal(report.name, "Atlas");
+    assert.match(report.mind, /session resumed-/);
+    assert.equal(report.draft, "still writing");
+    assert.equal(report.promptDraft, "an unsaved prompt");
+    assert.deepEqual(report.rows, DRAWN.map((row) => ({
+      ...row,
+      label: row.label === "Buddy Bot" ? "Atlas" : row.label,
+    })));
+    assert.equal(report.readyCalls, 1);
+    assert.equal(report.openingCalls, 3);
+  },
+);
 
 test(
   "a loaded session's whole replay sits above the waiting line, and the answer still lands on it",
@@ -256,7 +289,7 @@ const TOOL_HISTORY = [
     ],
     content: [
       { type: "diff", path: "/Users/oded/src/main.rs", added: 3, removed: 1, approximate: false },
-      { type: "terminal", id: "term-7" },
+      { type: "terminal", label: "Terminal term-7" },
       { type: "text", text: "wrote [x](https://evil.example) and **2** hunks" },
       { type: "mark", markdown: "[spec](https://example.com/spec.md)" },
       { type: "mark", markdown: "[image image/png]" },
@@ -311,7 +344,7 @@ test(
         locations: [{ path: "/tmp/a\nb\u202ec.rs", line: 2 }],
         content: [
           { type: "diff", path: "/tmp/x\r\ny\u202ez.rs", added: 1, removed: 0, approximate: false },
-          { type: "terminal", id: "t\n1\u202e2" },
+          { type: "terminal", label: "Terminal t\n1\u202e2" },
           { type: "text", text: "kept\nlines\u202e" },
         ],
       },

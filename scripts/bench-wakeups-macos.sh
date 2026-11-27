@@ -8,6 +8,8 @@
 
 set -uo pipefail
 cd "$(dirname "$0")/.." || exit 1
+# shellcheck source=scripts/scenarios/helpers/wait-helpers.mac.sh
+. scripts/scenarios/helpers/wait-helpers.mac.sh
 
 BINARY=""
 SCENARIO=""
@@ -51,12 +53,18 @@ fi
 
 mkdir -p "$OUT"
 LOG="$OUT/app.log"
+DATA_DIR="$OUT/data"
 PM="$OUT/powermetrics.txt"
 META="$OUT/meta.txt"
 
 APP_PID=""
 PROP_PID=""
-trap 'kill "$APP_PID" "$PROP_PID" 2> /dev/null; wait "$APP_PID" "$PROP_PID" 2> /dev/null' EXIT INT TERM
+PUMP_PID=""
+stop_pump() {
+  # The pump is its own process group, so one signal takes tail and awk.
+  [ -z "$PUMP_PID" ] || kill -- -"$PUMP_PID" 2> /dev/null || kill "$PUMP_PID" 2> /dev/null
+}
+trap 'stop_pump; kill "$APP_PID" "$PROP_PID" 2> /dev/null; wait "$APP_PID" "$PROP_PID" "$PUMP_PID" 2> /dev/null' EXIT INT TERM
 
 # Other agents build and run fidget on this machine. A baseline with one of
 # theirs alive is not a baseline, and powermetrics cannot tell whose it is.
@@ -67,27 +75,35 @@ if [ "$SCENARIO" = "baseline" ] && [ -n "$STRAY_BEFORE" ]; then
 fi
 
 if [ "$SCENARIO" != "baseline" ]; then
+  mkdir -p "$DATA_DIR"
+  # A settings file skips the first-run tour, which would open a window
+  # during the sample. A private data dir keeps this process.log alone.
+  echo '{"first_run_tour_shown": true}' > "$DATA_DIR/settings.json"
+  # Release traces exist only in process.log, each stamped with epoch seconds,
+  # so a wait for ^overlay: on the terminal redirect never fires. A default
+  # ten-line tail can miss that line once frames are already landing.
+  : > "$DATA_DIR/process.log"
+  set -m
+  (
+    tail -n +1 -F "$DATA_DIR/process.log" 2> /dev/null |
+      awk '{ sub(/^[0-9]+ /, ""); print; fflush() }' > "$LOG"
+  ) &
+  PUMP_PID=$!
+  set +m
   FIDGET_DIRECTOR_API_KEY=bench-placeholder \
     FIDGET_DIRECTOR=0 \
     FIDGET_TRACE_FRAMES=1 \
     FIDGET_TRACE_ENGINE=1 \
     FIDGET_CAPTURABLE=1 \
-    "$BINARY" > "$LOG" 2>&1 &
+    FIDGET_DATA_DIR="$DATA_DIR" \
+    "$BINARY" > "$OUT/app.out" 2>&1 &
   APP_PID=$!
-  echo "launched pid=$APP_PID binary=$BINARY log=$LOG" >&2
+  # shellcheck disable=SC2034 # read by the sourced wait helpers
+  pid=$APP_PID
+  echo "launched pid=$APP_PID binary=$BINARY data=$DATA_DIR log=$LOG" >&2
 fi
 
-READY=$([ "$SCENARIO" = "baseline" ] && echo 1 || echo 0)
-for _ in $(seq 1 40); do
-  [ "$READY" -eq 1 ] && break
-  grep -q '^overlay:' "$LOG" 2> /dev/null && {
-    READY=1
-    break
-  }
-  kill -0 "$APP_PID" 2> /dev/null || break
-  perl -e 'select(undef,undef,undef,0.25)'
-done
-if [ "$READY" -ne 1 ]; then
+if [ "$SCENARIO" != "baseline" ] && ! wait_for_up "$LOG"; then
   echo "bench-wakeups-macos: app never reported '^overlay:' - see $LOG" >&2
   exit 1
 fi
@@ -96,10 +112,7 @@ fi
 # the sprite spawns mid-air and plays Falling until it lands, and a click during
 # that window can miss the moving art, so wait for Grounded.
 if [ -n "$APP_PID" ]; then
-  for _ in $(seq 1 40); do
-    grep -qE '^frame: .* (Grounded|Perched) ' "$LOG" 2> /dev/null && break
-    perl -e 'select(undef,undef,undef,0.25)'
-  done
+  wait_for_trace 10 "$LOG" '^frame: .* (Grounded|Perched) ' || true
   sleep 1
 fi
 
@@ -109,11 +122,7 @@ if [ "$SCENARIO" = "hidden" ]; then
   # interrupted run leaves no window behind.
   swift scripts/fullscreen-window.swift $((DURATION + 60)) > "$OUT/fullscreen.log" 2>&1 &
   PROP_PID=$!
-  for _ in $(seq 1 40); do
-    grep -q '^presence: hidden' "$LOG" 2> /dev/null && break
-    perl -e 'select(undef,undef,undef,0.25)'
-  done
-  if ! grep -q '^presence: hidden' "$LOG"; then
+  if ! wait_for_trace 10 "$LOG" '^presence: hidden'; then
     echo "bench-wakeups-macos: sprite never reported 'presence: hidden' - see $OUT/fullscreen.log and $LOG" >&2
     exit 1
   fi
@@ -144,9 +153,9 @@ PY
   # `osascript ... click at` resolves an AX element under the point first, and
   # this borderless panel presents none (fails -25208). click-cursor.swift warps
   # the cursor and posts real HID events instead. `2` clicks reads as one Summon.
+  BEFORE_SUMMON=$(line_count "$LOG" 'verbs:.*Summon')
   swift scripts/click-cursor.swift "$CX" "$CY" 2 > "$OUT/click.log" 2>&1
-  sleep 1
-  if grep -qE 'verbs:.*Summon' "$LOG"; then
+  if wait_for_count 1 "$LOG" 'verbs:.*Summon' "$BEFORE_SUMMON"; then
     SUMMON_STATUS="confirmed"
   else
     SUMMON_STATUS="NOT CONFIRMED - see $OUT/click.log and $LOG"

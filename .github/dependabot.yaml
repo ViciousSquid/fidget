@@ -1,11 +1,17 @@
 version: 2
 
 updates:
+  # Version updates wait 7 days after a release, not GitHub's implicit 3, so
+  # a compromised version yanked within the week never reaches a pull request.
+  # Security updates skip the wait.
+
   # The workspace root holds Cargo.lock; src-tauri has none.
   - directory: "/"
     package-ecosystem: "cargo"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     labels:
       - "maintenance"
     ignore:
@@ -26,8 +32,16 @@ updates:
     package-ecosystem: "github-actions"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     labels:
       - "maintenance"
+    # One pull request, and one actions.lock diff, for the week's minor and
+    # patch bumps. A major bump still arrives on its own.
+    groups:
+      github-actions:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
 
   # marked is vendored as src/vendor/marked.esm.js. A marked bump must
   # re-vendor that file per src/vendor/README.md, or the test that checks
@@ -36,6 +50,8 @@ updates:
     package-ecosystem: "npm"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     labels:
       - "maintenance"
 
@@ -43,6 +59,8 @@ updates:
     package-ecosystem: "pip"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     labels:
       - "maintenance"
 
@@ -50,5 +68,7 @@ updates:
     package-ecosystem: "pre-commit"
     schedule:
       interval: "weekly"
+    cooldown:
+      default-days: 7
     labels:
       - "maintenance"

@@ -184,11 +184,12 @@ pub struct SettingsView {
     /// Every text row a variable can own, by form row id: the exported
     /// variable's value where it owns the row, else the file's.
     pub variable_texts: HashMap<String, String>,
-    /// Live OS grants, not a file field. The window rereads them on become-key.
+    /// Settings intent for each capability, separate from its OS grant.
     pub consent: Vec<ConsentRow>,
     /// Which Chat UI design is selected: minimal, terminal, or glass.
     pub chat_ui: String,
     pub chat_appearance: ChatAppearance,
+    pub language: String,
     /// A model or effort the attached Harness did not take.
     pub not_applied: Vec<crate::harness::NotAppliedNotice>,
     pub caffeinate_display: bool,
@@ -596,7 +597,7 @@ impl SettingsView {
             hidden: settings.hidden,
             hide_in_fullscreen: settings.hide_in_fullscreen,
             launch_at_login: settings.launch_at_login,
-            hide_hotkey: display_hotkey(&settings.hide_hotkey),
+            hide_hotkey: settings.hide_hotkey.display(ModifierWords::current()),
             excluded_applications: settings.excluded_applications.clone(),
             character: settings.character.clone(),
             memory_path: memory_path.display().to_string(),
@@ -630,6 +631,9 @@ impl SettingsView {
             consent: consent::rows(|id| settings.wants_consent(id)),
             chat_ui: settings.chat_ui.clone(),
             chat_appearance: settings.chat_appearance,
+            language: crate::i18n::flag()
+                .map(|lang| lang.code().to_string())
+                .unwrap_or_else(|| settings.language.clone()),
         }
     }
 
@@ -724,7 +728,7 @@ impl SettingsView {
         values.extend(
             self.consent
                 .iter()
-                .map(|row| (row.row_id(), RowValue::Bool(row.granted))),
+                .map(|row| (row.row_id(), RowValue::Bool(row.wanted))),
         );
         // Only a field the Harness did not take has a notice. A row with none has no key.
         for notice in &self.not_applied {
@@ -776,6 +780,10 @@ impl SettingsView {
             "chat_appearance".to_string(),
             text(self.chat_appearance.title()),
         );
+        values.insert(
+            form::LANGUAGE_ID.to_string(),
+            text(&form::language_title(&self.language)),
+        );
         values
     }
 
@@ -817,6 +825,7 @@ impl SettingsView {
                     .unwrap_or_default(),
             )),
             "chat_appearance" => Some(self.chat_appearance.title().to_string()),
+            form::LANGUAGE_ID => Some(form::language_title(&self.language)),
             _ => None,
         }
     }
@@ -1136,6 +1145,15 @@ fn harness_retargets(settings: &Settings, patch: &SettingsPatch) -> bool {
         )
 }
 
+/// Whether a saved Language edit changed the language the Director will ask for.
+fn language_requires_new_session(
+    language_patched: bool,
+    previous: Option<&str>,
+    current: Option<&str>,
+) -> bool {
+    language_patched && previous != current
+}
+
 /// Whether an open Chat surface must hear a new opening: a Director switch, a
 /// source change, or any retarget, since the header names model and host. A key
 /// or timeout change re-pushes an identical opening, because one rule is
@@ -1286,7 +1304,7 @@ pub struct SettingsSession {
     pub installed: Vec<String>,
     pub ops: mpsc::Sender<SettingsOp>,
     pub app: AppHandle,
-    pub on_rebind: fn(&AppHandle, &str),
+    pub on_rebind: fn(&AppHandle, &Hotkey),
     pub secrets: Arc<dyn SecretStore>,
     /// Last successful store fingerprint. Become-key must not hit Keychain
     /// every focus; a failed read is not cached, so unlocking can recover.
@@ -1336,8 +1354,8 @@ impl SettingsSession {
 
     pub fn apply(&self, patch: SettingsPatch) -> Result<(), String> {
         let switching = patch.roster.character.clone();
-        let rebind = patch.presence.hide_hotkey.clone();
-        let new_session = patch.new_session;
+        let rebind = patch.presence.hide_hotkey;
+        let requested_new_session = patch.new_session;
         let launch_at_login = patch.launch_at_login;
         write_key_off_the_settings_lock(&self.settings, self.secrets.as_ref(), &patch)?;
         if let Some(raw) = patch.completer.director_api_key.as_deref() {
@@ -1366,9 +1384,21 @@ impl SettingsSession {
             .is_some_and(|ui| *ui != settings.chat_ui);
         let new_chat_ui = patch.chat_ui.clone();
         let appearance_op = chat_appearance_op(settings.chat_appearance, &patch);
+        let language_patched = patch.language.is_some();
+        let previous_reply_language = crate::i18n::reply_language();
         // Seeded before `retarget_payload`, which rebuilds the Endpoint from
         // the live timeout and turn ceiling.
         apply_and_seed(&mut settings, patch);
+        if language_patched {
+            crate::i18n::apply(&settings.language);
+        }
+        let language_changed = language_requires_new_session(
+            language_patched,
+            previous_reply_language,
+            crate::i18n::reply_language(),
+        );
+        let new_session = requested_new_session || language_changed;
+        let reload_chat = reload_chat || language_changed;
         #[cfg(target_os = "macos")]
         consent::set_wanted(CapabilityId::Accessibility, settings.use_accessibility);
         consent::set_wanted(CapabilityId::WindowNames, settings.use_window_names);
@@ -1503,6 +1533,11 @@ impl SettingsSession {
         crate::platform::open_path(&self.memory_path)
     }
 
+    /// Hand the current Action Log to the desktop's opener.
+    pub fn open_action_log(&self) -> Result<(), String> {
+        crate::platform::open_path(&crate::action_log::current_path())
+    }
+
     pub fn wipe_memory(&self) -> Result<(), String> {
         MemoryManifest::new(&self.memory_path)
             .wipe()
@@ -1554,6 +1589,8 @@ pub struct SettingsPatch {
     pub chat_ui: Option<String>,
     pub chat_appearance: Option<ChatAppearance>,
     pub hover_delay_ms: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// The Character every Instance switches to.
@@ -1593,7 +1630,7 @@ pub struct CompleterPatch {
 pub struct PresencePatch {
     pub hidden: Option<bool>,
     pub hide_in_fullscreen: Option<bool>,
-    pub hide_hotkey: Option<String>,
+    pub hide_hotkey: Option<Hotkey>,
     pub excluded_applications: Option<Vec<String>>,
 }
 
@@ -1665,6 +1702,7 @@ pub enum TextField {
     ChatUI,
     ChatAppearance,
     HoverDelayMs,
+    Language,
 }
 
 impl SettingsPatch {
@@ -1755,6 +1793,7 @@ impl SettingsPatch {
                 self.chat_appearance = Some(ChatAppearance::from_title(value))
             }
             TextField::HoverDelayMs => self.hover_delay_ms = Some(value.to_string()),
+            TextField::Language => self.language = Some(form::language_choice(value)),
         }
         true
     }
@@ -1948,6 +1987,9 @@ impl Settings {
         if let Some(value) = patch.chat_appearance {
             self.chat_appearance = value;
         }
+        if let Some(value) = patch.language {
+            self.language = value;
+        }
         // director_api_key is intentionally ignored: the key lives in the
         // secret store, never in the JSON document.
     }
@@ -1977,9 +2019,14 @@ impl Settings {
 }
 
 /// The default hide hotkey. Three modifiers, because a global shortcut is taken
-/// from every app and B alone belongs to most. Stored in the spelling
-/// `parse_hotkey` reads everywhere.
-pub const DEFAULT_HIDE_HOTKEY: &str = "Control-Option-Command-B";
+/// from every app and B alone belongs to most.
+pub const DEFAULT_HIDE_HOTKEY: Hotkey = Hotkey {
+    control: true,
+    option: true,
+    shift: false,
+    command: true,
+    key: 'B',
+};
 
 fn default_true() -> bool {
     true
@@ -2015,10 +2062,8 @@ pub struct Settings {
     pub hidden: bool,
     /// Fade away when a fullscreen application is frontmost.
     pub hide_in_fullscreen: bool,
-    /// Read with `parse_hotkey`, shown with `display_hotkey`. A string, not
-    /// `Hotkey`: a parse failure resets the whole file, so the struct needs a
-    /// two-shape deserializer first.
-    pub hide_hotkey: String,
+    /// The global shortcut that toggles Go-away.
+    pub hide_hotkey: Hotkey,
     pub launch_at_login: bool,
     pub excluded_applications: Vec<String>,
     /// Last chosen Character Package. Empty means the loader's default.
@@ -2124,6 +2169,9 @@ pub struct Settings {
     pub chat_ui: String,
     #[serde(default)]
     pub chat_appearance: ChatAppearance,
+    /// Reply language code, or blank for the computer's preferred language.
+    #[serde(default)]
+    pub language: String,
 }
 
 impl Default for Settings {
@@ -2135,7 +2183,7 @@ impl Default for Settings {
             sound: true,
             hidden: false,
             hide_in_fullscreen: true,
-            hide_hotkey: DEFAULT_HIDE_HOTKEY.to_string(),
+            hide_hotkey: DEFAULT_HIDE_HOTKEY,
             launch_at_login: false,
             excluded_applications: Vec::new(),
             character: String::new(),
@@ -2173,6 +2221,7 @@ impl Default for Settings {
             names_hint_dismissed: false,
             chat_ui: "minimal".to_string(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
         }
     }
 }
@@ -2254,55 +2303,14 @@ pub fn settings_path(data_dir: &Path) -> PathBuf {
     data_dir.join("settings.json")
 }
 
-/// The modifiers and key a hide-hotkey string names. Parsed here, not by the
-/// shortcut plugin, so a bad binding is a settings problem and the default can
-/// take over.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// The modifiers and letter of the global hide shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hotkey {
     pub control: bool,
     pub option: bool,
     pub shift: bool,
     pub command: bool,
     pub key: char,
-}
-
-/// Read `Control-Option-Command-B` into parts; an unknown token refuses the
-/// whole string. Each alias set is one key under every OS's name, `Win`
-/// included, so everything `Hotkey::display` prints reads back.
-pub fn parse_hotkey(spec: &str) -> Option<Hotkey> {
-    let mut hotkey = Hotkey {
-        control: false,
-        option: false,
-        shift: false,
-        command: false,
-        key: '\0',
-    };
-    let mut key = None;
-    for token in spec
-        .split('-')
-        .map(str::trim)
-        .filter(|token| !token.is_empty())
-    {
-        match token {
-            "Control" | "Ctrl" => hotkey.control = true,
-            "Option" | "Alt" => hotkey.option = true,
-            "Shift" => hotkey.shift = true,
-            "Command" | "Super" | "Meta" | "Win" => hotkey.command = true,
-            one if one.len() == 1 => {
-                let letter = one.chars().next()?.to_ascii_uppercase();
-                if !letter.is_ascii_alphabetic() {
-                    return None;
-                }
-                if key.is_some() {
-                    return None;
-                }
-                key = Some(letter);
-            }
-            _ => return None,
-        }
-    }
-    hotkey.key = key?;
-    Some(hotkey)
 }
 
 /// How the keyboard in front of a user names the modifier keys: a spelling, not
@@ -2339,38 +2347,37 @@ impl ModifierWords {
 }
 
 impl Hotkey {
+    /// The configured chord, or the shipped default for an unsupported key.
+    pub fn in_force(&self) -> &Self {
+        if key_code_name(self.key).is_some() {
+            self
+        } else {
+            &DEFAULT_HIDE_HOTKEY
+        }
+    }
+
     /// Print the chord in `words`, e.g. `Control-Option-Command-B` or
-    /// `Ctrl-Alt-Super-B`. `parse_hotkey` reads every spelling back, since the
-    /// field shows and retakes it.
+    /// `Ctrl-Alt-Super-B`.
     pub fn display(&self, words: ModifierWords) -> String {
+        let hotkey = self.in_force();
         let (control, option, command) = words.names();
         let mut parts = Vec::with_capacity(5);
-        if self.control {
+        if hotkey.control {
             parts.push(control);
         }
-        if self.option {
+        if hotkey.option {
             parts.push(option);
         }
-        if self.shift {
+        if hotkey.shift {
             parts.push("Shift");
         }
-        if self.command {
+        if hotkey.command {
             parts.push(command);
         }
-        let letter = self.key.to_ascii_uppercase().to_string();
+        let letter = hotkey.key.to_ascii_uppercase().to_string();
         parts.push(&letter);
         parts.join("-")
     }
-}
-
-/// The hotkey `spec` names, in this OS's words. A stored string may use any
-/// platform's words, so it is parsed rather than printed; an unreadable one
-/// shows the default.
-pub fn display_hotkey(spec: &str) -> String {
-    parse_hotkey(spec)
-        .or_else(|| parse_hotkey(DEFAULT_HIDE_HOTKEY))
-        .map(|hotkey| hotkey.display(ModifierWords::current()))
-        .unwrap_or_default()
 }
 
 /// Flip Go-away and keep `Settings.hidden` on the same flag, so a restart or
@@ -2399,10 +2406,13 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
+    /// The process id too: `NEXT` and the thread id start over in every test
+    /// process, so two runs at once, or a process-per-test runner, would share a file.
     fn temp_path() -> PathBuf {
         let n = NEXT.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
-            "fidget-settings-{n}-{:?}.json",
+            "fidget-settings-{}-{n}-{:?}.json",
+            std::process::id(),
             std::thread::current().id()
         ))
     }
@@ -2437,7 +2447,13 @@ mod tests {
             sound: false,
             hidden: true,
             hide_in_fullscreen: false,
-            hide_hotkey: "Control-Shift-H".to_string(),
+            hide_hotkey: Hotkey {
+                control: true,
+                option: false,
+                shift: true,
+                command: false,
+                key: 'H',
+            },
             launch_at_login: true,
             excluded_applications: vec!["1Password".to_string(), "Keychain Access".to_string()],
             character: "nim".to_string(),
@@ -2466,6 +2482,7 @@ mod tests {
             capturable: true,
             chat_ui: "minimal".into(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
             use_accessibility: true,
             use_window_names: false,
             use_input_monitoring: true,
@@ -2789,14 +2806,13 @@ mod tests {
     /// Director off, or Poke would go silent with idle life.
     #[test]
     fn proactive_wakes_can_be_off_while_the_director_stays_on() {
-        let settings = Settings {
-            director_enabled: true,
-            proactive_wakes: false,
-            ..Settings::default()
-        };
+        let mut settings = Settings::default();
+        let mut patch = SettingsPatch::default();
+        patch.set_bool(BoolField::ProactiveWakes, false);
+        settings.apply(patch);
 
-        assert!(settings.director_enabled);
         assert!(!settings.proactive_wakes);
+        assert!(settings.director_enabled);
     }
 
     /// A hand-edit that drops a key, or an older file, must not refuse to load.
@@ -2892,20 +2908,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_default_hide_hotkey_parses() {
-        assert_eq!(
-            parse_hotkey(DEFAULT_HIDE_HOTKEY),
-            Some(Hotkey {
-                control: true,
-                option: true,
-                shift: false,
-                command: true,
-                key: 'B',
-            })
-        );
-    }
-
     /// A hotkey hide that does not write `hidden` comes back on restart, and a
     /// later settings patch of something else would overwrite HideRules with
     /// the stale flag. The menu already persists; the hotkey must too.
@@ -2933,7 +2935,6 @@ mod tests {
 
     #[test]
     fn a_rebound_hotkey_names_its_own_key_not_the_shipped_b() {
-        assert_eq!(parse_hotkey("Control-Shift-H").map(|h| h.key), Some('H'));
         assert_eq!(key_code_name('H').as_deref(), Some("KeyH"));
         assert_eq!(key_code_name('B').as_deref(), Some("KeyB"));
         assert_eq!(key_code_name('1'), None);
@@ -2950,7 +2951,13 @@ mod tests {
             sound: false,
             hidden: true,
             hide_in_fullscreen: false,
-            hide_hotkey: "Control-Shift-H".to_string(),
+            hide_hotkey: Hotkey {
+                control: true,
+                option: false,
+                shift: true,
+                command: false,
+                key: 'H',
+            },
             launch_at_login: true,
             excluded_applications: vec!["1Password".to_string(), "Keychain Access".to_string()],
             character: "nim".to_string(),
@@ -2979,6 +2986,7 @@ mod tests {
             capturable: true,
             chat_ui: "minimal".into(),
             chat_appearance: ChatAppearance::System,
+            language: String::new(),
             use_accessibility: true,
             use_window_names: false,
             use_input_monitoring: false,
@@ -3009,7 +3017,13 @@ mod tests {
         assert!(!view.sound);
         assert!(view.hidden);
         assert!(!view.hide_in_fullscreen);
-        assert_eq!(view.hide_hotkey, display_hotkey("Control-Shift-H"));
+        assert_eq!(
+            view.hide_hotkey,
+            match ModifierWords::current() {
+                ModifierWords::Mac => "Control-Shift-H",
+                ModifierWords::Linux | ModifierWords::Windows => "Ctrl-Shift-H",
+            }
+        );
         assert_eq!(view.excluded_text(), "1Password\nKeychain Access");
         assert_eq!(view.character, "nim");
         assert_eq!(view.memory_path, "/tmp/fidget/memory.md");
@@ -3029,10 +3043,10 @@ mod tests {
                 ]
             );
             assert!(
-                view.consent[0].granted,
+                view.consent[0].wanted,
                 "the checkbox follows settings intent, not the OS grant"
             );
-            assert!(!view.consent[1].granted);
+            assert!(!view.consent[1].wanted);
         }
         #[cfg(target_os = "windows")]
         {
@@ -3041,7 +3055,7 @@ mod tests {
                 ["Window and Application Names"]
             );
             assert!(
-                !view.consent[0].granted,
+                !view.consent[0].wanted,
                 "the checkbox follows settings intent, not the OS grant"
             );
         }
@@ -3049,7 +3063,7 @@ mod tests {
         {
             assert_eq!(view.consent.len(), 1);
             assert_eq!(view.consent[0].title, "Window and application names");
-            assert!(!view.consent[0].granted);
+            assert!(!view.consent[0].wanted);
         }
         #[cfg(target_os = "macos")]
         {
@@ -3140,7 +3154,7 @@ mod tests {
             None,
         );
         assert!(
-            !view.consent[0].granted,
+            !view.consent[0].wanted,
             "unchecking has to show off even if the OS still holds the grant"
         );
 
@@ -4647,39 +4661,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_bad_hotkey_is_refused_rather_than_half_applied() {
-        assert_eq!(
-            parse_hotkey("B"),
-            Some(Hotkey {
-                control: false,
-                option: false,
-                shift: false,
-                command: false,
-                key: 'B',
-            })
-        );
-        assert_eq!(parse_hotkey("Control-Option-Command"), None);
-        assert_eq!(parse_hotkey("Control-F1"), None);
-        assert_eq!(parse_hotkey("Control-B-C"), None);
-        assert_eq!(parse_hotkey(""), None);
-    }
-
-    /// One chord in four spellings, because the file keeps whichever of them
-    /// the user last named.
-    #[test]
-    fn one_chord_parses_the_same_from_every_platforms_words() {
-        let mac = parse_hotkey("Control-Option-Command-B").expect("mac words");
-        assert_eq!(parse_hotkey("Ctrl-Alt-Super-B"), Some(mac.clone()));
-        assert_eq!(parse_hotkey("Ctrl-Alt-Win-B"), Some(mac.clone()));
-        assert_eq!(parse_hotkey("Ctrl-Alt-Meta-B"), Some(mac));
-    }
-
     /// The menu must not print the stored Mac spelling on a Linux or
     /// Windows keyboard, which has no such keys.
     #[test]
     fn the_shipped_default_reads_as_each_platforms_own_chord() {
-        let default = parse_hotkey(DEFAULT_HIDE_HOTKEY).expect("default parses");
+        let default = DEFAULT_HIDE_HOTKEY;
         for (words, expected) in [
             (ModifierWords::Mac, "Control-Option-Command-B"),
             (ModifierWords::Linux, "Ctrl-Alt-Super-B"),
@@ -4694,70 +4680,52 @@ mod tests {
         }
     }
 
-    /// What `display` prints is also what the hotkey field accepts back, or a
-    /// user who retypes what the settings window shows them loses the binding.
-    #[test]
-    fn every_platforms_words_parse_back_to_the_chord_they_printed() {
-        let chord = Hotkey {
-            control: true,
-            option: true,
-            shift: true,
-            command: true,
-            key: 'B',
-        };
-        for words in [
-            ModifierWords::Mac,
-            ModifierWords::Linux,
-            ModifierWords::Windows,
-        ] {
-            let printed = chord.display(words);
-            assert_eq!(
-                parse_hotkey(&printed),
-                Some(chord.clone()),
-                "{printed} did not parse back"
-            );
-        }
-    }
-
-    /// The window renders the view verbatim, so the view is where the stored
-    /// spec becomes this machine's words — whichever words the file used.
+    /// The window renders the view verbatim, so the view names the chord
+    /// in this machine's words.
     #[test]
     fn the_view_shows_the_hotkey_in_this_machines_words() {
-        let settings = Settings {
-            hide_hotkey: "Ctrl-Alt-Super-B".to_string(),
-            ..Settings::default()
-        };
-        let view = SettingsView::from_parts(
-            &settings,
-            Path::new("/tmp/memory.md"),
-            None,
-            Vec::new(),
-            Vec::new(),
-            (false, String::new(), String::new()),
-            None,
-        );
-        let expected = parse_hotkey("Ctrl-Alt-Super-B")
-            .expect("stored spec parses")
-            .display(ModifierWords::current());
-        assert_eq!(view.hide_hotkey, expected);
-    }
-
-    /// A file nobody can parse must still name the chord the shell registers.
-    #[test]
-    fn an_unreadable_spec_is_shown_as_the_default_the_shell_binds() {
-        assert_eq!(
-            display_hotkey("Control-F1"),
-            parse_hotkey(DEFAULT_HIDE_HOTKEY)
-                .expect("default parses")
-                .display(ModifierWords::current())
-        );
+        for hotkey in [
+            DEFAULT_HIDE_HOTKEY,
+            Hotkey {
+                control: false,
+                option: false,
+                shift: true,
+                command: false,
+                key: '1',
+            },
+        ] {
+            let settings = Settings {
+                hide_hotkey: hotkey,
+                ..Settings::default()
+            };
+            let view = SettingsView::from_parts(
+                &settings,
+                Path::new("/tmp/memory.md"),
+                None,
+                Vec::new(),
+                Vec::new(),
+                (false, String::new(), String::new()),
+                None,
+            );
+            let expected = match ModifierWords::current() {
+                ModifierWords::Mac => "Control-Option-Command-B",
+                ModifierWords::Linux => "Ctrl-Alt-Super-B",
+                ModifierWords::Windows => "Ctrl-Alt-Win-B",
+            };
+            assert_eq!(view.hide_hotkey, expected);
+        }
     }
 
     #[test]
     fn a_chord_with_no_modifiers_prints_just_the_letter() {
-        let printed = parse_hotkey("H")
-            .expect("letter")
-            .display(ModifierWords::Mac);
+        let printed = Hotkey {
+            control: false,
+            option: false,
+            shift: false,
+            command: false,
+            key: 'H',
+        }
+        .display(ModifierWords::Mac);
         assert_eq!(printed, "H");
     }
 
@@ -5205,6 +5173,37 @@ mod tests {
             ..SettingsPatch::default()
         };
         assert!(chat_surface_reloads(&Settings::default(), &patch));
+    }
+
+    #[test]
+    fn a_language_patch_reopens_only_when_the_resolved_language_changes() {
+        let language_patch = SettingsPatch {
+            language: Some("es".into()),
+            ..SettingsPatch::default()
+        };
+        let language_patched = language_patch.language.is_some();
+        assert!(language_requires_new_session(
+            language_patched,
+            None,
+            Some("Spanish")
+        ));
+        assert!(language_requires_new_session(
+            language_patched,
+            Some("French"),
+            None
+        ));
+        assert!(!language_requires_new_session(
+            language_patched,
+            Some("Spanish"),
+            Some("Spanish")
+        ));
+
+        let untouched = SettingsPatch::default();
+        assert!(!language_requires_new_session(
+            untouched.language.is_some(),
+            None,
+            Some("Spanish")
+        ));
     }
 
     #[test]

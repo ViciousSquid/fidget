@@ -5,6 +5,7 @@
 use serde::Deserialize;
 
 use crate::overlay::DrawTrail;
+use crate::roster::InstanceId;
 
 /// Rectangle in overlay coordinates: `[left, top, right, bottom]`.
 pub type RegionRect = [i32; 4];
@@ -21,6 +22,10 @@ pub struct OverlayRect {
     /// the rect was measured. `None` for a rect that stays put.
     #[serde(default)]
     pub follows: Option<Follows>,
+    /// Mostly clear pixels, like the possess ghost's flight. Windows' region
+    /// keeps it; an uncomposited X11 shape leaves it out, or it shows black.
+    #[serde(default)]
+    pub see_through: bool,
 }
 
 /// Which Instance a rect is placed from, and that Instance's top-left, in
@@ -56,8 +61,8 @@ pub fn follow_placements(
             }
             OverlayRect {
                 rect: [left, top, right - left, bottom - top],
-                clickable: overlay_rect.clickable,
                 follows: None,
+                ..overlay_rect.clone()
             }
         })
         .collect()
@@ -79,14 +84,33 @@ pub enum RegionPlan {
     Apply(Vec<RegionRect>),
 }
 
-/// Clears only when there is nothing at all to keep: no sprite and no rect.
-/// `trail` is already `[left, top, right, bottom]`.
-pub fn region_plan(trail: &[[i32; 4]], rects: &[OverlayRect]) -> RegionPlan {
-    let bounds = rects.iter().map(|OverlayRect { rect, .. }| {
+/// One Character's swept art on an overlay, kept apart from the others' so
+/// each Character's region shape is its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpriteArt {
+    pub instance: InstanceId,
+    pub rects: Vec<RegionRect>,
+}
+
+/// Each rect's `[left, top, right, bottom]`.
+pub fn rect_bounds(rects: &[OverlayRect]) -> impl Iterator<Item = RegionRect> + '_ {
+    rects.iter().map(|OverlayRect { rect, .. }| {
         let [x, y, width, height] = *rect;
         [x, y, x + width, y + height]
-    });
-    let region: Vec<RegionRect> = trail.iter().copied().chain(bounds).collect();
+    })
+}
+
+/// Clears only when there is nothing at all to keep: no sprite and no rect.
+/// `trail` is already `[left, top, right, bottom]`.
+pub fn region_plan<'a>(
+    trail: impl IntoIterator<Item = &'a RegionRect>,
+    rects: &[OverlayRect],
+) -> RegionPlan {
+    let region: Vec<RegionRect> = trail
+        .into_iter()
+        .copied()
+        .chain(rect_bounds(rects))
+        .collect();
     if region.is_empty() {
         RegionPlan::Clear
     } else {
@@ -165,9 +189,9 @@ pub struct DrawnInstance<'a> {
     pub offset: (i32, i32),
 }
 
-/// What an overlay draws: every Character's swept art and every overlay rect,
-/// each following rect stretched over its sprite's placements. Nothing while
-/// the Characters are hidden.
+/// What an uncomposited X11 overlay draws: every Character's swept art and
+/// every overlay rect but a see-through one, each following rect stretched over
+/// its sprite's placements. Nothing while the Characters are hidden.
 pub fn drawn_region(
     visible: bool,
     instances: &[DrawnInstance<'_>],
@@ -180,7 +204,12 @@ pub fn drawn_region(
         .iter()
         .flat_map(|instance| instance.trail.clip_rects(instance.offset))
         .collect();
-    let rects = follow_placements(rects, |id| {
+    let opaque: Vec<OverlayRect> = rects
+        .iter()
+        .filter(|rect| !rect.see_through)
+        .cloned()
+        .collect();
+    let rects = follow_placements(&opaque, |id| {
         let instance = instances.iter().find(|instance| instance.id == id)?;
         Some(instance.trail.placements(instance.offset).to_vec())
     });
@@ -217,6 +246,68 @@ pub fn characters_on_overlay<Character>(
         .collect()
 }
 
+/// A region's rects moved so their bounds start at the origin, and where
+/// they started. Two regions with the same shape differ only in position.
+#[derive(Debug, PartialEq, Eq)]
+pub struct PlacedShape {
+    pub shape: Vec<RegionRect>,
+    pub at: (i32, i32),
+}
+
+/// `rects` as a shape at the origin, and where its bounds' top-left was.
+pub fn placed_shape(rects: &[RegionRect]) -> PlacedShape {
+    let left = rects.iter().map(|rect| rect[0]).min().unwrap_or(0);
+    let top = rects.iter().map(|rect| rect[1]).min().unwrap_or(0);
+    PlacedShape {
+        shape: rects
+            .iter()
+            .map(|[l, t, r, b]| [l - left, t - top, r - left, b - top])
+            .collect(),
+        at: (left, top),
+    }
+}
+
+/// One Character's recently built regions on one overlay, keyed by shape. `H` is the region
+/// handle, built at the origin, so art that only moved reuses it at the new
+/// spot instead of rebuilding it rect by rect.
+#[derive(Debug)]
+pub struct RegionShapes<H> {
+    kept: Vec<(Vec<RegionRect>, H)>,
+}
+
+impl<H> Default for RegionShapes<H> {
+    fn default() -> Self {
+        Self { kept: Vec::new() }
+    }
+}
+
+impl<H: Copy> RegionShapes<H> {
+    /// Enough for a walk cycle: each frame and each frame change, at each of
+    /// the steps a sprite moving a fraction of a pixel a tick alternates between.
+    pub const KEPT: usize = 32;
+
+    /// The handle kept for `shape`, if any, now the most recently used.
+    pub fn get(&mut self, shape: &[RegionRect]) -> Option<H> {
+        let found = self.kept.iter().position(|(kept, _)| kept == shape)?;
+        // `keep` evicts from the front, so the back is the most recently used.
+        self.kept[found..].rotate_left(1);
+        self.kept.last().map(|(_, handle)| *handle)
+    }
+
+    /// Keep `handle` as `shape`'s region. Returns the least recently used
+    /// handle when that makes one too many, for the caller to free.
+    pub fn keep(&mut self, shape: Vec<RegionRect>, handle: H) -> Option<H> {
+        let evicted = (self.kept.len() == Self::KEPT).then(|| self.kept.remove(0).1);
+        self.kept.push((shape, handle));
+        evicted
+    }
+
+    /// Every kept handle, for the caller to free, leaving none kept.
+    pub fn take_all(&mut self) -> Vec<H> {
+        self.kept.drain(..).map(|(_, handle)| handle).collect()
+    }
+}
+
 #[cfg(test)]
 #[allow(non_upper_case_globals)]
 mod tests {
@@ -233,6 +324,7 @@ mod tests {
             rect,
             clickable: true,
             follows: None,
+            see_through: false,
         }
     }
 
@@ -241,6 +333,7 @@ mod tests {
             rect,
             clickable: false,
             follows: None,
+            see_through: false,
         }
     }
 
@@ -287,6 +380,17 @@ mod tests {
         );
     }
 
+    /// The bindings card takes the resume click. The charge bar is drawn
+    /// and passes the click through.
+    #[test]
+    fn the_possession_card_takes_a_click_and_the_charge_bar_does_not() {
+        const card: OverlayRect = clickable([40, 280, 220, 88]);
+        const bar: OverlayRect = drawn([40, 376, 220, 8]);
+        assert!(card.takes_click_at(50, 300));
+        assert!(!bar.takes_click_at(50, 380));
+        assert_eq!(clickable_rects(&[card, bar]), vec![[40, 280, 220, 88]]);
+    }
+
     /// Only a clickable rect stops the overlay passing a click, over its
     /// pixels and not one past them.
     #[test]
@@ -329,7 +433,7 @@ mod tests {
             ("bubble only", &[bubble], &[]),
             ("thinking only", &[thinking], &[]),
             (
-                "truncated speech: Open chat + bubble",
+                "truncated dialogue: Open chat + bubble",
                 &[bubble, open_chat],
                 &[[220, 140, 72, 18]],
             ),
@@ -355,6 +459,10 @@ mod tests {
     #[test]
     fn region_plan_table() {
         let art = [[100, 200, 180, 328]]; // sprite swept bounds
+        let ghost_flight = OverlayRect {
+            see_through: true,
+            ..drawn([40, 20, 220, 270])
+        };
         const open_chat: OverlayRect = clickable([220, 140, 72, 18]);
         const bubble: OverlayRect = drawn([120, 80, 200, 90]);
         const thinking: OverlayRect = drawn([150, 100, 48, 24]);
@@ -385,7 +493,7 @@ mod tests {
                 ],
             ),
             (
-                "truncated speech: Open chat + bubble",
+                "truncated dialogue: Open chat + bubble",
                 &art,
                 &[open_chat, bubble],
                 &[
@@ -395,6 +503,12 @@ mod tests {
                 ],
             ),
             ("bubble hidden", &art, &[], &[[100, 200, 180, 328]]),
+            (
+                "possess ghost in flight, mostly clear but still drawn",
+                &art,
+                &[ghost_flight],
+                &[[100, 200, 180, 328], [40, 20, 260, 290]],
+            ),
             (
                 "no sprite, bubble straddling the seam",
                 &[],
@@ -410,7 +524,7 @@ mod tests {
         ];
 
         for (name, trail, rects, expect) in rows {
-            let plan = region_plan(trail, rects);
+            let plan = region_plan(trail.iter(), rects);
             if expect.is_empty() {
                 assert_eq!(plan, RegionPlan::Clear, "{name}");
                 continue;
@@ -520,6 +634,7 @@ mod tests {
                 instance: "one".into(),
                 at: [100, 100],
             }),
+            see_through: false,
         };
         let region = drawn_region(true, &instances, &[bubble]);
         assert!(
@@ -545,6 +660,26 @@ mod tests {
         assert!(shows(&region, (101, 101)), "{region:?}");
     }
 
+    /// A ghost's flight is mostly clear pixels, which an uncomposited X11
+    /// shape would fill black, so only the art is shown.
+    #[test]
+    fn a_see_through_rect_is_not_drawn() {
+        let trail = trail_through(&[(100, 100)]);
+        let instances = [DrawnInstance {
+            id: "one",
+            trail: &trail,
+            offset: (0, 0),
+        }];
+        let flight = OverlayRect {
+            see_through: true,
+            ..drawn([0, 0, 400, 400])
+        };
+        assert_eq!(
+            drawn_region(true, &instances, &[flight]),
+            drawn_region(true, &instances, &[])
+        );
+    }
+
     /// Hidden Characters draw nothing, bubble included.
     #[test]
     fn hidden_characters_draw_nothing() {
@@ -558,6 +693,7 @@ mod tests {
             rect: [100, 40, 40, 20],
             clickable: false,
             follows: None,
+            see_through: false,
         };
         assert_eq!(
             drawn_region(false, &instances, &[bubble]),
@@ -666,5 +802,51 @@ mod tests {
         shapes.fit(1);
         shapes.fit(2);
         assert_eq!(shapes[1].change_for(false, || drawn.clone()), None);
+    }
+
+    /// BMO walking: the same frame one step later is the same shape, found
+    /// again with the step as its new top-left.
+    #[test]
+    fn a_region_that_only_moved_is_found_again_where_it_now_is() {
+        let walking = [[100, 200, 180, 328], [120, 80, 320, 170]];
+        let stepped = [[103, 199, 183, 327], [123, 79, 323, 169]];
+        let mut shapes = RegionShapes::default();
+        let first = placed_shape(&walking);
+        assert_eq!(shapes.get(&first.shape), None);
+        assert_eq!(shapes.keep(first.shape, 7), None);
+
+        let next = placed_shape(&stepped);
+        assert_eq!(shapes.get(&next.shape), Some(7));
+        assert_eq!((first.at, next.at), ((100, 80), (103, 79)));
+
+        let next_frame = placed_shape(&[[103, 199, 190, 327], [123, 79, 323, 169]]);
+        assert_eq!(shapes.get(&next_frame.shape), None);
+    }
+
+    /// A walk cycle's frames, each kept as its own shape: one used again stays,
+    /// and the least recently used one is handed back to be freed.
+    #[test]
+    fn a_character_keeps_its_recent_shapes_and_frees_the_oldest() {
+        let frame = |n: i32| vec![[0, 0, 10 + n, 10]];
+        let mut shapes = RegionShapes::default();
+        for n in 0..RegionShapes::<i32>::KEPT as i32 {
+            assert_eq!(shapes.keep(frame(n), n), None);
+        }
+        assert_eq!(shapes.get(&frame(0)), Some(0));
+
+        assert_eq!(shapes.keep(frame(100), 100), Some(1));
+        assert_eq!(shapes.get(&frame(1)), None);
+        assert_eq!(shapes.get(&frame(0)), Some(0));
+        assert_eq!(shapes.get(&frame(100)), Some(100));
+    }
+
+    #[test]
+    fn clearing_hands_back_every_kept_region() {
+        let mut shapes = RegionShapes::default();
+        shapes.keep(vec![[0, 0, 4, 4]], 1);
+        shapes.keep(vec![[0, 0, 8, 4]], 2);
+        assert_eq!(shapes.take_all(), vec![1, 2]);
+        assert_eq!(shapes.get(&[[0, 0, 4, 4]]), None);
+        assert_eq!(shapes.take_all(), Vec::<i32>::new());
     }
 }

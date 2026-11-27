@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::overlay::AlphaMask;
 
-use super::manifest::{DeclaredAnimation, DeclaredBehavior};
+use super::manifest::{Declared, DeclaredAnimation, DeclaredBehavior};
 use super::{
-    Animation, Art, Behavior, PackageBytes, ALPHA_THRESHOLD, MAX_CHARACTER_PIXELS, MAX_FRAME_SIDE,
-    SHOWN_LOOP_BEHAVIORS,
+    Animation, Art, Behavior, Facing, PackageBytes, ALPHA_THRESHOLD, MAX_CHARACTER_PIXELS,
+    MAX_FRAME_SIDE, SHOWN_LOOP_BEHAVIORS,
 };
 
 /// Check every declared Animation against package art and decode what passes.
@@ -17,6 +17,8 @@ use super::{
 pub(super) fn resolve_animations(
     package: &PackageBytes,
     declared: BTreeMap<String, DeclaredAnimation>,
+    facing: Facing,
+    frame_facing: &BTreeMap<String, Facing>,
     errors: &mut Vec<String>,
 ) -> (BTreeMap<String, Animation>, BTreeMap<String, Art>) {
     let mut animations = BTreeMap::new();
@@ -80,6 +82,8 @@ pub(super) fn resolve_animations(
                     fps: declaration.fps,
                     looping: declaration.looping,
                     variants: Vec::new(),
+                    variant_of: declaration.variant_of.clone(),
+                    same_as: None,
                     left_strip: None,
                     weight: declaration.weight,
                 },
@@ -102,11 +106,13 @@ pub(super) fn resolve_animations(
         let bytes = &package[&frame];
         match AlphaMask::from_png(bytes, ALPHA_THRESHOLD) {
             Ok(mask) => {
+                let facing = frame_facing.get(&frame).copied().unwrap_or(facing);
                 art.insert(
                     frame,
                     Art {
                         png: bytes.clone(),
                         mask,
+                        facing,
                     },
                 );
             }
@@ -119,11 +125,67 @@ pub(super) fn resolve_animations(
     (animations, art)
 }
 
+/// Every `[frame_facing]` entry names a frame some Animation plays, so a typo
+/// cannot leave the real frame quietly facing the default.
+pub(super) fn check_frame_facing(declared: &Declared, errors: &mut Vec<String>) {
+    for frame in declared.frame_facing.keys() {
+        let mut played = declared.animations.values().flat_map(|a| &a.frames);
+        if !played.any(|f| f == frame) {
+            errors.push(format!(
+                "frame_facing names {frame:?}, which no animation plays"
+            ));
+        }
+    }
+}
+
+/// Validate every `same_as` and hand back the (alias, owner) pairs. One hop:
+/// the owner draws its own frames, so an alias never resolves through another.
+pub(super) fn check_same_as(
+    declared: &BTreeMap<String, DeclaredAnimation>,
+    same_as: &BTreeMap<String, String>,
+    errors: &mut Vec<String>,
+) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for (name, owner) in same_as {
+        if owner == name {
+            errors.push(format!("animation {name:?} is the same_as itself"));
+        } else if same_as.contains_key(owner) {
+            errors.push(format!(
+                "animation {name:?} is the same_as {owner:?}, itself a same_as; \
+                 name the animation that owns the frames"
+            ));
+        } else if !declared.contains_key(owner) {
+            errors.push(format!(
+                "animation {name:?} is the same_as {owner:?}, which is not declared"
+            ));
+        } else {
+            pairs.push((name.clone(), owner.clone()));
+        }
+    }
+    pairs
+}
+
+/// A `variant_of` or `left_of` naming a `same_as` table, which owns no frames
+/// to ring or face. `None` when `base` is not one.
+fn names_an_alias(
+    name: &str,
+    key: &str,
+    base: &str,
+    same_as: &BTreeMap<String, String>,
+) -> Option<String> {
+    let owner = same_as.get(base)?;
+    Some(format!(
+        "animation {name:?} is a {key} {base:?}, a same_as {owner:?}; \
+         name the animation that owns the frames"
+    ))
+}
+
 /// Validate every `variant_of` and hand back the (variant, base) pairs.
 /// A variant is more art for an Animation the engine already plays, never a new
 /// Behavior. A held last frame would stall; a variant of a variant nests a ring.
 pub(super) fn check_variants(
     declared: &BTreeMap<String, DeclaredAnimation>,
+    same_as: &BTreeMap<String, String>,
     errors: &mut Vec<String>,
 ) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
@@ -131,6 +193,21 @@ pub(super) fn check_variants(
         let Some(base) = &animation.variant_of else {
             continue;
         };
+        if base == super::IDLE_GESTURE {
+            // "idle-gesture" is a category. The Animation keeps its own name.
+            if !animation.looping {
+                errors.push(format!(
+                    "animation {name:?} is a variant_of \"idle-gesture\", and must \
+                     loop \"forever\"; its art loops, while the engine schedules one \
+                     pass per idle gesture"
+                ));
+            }
+            continue;
+        }
+        if let Some(error) = names_an_alias(name, "variant_of", base, same_as) {
+            errors.push(error);
+            continue;
+        }
         match declared.get(base) {
             _ if base == name => errors.push(format!("animation {name:?} is a variant_of itself")),
             None => errors.push(format!(
@@ -155,6 +232,7 @@ pub(super) fn check_variants(
 /// strips instead of mirroring a cheek mark. A different length would play two animations.
 pub(super) fn check_left_strips(
     declared: &BTreeMap<String, DeclaredAnimation>,
+    same_as: &BTreeMap<String, String>,
     errors: &mut Vec<String>,
 ) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
@@ -163,6 +241,10 @@ pub(super) fn check_left_strips(
         let Some(base) = &animation.left_of else {
             continue;
         };
+        if let Some(error) = names_an_alias(name, "left_of", base, same_as) {
+            errors.push(error);
+            continue;
+        }
         match declared.get(base) {
             _ if base == name => errors.push(format!("animation {name:?} is a left_of itself")),
             None => errors.push(format!(
@@ -202,9 +284,11 @@ fn art_size(bytes: &[u8]) -> Result<(u32, u32), String> {
 }
 
 /// Weight-0 Behaviors for each `ASKABLE_PRIMITIVES` entry whose name is free
-/// and whose Primitive no declared Behavior already plays. Author entries win.
-/// Exclusions (land/hold/talk/idle) live on that table's comment.
-fn ensure_default_behaviors(declared: &mut BTreeMap<String, DeclaredBehavior>) {
+/// and whose Primitive no declared Behavior already plays. Returns their names:
+/// the Behaviors not in the manifest. Author entries win; exclusions
+/// (land/hold/talk/idle) are on that table.
+fn ensure_default_behaviors(declared: &mut BTreeMap<String, DeclaredBehavior>) -> BTreeSet<String> {
+    let mut added = BTreeSet::new();
     for &(name, primitive) in super::ASKABLE_PRIMITIVES {
         if declared.contains_key(name) {
             continue;
@@ -219,12 +303,16 @@ fn ensure_default_behaviors(declared: &mut BTreeMap<String, DeclaredBehavior>) {
             name.to_string(),
             DeclaredBehavior {
                 primitives: vec![primitive],
+                animation: None,
                 then: None,
                 weight: 0,
                 trigger: None,
+                idle_type: false,
             },
         );
+        added.insert(name.to_string());
     }
+    added
 }
 
 /// Check that every Behavior can be played to an end. A chain that returns to
@@ -234,7 +322,7 @@ pub(super) fn resolve_behaviors(
     mut declared: BTreeMap<String, DeclaredBehavior>,
     errors: &mut Vec<String>,
 ) -> BTreeMap<String, Behavior> {
-    ensure_default_behaviors(&mut declared);
+    let not_in_manifest = ensure_default_behaviors(&mut declared);
 
     for (name, declaration) in &declared {
         if let Some(next) = &declaration.then {
@@ -281,17 +369,54 @@ pub(super) fn resolve_behaviors(
     declared
         .into_iter()
         .map(|(name, declaration)| {
+            let not_in_manifest = not_in_manifest.contains(&name);
             (
                 name,
                 Behavior {
                     primitives: declaration.primitives,
+                    animation: declaration.animation,
                     then: declaration.then,
                     weight: declaration.weight,
                     trigger: declaration.trigger,
+                    not_in_manifest,
+                    idle_type: declaration.idle_type,
                 },
             )
         })
         .collect()
+}
+
+/// A Behavior `animation` must name an idle-gesture Animation. A real gesture
+/// mixed with Primitives is refused as mixed; an unknown token is named as invalid.
+pub(super) fn check_play_animations(
+    behaviors: &BTreeMap<String, Behavior>,
+    animations: &BTreeMap<String, Animation>,
+    errors: &mut Vec<String>,
+) {
+    let gestures: Vec<&str> = animations
+        .iter()
+        .filter(|(_, animation)| animation.is_idle_gesture())
+        .map(|(name, _)| name.as_str())
+        .collect();
+    for (name, behavior) in behaviors {
+        let Some(animation) = behavior.animation.as_deref() else {
+            continue;
+        };
+        let mixed = !behavior.primitives.is_empty();
+        let known = gestures.contains(&animation);
+        if mixed && known {
+            errors.push(format!(
+                "play for behavior {name:?} mixes Primitives and idle-gestures; use one or the other"
+            ));
+            continue;
+        }
+        if !known {
+            errors.push(format!(
+                "behavior {name:?} declares {animation:?}, which is not a Primitive or an idle-gesture"
+            ));
+            continue;
+        }
+    }
 }
 
 /// The loop a chain closes, from where it closes, for the author to read.
@@ -560,6 +685,61 @@ mod tests {
                 (budget as u64 + 1) * pixels
             )],
             "the author is told how much art they declared and how much a Character may hold"
+        );
+    }
+
+    /// Idle swaps members in the middle of a stretch, so a different frame
+    /// size would jump the sprite. A walk ring is drawn once and may differ.
+    #[test]
+    fn an_idle_ring_member_must_share_the_base_frame_size() {
+        let mut idle_package = art();
+        idle_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        idle_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.spin]\nframes = [\"wide-0.png\"]\nvariant_of = \"idle\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            errors(load(&idle_package)),
+            vec![
+                "animation \"spin\" frames are 4x4, and its base \"idle\" is 2x2; \
+                 idle loops and idle-gestures share the base frame size"
+                    .to_string()
+            ]
+        );
+
+        let mut walk_package = art();
+        walk_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        walk_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.ballwalk]\nframes = [\"wide-0.png\"]\nvariant_of = \"walk\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        load(&walk_package).expect("a walk ring is drawn once and may differ in size");
+
+        let mut gesture_package = art();
+        gesture_package.insert("wide-0.png".to_string(), png_bytes(4, 4));
+        gesture_package.insert(
+            CHARACTER_MANIFEST_FILE.to_string(),
+            format!(
+                "{}[animations.groom]\nframes = [\"wide-0.png\"]\nvariant_of = \"idle-gesture\"\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            )
+            .into_bytes(),
+        );
+        assert_eq!(
+            errors(load(&gesture_package)),
+            vec![
+                "animation \"groom\" frames are 4x4, and its base \"idle\" is 2x2; \
+                 idle loops and idle-gestures share the base frame size"
+                    .to_string()
+            ]
         );
     }
 

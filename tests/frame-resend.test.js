@@ -11,6 +11,9 @@ import { pageWait } from "./page-wait.js";
 
 const SRC = fileURLToPath(new URL("../src/", import.meta.url));
 
+const ART =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
 const frame = {
   sprites: [
     {
@@ -62,7 +65,7 @@ function run() {
   window.__TAURI__ = {
     core: {
       invoke(name) {
-        if (name === "character") return Promise.resolve({ characters: {} });
+        if (name === "character") return Promise.resolve({ characters: { "Buddy Bot": { art: { idle: [${JSON.stringify(ART)}, ${JSON.stringify(ART)}] } } } });
         return Promise.resolve();
       },
     },
@@ -129,7 +132,7 @@ test("a late listener's first placement is drawn", { skip: chromeSkip, timeout: 
   assert.equal(asks.first, 1);
   assert.deepEqual(drawn, {
     visibility: "visible",
-    transform: "translate(200px, 200px) scaleX(1)",
+    transform: "translate(200px, 200px)",
     animation: "idle",
     frameIndex: "0",
   });

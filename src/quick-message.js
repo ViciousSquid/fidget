@@ -45,11 +45,11 @@ export function quickMessageMirror(text, prompt, available) {
   return "\u200b";
 }
 
-// Auto-hide after 3s continuously away from both sprite and pill.
+// Auto-hide after 1.5s continuously away from both sprite and pill.
 // Re-entering resets the wait.
-export const AUTO_HIDE_DELAY_MS = 3000;
+export const AUTO_HIDE_DELAY_MS = 1500;
 
-// While Speech or thinking is up the Character has the floor, so an empty
+// While the Speech bubble or thinking is up the Character has the floor, so an empty
 // pill the pointer left gives way. Only long enough to cross onto the pill.
 export const BUBBLE_YIELD_MS = 1000;
 
@@ -107,6 +107,8 @@ export function createQuickMessage({
   // The overlay re-reports hover every frame. Summon and Send leave the
   // pointer on the Character, and that report would open the pill again.
   let yielded = false;
+  // The Character's menu is open. The user is there, not here.
+  let menuOpen = false;
   let bubbleUp = false;
   let ready = available;
   // Whether this overlay owns the Instance's bubble, as the last placement said.
@@ -156,6 +158,11 @@ export function createQuickMessage({
     if (was) changed();
   }
 
+  // An empty pill is the dwell this menu suspends. A typed draft stays.
+  function hideEmpty() {
+    if (visible && !hasText()) hide();
+  }
+
   function show() {
     if (visible || disposed) return;
     visible = true;
@@ -192,6 +199,14 @@ export function createQuickMessage({
     return true;
   }
 
+  // `hold` is the Summon rule: a pointer still on the Character must not
+  // reopen the pill. A choice made after the pointer left must not swallow
+  // the next hover.
+  function yieldPill(hold) {
+    if (hold) yielded = true;
+    dismissOpen();
+  }
+
   return {
     get visible() {
       return visible;
@@ -218,7 +233,7 @@ export function createQuickMessage({
       if (disposed) return;
       overSprite = true;
       cancelAutoHide();
-      if (yielded || visible || hoverTimer !== null) return;
+      if (yielded || menuOpen || visible || hoverTimer !== null) return;
       hoverTimer = schedule(() => {
         hoverTimer = null;
         if (disposed || !overSprite) return;
@@ -304,8 +319,31 @@ export function createQuickMessage({
     // The overlay lost the keyboard to another window. The same as a drag.
     away: keepTyped,
     summon() {
+      yieldPill(true);
+    },
+    // The user picked another activity. Hold only while the pointer is still here.
+    aside() {
+      yieldPill(overSprite || overPill);
+    },
+    // A right-press on the Character opens its menu. The native menu blocks
+    // the Shell, so its menu_open frame lands only after the close while this
+    // timer keeps running. Hold like a Summon from the press itself.
+    menuPress() {
       yielded = true;
-      dismissOpen();
+      cancelHover();
+      hideEmpty();
+    },
+    // No dwell runs under the menu. Its close holds like a Summon, because
+    // the pointer it leaves on the Character is not a new hover.
+    setMenu(open) {
+      if (open === menuOpen) return;
+      menuOpen = open;
+      cancelHover();
+      if (open) {
+        hideEmpty();
+        return;
+      }
+      yielded = true;
     },
     submit,
     restore(value) {
@@ -413,7 +451,7 @@ export function createDraftReporter(invoke) {
   };
 }
 
-// Same seat as a speech line or the thinking dots. When that box is already
+// Same seat as the Speech bubble or the thinking dots. When that box is already
 // there, step clear of it so a hover does not cover it.
 export function placeQuickMessage(spriteRect, size, bounds, speechRect) {
   const pos = placeBubble(spriteRect, size, bounds);

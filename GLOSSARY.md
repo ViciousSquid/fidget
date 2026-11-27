@@ -73,11 +73,18 @@ _Avoid_: Clip, sprite, sequence
 
 **Variant**:
 An Animation declared `variant_of` another. A base Animation and its variants
-form a ring, and when the engine asks for the base it draws one member of that
-ring instead — chosen once, when the Animation starts, and played until the
-engine asks for a different Animation. A member's `weight` is its share against
-the others and 10 when undeclared, so a ring nobody weighs is an even split and
-a member can be weighed below the default as well as above it.
+form a ring. `variant_of` `"idle"` is a calm loop of the declared `idle` Animation.
+`variant_of` `"idle-gesture"` marks this Animation as an idle-gesture. That is
+a category of Animation, not a Behavior type, and no Animation is named
+`idle-gesture`. The Engine
+plays a loop, waits a seeded gap, plays one gesture from its first frame, then
+picks a loop again. A Behavior's `idle`
+Primitive still draws one loop-ring member and loops it, unless that Behavior
+is `type = "idle"`, which uses the same loops and gestures. Every other ring
+draws one member when that Animation starts and plays it until the engine asks
+for a different Animation. A member's `weight` is its share against the others
+and 10 when undeclared, so a ring nobody weighs is an even split and a member
+can be weighed below the default as well as above it.
 Nothing bounds the total. The draw is seeded: one seed and one Character draw
 the same members on every machine. #316.
 _Avoid_: Alternate, costume, skin, random animation, mood
@@ -87,9 +94,25 @@ An Animation declared `left_of` another, drawn in its place while the sprite
 travels left instead of the renderer mirroring the base. The same number of
 frames and the same frame size as the base, so turning round changes only which
 art plays. For asymmetric art: a mark on one cheek survives the turn, where a
-mirror would move it to the other. Optional — an Animation with no strip is
-mirrored as every Character's has always been. #345.
+mirror would move it to the other. Optional. A strip's frames mirror by their
+Facing like any other frame, so a strip drawn facing left declares it. #345.
 _Avoid_: Flipped animation, left walk, direction variant
+
+**Same As**:
+An Animation declared `same_as` another, with no frames of its own: a second
+name for one clip, played with the owner's frames, fps and loop. It joins no
+ring and no idle-gesture category. A required slot uses it when its clip is
+another Animation's, so the frames are listed once: Rubber Duck's `sit` is the
+same as its `pondering`. One clip at two speeds stays two Animations on the
+same frame files.
+_Avoid_: Alias, copy, duplicate animation
+
+**Facing**:
+Which way a frame's art faces as drawn, left or right: the Character
+Manifest's `facing` default, or the frame's own `[frame_facing]` entry. The
+renderer mirrors a frame exactly when its Facing is not the way the sprite
+travels. A frame facing the viewer keeps the default. #2069.
+_Avoid_: Direction, orientation, heading (the way the sprite travels)
 
 **Required Animation Set**:
 The animations every Character Package must supply for the engine to drive it.
@@ -132,9 +155,19 @@ Characters may compose Primitives but never define new ones.
 _Avoid_: Action, command, step
 
 **Behavior**:
-A named sequence of Primitives with weights and trigger conditions, declared as
-data in a Character Package. The unit the Director proposes and the engine plays.
+A named play list with weights and trigger conditions, declared as data in a
+Character Package. `play` is either an ordinary sequence of Primitives, or one
+named idle-gesture Animation that plays one pass — not mixed. The unit the Director
+proposes and the engine plays.
 _Avoid_: Routine, script, macro
+
+**Animation source**:
+Who owns the Animation on screen, shown in the expanded Chat status: Idle Loop,
+Engine, Local Director (the Static Director's weighted pick), AI Requested (an
+AI Director reply), AI MCP (an MCP Expression tool), User Invoked, AI Feedback
+(Harness turn beats and the question-wait ask) or Onboarding (the first-run
+gesture tips). The owner of what plays, never the latest request. #2160.
+_Avoid_: Trigger (a Behavior's own field), cause, origin
 
 **Director**:
 The role that proposes a Behavior, and Dialogue when the session is on. Static
@@ -198,6 +231,17 @@ on a Surface, was lifted onto one, stands where it stood, hangs in the air, or
 met a wall or the ceiling. An observation only — what the sprite becomes as a
 result is the State machine's decision, never the Contact's.
 _Avoid_: Collision, hit, event
+
+**Move**:
+A walk to one x that a Harness asks for with the `move` tool, as a distance or
+a time to the left or right, or as a spot `whereabouts` reported. The Engine
+keeps that x beside the Primitives, not as one, so no Primitive's turn ends a
+Move. A Behavior that needs the feet is refused until the Move ends. Arrival
+ends it, and so do a Grab, a fall, a Poke or a Summon, Possession, Do Not
+Disturb, and the end of the Surface underfoot. Nothing resumes it, and it never
+crosses to another display. A Speech bubble does not stop it, and a second Move
+replaces it.
+_Avoid_: Errand, path, order
 
 ### Layers
 
@@ -296,6 +340,40 @@ Right-click on the sprite, or Control-click on macOS — character switching, se
 The deliberate act that opens the Functional Layer.
 _Avoid_: Invoke, activate, wake
 
+**Possession**:
+The switch that hands a fidget to the user's keyboard. Left and Right walk it,
+Up takes the wall it stands against, Down drops it through its Perch, Space
+makes it jump, the digits 1 to 9 play one pass of its Animations in name
+order, and Escape releases it. On a wall it climbs while Up is held, climbs
+down while Down is held, and holds still under neither. It stops at the top
+of the display and steps onto what is under the wall when it reaches it.
+A digit plays the Animation alone, never a
+Behavior or its `then`. The digits skip the required Animations, which the
+Engine plays, and every Animation the controls already draw: walk, jump,
+fall, land, climb, hold on a Perch, grab under the mouse, and possessed.
+They keep `react`, `sit`, `sleep` and `talk`: a digit plays one pass of
+the clip, never a Behavior that plays it. A Perch still draws `sit`, a
+poke still plays `react`, and Dialogue still draws `talk`. They skip
+drawn variants, left strips and `same_as` names too, all by declaration.
+A later name whose ordered frame-path list matches one already kept,
+ignoring fps and loop, shares that digit, and the card joins their
+display names with `/`. An idle-gesture keeps its digit
+when a required slot is the same as it. The fidget is possessed, the way
+a ghost possesses a body, and the Director's prompt says so.
+Possession applies to one Character Instance.
+Possessing another releases the first. It is not a State, so a possessed sprite
+still falls, perches and can be grabbed, and it stays possessed when another
+window takes the keyboard. The Director hears only that the fidget was possessed
+and released, never the moves in between, so it comes to dazed, not sure how it
+got where it is. Users see it explained as "Manually drive the fidget on your
+screen". Possessing plays the optional `possessed` Animation, or `react` in a
+package without it. #1655, #1950.
+
+**Possess, Release**:
+The verbs that turn Possession on and off, and the Menu row's two labels.
+Escape, hiding, Quit and removing the Instance also release. This Release is
+not the release of a Grab that ends in a Throw.
+
 ### Expression
 
 **Dialogue**:
@@ -355,15 +433,16 @@ _Avoid_: Chat window, console, terminal, prompt box, Chat UI (its visual
 design, not the window)
 
 **Chat UI**:
-A named, swappable visual design for the Chat surface — palette, type scale and
-shape — defined in `src/chat-ui.css` and applied by a class on the root element
-of the Chat surface's own document. Not the surface itself: the surface is the
-window, and a Chat UI is one of the designs it can be drawn in. Reaches nothing
-the overlay draws by itself — a Character's art never, and the Speech bubble
-only the opaque panel tokens in `src/chat-shared.css` that the default Chat UI
-and the overlay both import (#441, #456, #545) — and is not the light or dark
-theme the operating system supplies. The user picks one for the whole app in
-Settings. #355, #348, #1068, ADR-0036.
+A named visual design the user can swap for the Chat surface. It sets the
+palette, fonts and shape through tokens in `src/ui-tokens.css`, and a class
+on the root element of the surface's document applies it. It is not the surface
+itself. The surface is the window, and a Chat UI is one design the window can
+use. It applies to app chrome, which includes the Possession card on the
+overlay. It never applies to a Character's expression. A Character's art takes
+none of it, and the Speech bubble shares only the opaque tokens in
+`src/bubble-tokens.css` with the default Chat UI (#441, #456, #545). It is not
+the light or dark theme the operating system supplies. The user picks one for
+the whole app in Settings. #355, #348, #1068, #2152, ADR-0041.
 _Avoid_: Look, theme, skin, style, variant, design
 
 **Caffeinate**:

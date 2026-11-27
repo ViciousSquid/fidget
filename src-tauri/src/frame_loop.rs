@@ -5,16 +5,20 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use fidget_core::character::IdleBeat;
 use fidget_core::director::{self, Context, Happened, Lately, Wake};
 use fidget_core::dispatch::{
     dispatch, DenyList, DispatchContext, FeetAt, InstanceInfo, PlacementQuery,
 };
-use fidget_core::engine::{BehaviorProposal, State, Verb};
+use fidget_core::engine::{BehaviorProposal, DigitAnimation, State, Verb};
 use fidget_core::input::press_target;
 #[cfg(not(target_os = "macos"))]
 use fidget_core::overlay::DrawTrail;
-use fidget_core::overlay::{bubble_owner, display_index_for, drawn_frame, place_sprite};
-use fidget_core::quick_message::walk_held;
+use fidget_core::overlay::{
+    bubble_owner, display_index_for, drawn_frame, place_sprite, usable_in_overlay,
+};
+use fidget_core::possession::{digit_animations, Intent};
+use fidget_core::quick_message::speaking_for;
 use fidget_core::roster::{InstanceId, Roster};
 use fidget_core::scheduler;
 use fidget_core::sensing::{Activity, DesktopSense, SystemClock};
@@ -28,14 +32,15 @@ use super::chat_surface::{CHAT_APPEARANCE_EVENT, CHAT_EVENT, CHAT_STATUS_EVENT, 
 use super::session_log;
 use super::settings::{ChatAppearance, SettingsOp};
 use super::{
-    apply_menu_action, bring_roster_off_fullscreen, cancelled_caret, chat_label, close_chat,
-    completer, describe_menu, dev_flags, harness, mcp_http, mcp_resources, menu, menu_caffeinate,
-    model, note_caffeinate_view, note_happened, open_chat, overlay_label, paced, place_overlays,
-    platform, publish_instances, push_chat_opening, push_chat_openings, remember_instances,
-    spawn_live, sprite_width, switch_instance, tray, ChatMsg, ChatReply, ChatStatus,
-    ChatStatusPush, DirectorRun, Drawn, FrameExtras, InstanceState, MenuChannel, MenuHold,
-    MenuSignal, Placed, Placement, SpritePlacement, Traced, TrayHandle, ENGINE_TICK, FRAME_EVENT,
-    MENU_HOLD_TIMEOUT, SENSE_INTERVAL,
+    apply_keyboard_flips, apply_menu_action, bring_roster_off_fullscreen, cancelled_caret,
+    chat_label, chat_status, close_chat, completer, describe_menu, dev_flags, harness, mcp_http,
+    mcp_resources, menu, menu_caffeinate, model, note_caffeinate_view, note_happened, open_chat,
+    overlay_label, overlay_request_focus, paced, place_overlays, platform, possession,
+    publish_instances, push_chat_opening, push_chat_openings, quit_now, remember_instances,
+    spawn_live, sprite_width, switch_instance, tray, ChatMsg, ChatReply, ChatStatusPush,
+    DirectorRun, Drawn, FrameExtras, InstanceState, MenuChannel, MenuEffect, MenuHold, MenuSignal,
+    Placed, Placement, QuickMessageAside, SpritePlacement, Traced, TrayHandle, WorkArea,
+    ENGINE_TICK, FRAME_EVENT, MENU_HOLD_TIMEOUT, SENSE_INTERVAL,
 };
 use super::{caffeinate_frame, emit_chat_notice};
 
@@ -71,11 +76,14 @@ type SpriteMaskParams = (Vec<bool>, i32, i32, bool, i32);
 #[cfg(any(test, all(unix, not(target_os = "macos"))))]
 type MaskParams = (Vec<SpriteMaskParams>, Vec<[i32; 4]>);
 
-/// One Windows overlay's last applied region: the sprite's swept ink and the
+/// One Windows overlay's last applied region: each sprite's swept ink and the
 /// rects the renderer draws outside it. The region is what gets compared, so a
-/// trail that settles after a walk still rebuilds it.
+/// trail that settles after a walk still updates it.
 #[cfg(not(unix))]
-type RegionParams = (Vec<[i32; 4]>, Vec<fidget_core::overlay_region::OverlayRect>);
+type RegionParams = (
+    Vec<fidget_core::overlay_region::SpriteArt>,
+    Vec<fidget_core::overlay_region::OverlayRect>,
+);
 
 /// Every Character whose sprite reaches into `display`'s overlay, in placement
 /// order: the X11 input mask and the Windows region hold them all.
@@ -111,13 +119,13 @@ enum RegionAction {
 /// passes clicks, and one already doing so needs no call.
 #[cfg(any(test, not(unix)))]
 fn decide_region_action(
-    sprite: &[[i32; 4]],
+    art: &[fidget_core::overlay_region::SpriteArt],
     rects: &[fidget_core::overlay_region::OverlayRect],
     ignore: bool,
 ) -> RegionAction {
     use fidget_core::overlay_region::{region_plan, RegionPlan};
 
-    if region_plan(sprite, rects) != RegionPlan::Clear {
+    if region_plan(art.iter().flat_map(|sprite| &sprite.rects), rects) != RegionPlan::Clear {
         RegionAction::ApplyMask
     } else if ignore {
         RegionAction::Nothing
@@ -147,6 +155,16 @@ fn decide_overlay_action<Shape: PartialEq>(
     }
 }
 
+/// A display can go between queueing a callback and running it. The shrink
+/// already reset that overlay to resend, so its result is dropped. A regrown
+/// slot is the same hidden window, so a late result there still holds.
+#[cfg(any(test, not(target_os = "macos")))]
+fn record_for_overlay<T>(per_overlay: &Mutex<Vec<T>>, index: usize, value: T) {
+    if let Some(slot) = per_overlay.lock().unwrap().get_mut(index) {
+        *slot = value;
+    }
+}
+
 /// The frame loop: assemble a snapshot, tick the Engine, apply the `Frame`.
 /// Webview and hit-test share a loop; the hit-test leads by up to one tick (src/interpolate.js).
 // One over clippy's cap: Director config belongs here, not mixed with window geometry.
@@ -158,6 +176,144 @@ fn chat_dialogue<'a>(
     from_engine_frame: Option<&'a str>,
 ) -> Option<&'a str> {
     parsed_from_harness.or(from_engine_frame)
+}
+
+fn possession_window(roster: &Roster, id: &str, frames: &[Rect]) -> String {
+    let index = roster
+        .get(id)
+        .and_then(|instance| {
+            let feet = instance.feet();
+            display_index_for((feet.x, feet.y), frames)
+        })
+        .unwrap_or(0);
+    overlay_label(index)
+}
+
+fn hold_possession_keyboard(app: &tauri::AppHandle, window: &str, holding: bool) {
+    let (flips, process_empty) = super::pill_focus::shared()
+        .lock()
+        .map(|mut pills| {
+            let flips = pills.note_possession(window, holding);
+            (flips, !pills.any_open())
+        })
+        .unwrap_or((Vec::new(), true));
+    apply_keyboard_flips(app, flips, process_empty);
+}
+
+fn begin_possession(
+    app: &tauri::AppHandle,
+    session: &mut Option<possession::Session>,
+    lives: &mut [InstanceState],
+    id: &str,
+    window: &str,
+) {
+    if session
+        .as_ref()
+        .is_some_and(|session| session.instance == id)
+    {
+        return;
+    }
+    if let Some(old) = session.take() {
+        hold_possession_keyboard(app, &old.window, false);
+    }
+    *session = Some(possession::Session::start(id, window));
+    if let Some(live) = lives.iter_mut().find(|live| live.id == id) {
+        note_happened(&mut live.happened, Happened::PossessionStart);
+        live.addressed = true;
+    }
+    hold_possession_keyboard(app, window, true);
+    if let Some(overlay) = app.get_webview_window(window) {
+        if let Err(why) = overlay_request_focus(overlay) {
+            eprintln!("possession: {window} could not take the keyboard: {why}");
+        }
+    }
+}
+
+/// Only the overlay drawing the card hears keys, so the keyboard moves with the
+/// card. A paused session only relabels: the user's app keeps focus.
+fn follow_possession_display(
+    app: &tauri::AppHandle,
+    session: &mut possession::Session,
+    window: String,
+    now: Instant,
+) {
+    if session.window == window {
+        return;
+    }
+    hold_possession_keyboard(app, &window, true);
+    hold_possession_keyboard(app, &session.window, false);
+    if !session.move_to(window.as_str(), now) {
+        return;
+    }
+    if let Some(overlay) = app.get_webview_window(&window) {
+        if let Err(why) = overlay_request_focus(overlay) {
+            eprintln!("possession: {window} could not take the keyboard: {why}");
+        }
+    }
+}
+
+fn end_possession(
+    app: &tauri::AppHandle,
+    session: &mut Option<possession::Session>,
+    roster: &mut Roster,
+    lives: &mut [InstanceState],
+    reason: possession::Release,
+) {
+    let Some(old) = session.take() else {
+        return;
+    };
+    if let Some(instance) = roster.get_mut(old.instance.as_str()) {
+        instance.set_possessed(false);
+    }
+    if let Some(live) = lives.iter_mut().find(|live| live.id == old.instance) {
+        note_happened(&mut live.happened, Happened::PossessionEnd);
+        live.addressed = true;
+    }
+    hold_possession_keyboard(app, &old.window, false);
+    eprintln!("possession: {}", release_word(reason));
+}
+
+fn release_word(reason: possession::Release) -> &'static str {
+    match reason {
+        possession::Release::Escape => "escape",
+        possession::Release::Menu => "release",
+        possession::Release::Hide => "hide",
+        possession::Release::Quit => "quit",
+        possession::Release::FullscreenHide => "fullscreen",
+        possession::Release::Removed => "removed",
+    }
+}
+
+fn take_menu_effect(
+    effect: MenuEffect,
+    app: &tauri::AppHandle,
+    session: &mut Option<possession::Session>,
+    roster: &mut Roster,
+    lives: &mut [InstanceState],
+    id: &str,
+    frames: &[Rect],
+) {
+    match effect {
+        MenuEffect::Possession(true) => {
+            if session
+                .as_ref()
+                .is_some_and(|session| session.instance != id)
+            {
+                end_possession(app, session, roster, lives, possession::Release::Menu);
+            }
+            let window = possession_window(roster, id, frames);
+            begin_possession(app, session, lives, id, &window);
+        }
+        MenuEffect::Possession(false) => {
+            end_possession(app, session, roster, lives, possession::Release::Menu);
+        }
+        MenuEffect::Hide => end_possession(app, session, roster, lives, possession::Release::Hide),
+        MenuEffect::Quit => {
+            end_possession(app, session, roster, lives, possession::Release::Quit);
+            quit_now();
+        }
+        MenuEffect::None => {}
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -225,13 +381,14 @@ pub(crate) fn run_frame_loop(
                 &current,
                 &roster,
                 &id,
-                &settings_now,
                 rules_now.as_deref().unwrap_or(&HideRules::default()),
                 menu_caffeinate(&settings_now, None),
+                menu::MenuSurface::Tray,
             );
             (description.actions.clone(), Some(description))
         };
         let mut caffeinate_shown = None;
+        let mut session: Option<possession::Session> = None;
 
         // Read once for every Instance: there is one desktop and one user, and
         // asking AppKit how long they have been idle once per character would be
@@ -308,9 +465,16 @@ pub(crate) fn run_frame_loop(
         let mut input_events: Option<platform::EventTap> = None;
         #[cfg(not(unix))]
         let mut input_events: Option<mpsc::Receiver<()>> = None;
+        // Button edges only. The idle back-off still waits out motion, and a
+        // press dragged off the sprite is hit-tested where the hook saw it.
+        #[cfg(not(unix))]
+        let mut press_wakes = platform::spawn_press_listener();
 
         let mut button_was_down = false;
         let mut sound_allowed = true;
+        let mut do_not_disturb = false;
+        let mut chat_ui = String::new();
+        let mut chat_appearance = ChatAppearance::default();
         let mut ticks: u32 = 0;
         // Counted apart from `frame:` lines, so the tick rate can be read with
         // FIDGET_TRACE_FRAMES off and its per-tick print ruled out as the cause.
@@ -365,6 +529,8 @@ pub(crate) fn run_frame_loop(
             // closed channel returns at once, which is a spin rather than a
             // sleep. Dropped after the match, where nothing borrows it.
             let mut listener_hung_up = false;
+            #[cfg(not(unix))]
+            let mut press_listener_hung_up = false;
 
             // Active sleeps 16ms. Idle blocks until a real deadline with no cap. Hidden
             // sleeps and ignores input. Visible, Asleep and DND included, keeps the
@@ -416,8 +582,9 @@ pub(crate) fn run_frame_loop(
                     thread::sleep(deadline);
                 }
                 _ => {
-                    // No listener: poll with back-off. That is Windows always, Wayland
-                    // always, and macOS until the user grants Input Monitoring.
+                    // No motion listener: poll with back-off. Wayland always, macOS
+                    // until Input Monitoring is granted. On Windows a button edge
+                    // ends the visible idle wait; motion keeps the cap.
                     match (schedule_mode, was_visible) {
                         (scheduler::ScheduleMode::Active, _) => {
                             let now = Instant::now();
@@ -475,14 +642,28 @@ pub(crate) fn run_frame_loop(
                             let next_sense = SENSE_INTERVAL.saturating_sub(since_sense);
                             let deadline = next_director.min(next_sense);
 
-                            // Visible idle input polling. Cap at 100ms when the cursor is near a
-                            // sprite (within 48px) for hover gesture responsiveness. Otherwise cap
-                            // at 1s to avoid burning CPU waiting for rare events (right-click).
+                            // Idle poll: 100ms within 48px of a sprite, else 1s. A button edge
+                            // ends the wait. Motion keeps the cap, so a still cursor does not
+                            // tick and a drag is hit-tested where the button went down.
                             let capped = if cursor_near_sprite(last_cursor, &last_sprite_rects) {
                                 deadline.min(Duration::from_millis(100))
                             } else {
                                 deadline.min(Duration::from_secs(1))
                             };
+                            #[cfg(not(unix))]
+                            {
+                                press_listener_hung_up = match &press_wakes {
+                                    Some(wakes) => matches!(
+                                        wakes.recv_timeout(capped),
+                                        Err(mpsc::RecvTimeoutError::Disconnected)
+                                    ),
+                                    None => {
+                                        thread::sleep(capped);
+                                        false
+                                    }
+                                };
+                            }
+                            #[cfg(unix)]
                             thread::sleep(capped);
                         }
                     }
@@ -498,6 +679,10 @@ pub(crate) fn run_frame_loop(
                 // went away. Back off rather than spin; on macOS the next
                 // iteration starts a new tap if the setting is still on.
                 input_events = None;
+            }
+            #[cfg(not(unix))]
+            if press_listener_hung_up {
+                press_wakes = None;
             }
 
             // Read per tick: the Development tab can flip these while the
@@ -612,6 +797,18 @@ pub(crate) fn run_frame_loop(
             // behind still counts as a gesture, and a mid-drag dismiss would
             // hold every other character's presses for as long as the button stayed down.
             lives.retain(|live| roster.get(&live.id).is_some());
+            if session
+                .as_ref()
+                .is_some_and(|session| roster.get(&session.instance).is_none())
+            {
+                end_possession(
+                    &app,
+                    &mut session,
+                    &mut roster,
+                    &mut lives,
+                    possession::Release::Removed,
+                );
+            }
 
             // Last tick's art is the one being hit-tested. A Character nobody
             // can see is not there to press, so the click reaches the window underneath.
@@ -642,8 +839,9 @@ pub(crate) fn run_frame_loop(
             button_was_down = held;
             // A press is hit-tested where it began: a drag started within
             // a tick has moved the cursor off the sprite by now.
-            let press_at = platform::press_point()
-                .filter(|_| button_edge == Some("down") || buttons.secondary)
+            let press_at = (button_edge == Some("down") || buttons.secondary)
+                .then(platform::press_point)
+                .flatten()
                 .map_or(cursor_at, |(x, y)| {
                     (
                         (f64::from(x) / cursor_scale).round() as i32,
@@ -662,10 +860,10 @@ pub(crate) fn run_frame_loop(
                         .filter(|_| visible)
                         .and_then(|last| {
                             let art = live.character.draw(
-                                last.animation,
-                                last.animation_ms,
-                                last.variant_draw,
-                                last.facing,
+                                last.frame.art_name(),
+                                last.frame.animation_ms,
+                                last.frame.ring_choice(),
+                                last.frame.facing,
                             )?;
                             Some((
                                 art.mask
@@ -754,7 +952,7 @@ pub(crate) fn run_frame_loop(
                 .collect();
 
             for (id, action) in &picked {
-                apply_menu_action(
+                let effect = apply_menu_action(
                     action.clone(),
                     &mut roster,
                     &mut lives,
@@ -772,6 +970,15 @@ pub(crate) fn run_frame_loop(
                     &displays.frames,
                     &displays.usable_frames,
                 );
+                take_menu_effect(
+                    effect,
+                    &app,
+                    &mut session,
+                    &mut roster,
+                    &mut lives,
+                    id,
+                    &displays.frames,
+                );
             }
             let mut menu_acted = !picked.is_empty();
 
@@ -784,7 +991,7 @@ pub(crate) fn run_frame_loop(
                             .first()
                             .map(|live| live.id.clone())
                             .unwrap_or_default();
-                        apply_menu_action(
+                        let effect = apply_menu_action(
                             action,
                             &mut roster,
                             &mut lives,
@@ -802,7 +1009,21 @@ pub(crate) fn run_frame_loop(
                             &displays.frames,
                             &displays.usable_frames,
                         );
+                        take_menu_effect(
+                            effect,
+                            &app,
+                            &mut session,
+                            &mut roster,
+                            &mut lives,
+                            &target,
+                            &displays.frames,
+                        );
                         menu_acted = true;
+                    } else {
+                        // Tray Quit ids carry a draw generation, so every
+                        // Quit lands here. Other ids outlive a rebuild: one
+                        // here is a row the current draw no longer has.
+                        eprintln!("menu: {id} is on no open menu");
                     }
                 }
             }
@@ -828,6 +1049,18 @@ pub(crate) fn run_frame_loop(
                         );
                     }
                     SettingsOp::Dismiss { id } => {
+                        if session
+                            .as_ref()
+                            .is_some_and(|session| session.instance == id)
+                        {
+                            end_possession(
+                                &app,
+                                &mut session,
+                                &mut roster,
+                                &mut lives,
+                                possession::Release::Removed,
+                            );
+                        }
                         roster.dismiss(&id);
                         lives.retain(|live| live.id != id);
                         slots.abandon(&id);
@@ -914,39 +1147,31 @@ pub(crate) fn run_frame_loop(
                             if interval_moved {
                                 live.pace = paced(&config, &live.character);
                             }
-                            // Completer target changed, not Character. A Wake
-                            // still on the wire would propose against the old
-                            // host and session; drop it and open a new turn.
-                            completer::retarget_model(
+                            retarget_for_settings(
+                                &app,
                                 &mut slots,
-                                &live.id,
-                                &mut live.model,
-                                live.character.behaviors.keys().cloned(),
-                                live.character.name.clone(),
+                                live,
                                 &director,
                                 configured,
+                                first_connection,
+                                &mut pending_first_connection_message,
                             );
-                            // Defer the banner to the first successful wake, or a failed spawn
-                            // scrolls the chat away from its own error.
-                            if first_connection {
-                                pending_first_connection_message = true;
-                            } else {
-                                session_log::new_session(
-                                    &app,
-                                    &live.id,
-                                    "settings changed what answers",
-                                );
-                            }
                         }
                     }
                     SettingsOp::ReloadChat => reload_chat = true,
                     SettingsOp::NewSession => {
                         for live in &mut lives {
-                            // Same Completer, same Character, same Blank AI:
-                            // the only thing thrown away is the conversation
-                            // the Instance is in.
-                            replace_session(&mut slots, live, &director, config.configured);
-                            session_log::new_session(&app, &live.id, "a new session was started");
+                            // Same Completer, same Character, same Blank AI.
+                            // The only thing thrown away is the conversation.
+                            replace_session(
+                                &app,
+                                &mut slots,
+                                live,
+                                &director,
+                                config.configured,
+                                "a new session was started",
+                                HarnessSession::Drop,
+                            );
                         }
                     }
                     SettingsOp::ChatUIChanged { chat_ui } => {
@@ -984,7 +1209,7 @@ pub(crate) fn run_frame_loop(
                 let line = match msg {
                     ChatMsg::Said(line) => line,
                     ChatMsg::InboundWake(wake) => {
-                        // Inbound wake triggers a Director wake so the speech participates
+                        // Inbound wake triggers a Director wake so the dialogue participates
                         // in Pace and reaches Chat/bubble/Behaviors.
                         if let Some(live) = lives.iter_mut().find(|live| live.id == wake.instance) {
                             live.addressed = true;
@@ -993,7 +1218,7 @@ pub(crate) fn run_frame_loop(
                                 chat_label(&wake.instance),
                                 CHAT_EVENT,
                                 super::ChatReply {
-                                    said: Some(wake.speech),
+                                    said: Some(wake.dialogue),
                                     busy: false,
                                     reacting_to: Some(director::unprompted_ai()),
                                     you: false,
@@ -1031,23 +1256,26 @@ pub(crate) fn run_frame_loop(
                         // the next launch mints another and loses it (ADR-0012).
                         remember_instances(&roster, &settings, &settings_path);
 
+                        // The Character Prompt is the opening turn. This session
+                        // opened without these words, so they take effect at the
+                        // next wake rather than by re-asking (ADR-0012).
+                        let why = "the Instance Prompt changed";
                         if let Some(live) =
                             lives.iter_mut().find(|live| live.id == written.instance)
                         {
-                            // The Character Prompt is the opening turn; this
-                            // session opened without these words. Takes
-                            // effect at the next wake, not by re-asking (ADR-0012).
-                            replace_session(&mut slots, live, &director, config.configured);
+                            replace_session(
+                                &app,
+                                &mut slots,
+                                live,
+                                &director,
+                                config.configured,
+                                why,
+                                HarnessSession::Drop,
+                            );
+                        } else {
+                            // No live Completer to retarget. The transcript still ends.
+                            session_log::new_session(&app, &written.instance, why);
                         }
-
-                        // Same session replacement a Character switch uses: the held turns
-                        // go, the open surface is told, and the Action Log keeps the boundary
-                        // (ADR-0012).
-                        session_log::new_session(
-                            &app,
-                            &written.instance,
-                            "the Instance Prompt changed",
-                        );
                         // A prompt layer changing is exactly what a user needs
                         // to find later. `chars` rather than the body, as the
                         // `prompt` event already does.
@@ -1180,6 +1408,7 @@ pub(crate) fn run_frame_loop(
                 }
                 live.addressed = true;
                 live.happened = Happened::Chat(line.text);
+                live.chat_said = true;
             }
 
             // A `tools/call` from the attached Harness, here because the `Roster` and
@@ -1246,9 +1475,9 @@ pub(crate) fn run_frame_loop(
                     &current,
                     &roster,
                     &id,
-                    &settings_now,
                     rules_now.as_deref().unwrap_or(&HideRules::default()),
                     menu_caffeinate(&settings_now, caffeinate_drawn.as_ref()),
+                    menu::MenuSurface::Tray,
                 );
                 let notice = crate::names_hint::live();
                 if notice.armed() {
@@ -1289,9 +1518,14 @@ pub(crate) fn run_frame_loop(
                 config.proactive_allowed = settings.proactive_wakes;
                 config.apply_switch(settings.director_enabled);
                 let dnd = settings.do_not_disturb;
+                do_not_disturb = dnd;
                 // Reread every tick, like the flags above, so a mute in
                 // Settings lands on the next frame and not the next launch.
                 sound_allowed = settings.sound_allowed();
+                if chat_ui != settings.chat_ui {
+                    chat_ui.clone_from(&settings.chat_ui);
+                }
+                chat_appearance = settings.chat_appearance;
                 if let Ok(mut inspect) = inspect.lock() {
                     inspect.enabled = config.enabled;
                     inspect.proactive_wakes = settings.proactive_wakes;
@@ -1338,6 +1572,16 @@ pub(crate) fn run_frame_loop(
                 // Only the Instance the press belongs to is told the cursor is
                 // over it. The rest still get time: a pointer that stopped
                 // being told would measure the next gesture's velocity over the gap.
+                let was_gesturing = live.pointer.gesturing();
+                // The mask hit used where the button went down. Travel has to
+                // start there too, or a drag that finished before this tick
+                // looks like a still press.
+                if target == Some(index) && button_edge == Some("down") {
+                    live.pointer.began_at(fidget_core::engine::Point {
+                        x: f64::from(press_at.0),
+                        y: f64::from(press_at.1),
+                    });
+                }
                 live.verbs = live.pointer.update(
                     target == Some(index),
                     held,
@@ -1345,6 +1589,38 @@ pub(crate) fn run_frame_loop(
                     cursor_points,
                     elapsed_ms,
                 );
+                // A click that lands while paused resumes. It is not a Poke.
+                // A drag that keeps going is still a Grab.
+                if let Some(session) = session
+                    .as_mut()
+                    .filter(|session| session.instance == live.id)
+                {
+                    if !was_gesturing && live.pointer.gesturing() && session.press() {
+                        if let Some(overlay) = app.get_webview_window(&session.window) {
+                            if let Err(why) = overlay_request_focus(overlay) {
+                                eprintln!(
+                                    "possession: {} could not take the keyboard: {why}",
+                                    session.window
+                                );
+                            }
+                        }
+                    }
+                    if session.swallow_click {
+                        let grabbing = live.verbs.iter().any(|verb| matches!(verb, Verb::Grab));
+                        let clicking = live
+                            .verbs
+                            .iter()
+                            .any(|verb| matches!(verb, Verb::Poke | Verb::Summon));
+                        if grabbing || clicking {
+                            if clicking {
+                                live.verbs
+                                    .retain(|verb| !matches!(verb, Verb::Poke | Verb::Summon));
+                            }
+                            live.pointer.discard_unsettled_poke();
+                            session.swallow_click = false;
+                        }
+                    }
+                }
 
                 if tracing_clicks && !live.verbs.is_empty() {
                     eprintln!("verbs: {} {:?}", live.id, live.verbs);
@@ -1376,9 +1652,9 @@ pub(crate) fn run_frame_loop(
                         &live.character.name,
                         &roster,
                         &live.id,
-                        &settings_now,
                         rules_now.as_deref().unwrap_or(&HideRules::default()),
                         menu_caffeinate(&settings_now, caffeinate_drawn.as_ref()),
+                        menu::MenuSurface::Sprite,
                     );
 
                     // The overlay the cursor is on, and where in it the cursor
@@ -1462,14 +1738,7 @@ pub(crate) fn run_frame_loop(
 
                         if !already_opened {
                             if let Some(instance) = roster.get_mut(&first_live.id) {
-                                let tour_message = "Double-click me any time to open Chat.\n\n\
-                                     Click once to Poke and get a reaction.\n\n\
-                                     Right-click to open the menu.";
-
-                                instance.enqueue(BehaviorProposal {
-                                    behavior: String::new(),
-                                    dialogue: Some(tour_message.to_string()),
-                                });
+                                instance.enqueue(tour_proposal());
                             }
 
                             if let Ok(mut settings_guard) = settings.lock() {
@@ -1519,6 +1788,7 @@ pub(crate) fn run_frame_loop(
             // Assembled once and handed to every Instance. Asking once per
             // Instance would poll the window server N times for one answer.
             let mut world = assembler.assemble(elapsed_ms, cursor_points, Vec::new());
+            let tick_ms = world.elapsed_ms;
 
             // Whole display frames, not the usable ones physics runs in: the
             // reserved strips are the difference between fullscreen and zoomed.
@@ -1529,6 +1799,7 @@ pub(crate) fn run_frame_loop(
             };
 
             // Visibility before instance ticks, so scheduler::mode gets the real answer.
+            let mut possession_release = None;
             let (presence, hide_in_fullscreen) = rules
                 .lock()
                 .map(|mut rules| {
@@ -1538,6 +1809,13 @@ pub(crate) fn run_frame_loop(
                             if change.visible { "shown" } else { "hidden" },
                             change.fade_ms,
                         );
+                        if !change.visible {
+                            possession_release = Some(if rules.is_away() {
+                                possession::Release::Hide
+                            } else {
+                                possession::Release::FullscreenHide
+                            });
+                        }
                     }
                     (rules.presence(), rules.hide_in_fullscreen())
                 })
@@ -1548,6 +1826,33 @@ pub(crate) fn run_frame_loop(
                     },
                     false,
                 ));
+            if let Some(reason) = possession_release {
+                end_possession(&app, &mut session, &mut roster, &mut lives, reason);
+            }
+            // Already hidden, including a possess clicked while away: the
+            // change above does not fire again, and a hidden sprite is not possessed.
+            if !presence.visible && session.is_some() {
+                let away = rules.lock().map(|rules| rules.is_away()).unwrap_or(false);
+                end_possession(
+                    &app,
+                    &mut session,
+                    &mut roster,
+                    &mut lives,
+                    if away {
+                        possession::Release::Hide
+                    } else {
+                        possession::Release::FullscreenHide
+                    },
+                );
+            }
+
+            let possession_now = Instant::now();
+            let possession_edges = possession::take_edges();
+            if let Some(session) = session.as_mut() {
+                for edge in &possession_edges {
+                    session.apply(edge, possession_now);
+                }
+            }
 
             // Teleport, as Bring does: a walk would parade the sprite across the app
             // it is leaving. A held sprite stays in the hand until let go.
@@ -1597,6 +1902,21 @@ pub(crate) fn run_frame_loop(
                     continue;
                 };
 
+                let feet = (live.last_position.x, live.last_position.y);
+                let owner_drew = bubble_owner(feet, &displays.frames)
+                    .is_some_and(|index| platform::overlay_drew(&overlay_label(index), &live.id));
+                let runs = live
+                    .first_draw
+                    .runs(&live.id, elapsed, owner_drew, presence.visible);
+                // Shadowed for the rest of this turn, so every clock below holds
+                // with the Engine while the spawn pose waits for its first draw.
+                let (elapsed, elapsed_ms) = if runs {
+                    (elapsed, elapsed_ms)
+                } else {
+                    (Duration::ZERO, 0)
+                };
+                world.elapsed_ms = if elapsed_ms == 0 { 0 } else { tick_ms };
+
                 if let Some(moment) = turn_plays
                     .get_mut(&live.id)
                     .and_then(|queued| queued.pop_front())
@@ -1615,12 +1935,9 @@ pub(crate) fn run_frame_loop(
                     Some(completer::Arrived::Answered(answered)) => Some(*answered),
                     // A line with no Behavior, so `talk` plays while it grows.
                     // The reply's own Behavior is applied when it lands. The same
-                    // speech updates the Chat row so both surfaces stream together.
-                    Some(completer::Arrived::Speech(line)) => {
-                        proposal = Some(BehaviorProposal {
-                            behavior: String::new(),
-                            dialogue: Some(line.clone()),
-                        });
+                    // dialogue updates the Chat row so both surfaces stream together.
+                    Some(completer::Arrived::Dialogue(line)) => {
+                        proposal = Some(streamed_line(line.clone()));
                         let _ = app.emit_to(
                             chat_label(&live.id),
                             CHAT_EVENT,
@@ -1742,7 +2059,7 @@ pub(crate) fn run_frame_loop(
                         live.previous_idle,
                         live.since_state,
                         instance.do_not_disturb(),
-                        false,
+                        instance.possessed(),
                     );
                     live.previous_idle = activity.idle;
 
@@ -1764,7 +2081,7 @@ pub(crate) fn run_frame_loop(
                                 front_title: None,
                                 lately: Lately::default(),
                                 caffeinate: caffeinate_fact,
-                                possessed: false,
+                                possessed: instance.possessed(),
                             });
                         }
                     }
@@ -1780,9 +2097,34 @@ pub(crate) fn run_frame_loop(
                 world.poke_settled = live.pointer.poke_settled();
                 world.proposal = proposal;
                 live.qm = platform::qm_draft(&live.id);
-                world.locomotion_frozen = walk_held(&live.speech, live.qm.as_ref(), Instant::now());
+                world.speaking_for = speaking_for(&live.speech, live.qm.as_ref(), Instant::now());
+                world.chat = std::mem::take(&mut live.chat_said);
+                let ending = match session
+                    .as_mut()
+                    .filter(|session| session.instance == live.id)
+                {
+                    Some(session) => {
+                        let intent = session.tick(elapsed_ms, possession_now);
+                        let ending = intent.end_possession;
+                        world.possession = intent;
+                        ending
+                    }
+                    None => {
+                        world.possession = Intent::default();
+                        false
+                    }
+                };
 
                 let frame = instance.tick(&world);
+                if ending {
+                    instance.set_possessed(false);
+                    note_happened(&mut live.happened, Happened::PossessionEnd);
+                    live.addressed = true;
+                    if let Some(old) = session.take() {
+                        hold_possession_keyboard(&app, &old.window, false);
+                        eprintln!("possession: {}", release_word(possession::Release::Escape));
+                    }
+                }
                 riding |= frame.riding;
                 live.recency.tick(elapsed, &world.verbs, &frame);
 
@@ -1811,8 +2153,10 @@ pub(crate) fn run_frame_loop(
                     // The mark goes into the logged line once, here:
                     // the Chat surface draws the record. The bubble keeps
                     // the model's words; the parser has already read them.
-                    let dialogue =
-                        chat_dialogue(parsed_dialogue.as_deref(), frame.dialogue.as_deref());
+                    let dialogue = chat_dialogue(
+                        parsed_dialogue.as_deref(),
+                        frame.dialogue.as_ref().map(|line| line.text.as_str()),
+                    );
                     let logged = dialogue.map(|line| director::marked(line, truncated));
                     session_log::log_reply(
                         &app,
@@ -1847,12 +2191,9 @@ pub(crate) fn run_frame_loop(
                     session_log::log_thinking(&app, &live.id);
                 }
 
-                let became_perched = live.last_state.is_some()
-                    && frame.state == State::Perched
-                    && live.last_state != Some(State::Perched);
-                if became_perched {
+                if let Some(what) = landed(live.last_state, frame.state, instance.possessed()) {
                     live.addressed = true;
-                    note_happened(&mut live.happened, Happened::Perch);
+                    note_happened(&mut live.happened, what);
                 }
 
                 if live.last_state != Some(frame.state) {
@@ -1862,7 +2203,7 @@ pub(crate) fn run_frame_loop(
                 live.last_position = frame.position;
 
                 // Stay Active while moving, a multi-frame animation still
-                // advancing, or idle_ms accruing toward sleep.
+                // advancing, or awake_ms accruing toward sleep.
                 let behavior_playing = frame.playing_behavior.is_some();
                 let needs_active_for_motion =
                     scheduler::mode(&frame, presence.visible, behavior_playing)
@@ -1870,28 +2211,31 @@ pub(crate) fn run_frame_loop(
 
                 let needs_active_for_animation =
                     if let Some(character) = characters.get(instance.character_name()) {
-                        character
-                            .animations
-                            .get(frame.animation)
-                            .is_some_and(|anim| {
-                                anim.looping || {
-                                    let current_frame = anim.frame_at(frame.animation_ms);
-                                    current_frame + 1 < anim.frames.len()
-                                }
-                            })
+                        character.art_still_advancing(
+                            frame.art_name(),
+                            frame.animation_ms,
+                            frame.idle_beat.as_ref(),
+                        )
                     } else {
                         false
                     };
 
-                // idle_ms accrues when Grounded/Perched but not Asleep.
-                // Keep Active while accruing so sleep-after happens on time.
-                let needs_active_for_sleep_accrual =
-                    matches!(frame.state, State::Grounded | State::Perched);
+                // The awake clock and the sleep timer both run on ticks, so a
+                // sprite left alone still reaches sleep and wakes from it.
+                let needs_active_for_sleep_timers = matches!(
+                    frame.state,
+                    State::Grounded | State::Perched | State::Asleep
+                );
 
                 any_moving |= scheduler::moving(&frame);
+                // Windows hears button edges, not motion, so a press that is
+                // not yet a Grab or a Poke would otherwise sit on the 1s cap.
+                // macOS and X11 already wake on the drag.
+                let resolving_press = cfg!(not(unix)) && live.pointer.gesturing();
                 if needs_active_for_motion
                     || needs_active_for_animation
-                    || needs_active_for_sleep_accrual
+                    || needs_active_for_sleep_timers
+                    || resolving_press
                 {
                     any_needs_active = true;
                 }
@@ -1901,112 +2245,118 @@ pub(crate) fn run_frame_loop(
                 // the trace at the end of this Instance's turn reads it.
                 let happened = live.happened.clone();
                 let mut asking = false;
-                let reactive_wake = if let (Some(model), Some(activity)) =
-                    (&live.model, last_activity.as_ref())
-                {
-                    if director::session_due(
-                        live.addressed,
-                        live.since_proactive,
-                        &live.pace,
-                        activity.displays_asleep,
-                        instance.do_not_disturb(),
-                        config.proactive_allowed,
-                        false,
-                    ) && config.enabled
-                    {
-                        let context = Context {
-                            activity: activity.clone(),
-                            recent: live.recent.clone(),
-                            // The two authored layers, the package's and
-                            // this Instance's own (ADR-0012). Read off the
-                            // roster, which is where a save lands.
-                            personality: live.character.personality.clone(),
-                            instance_prompt: instance.prompt().to_string(),
-                            state: frame.state,
-                            happened: live.happened.clone(),
-                            lately: live.recency.take(&live.happened),
-                            standing: assembler.standing_on(frame.position),
-                            front_title: activity
-                                .frontmost_application
-                                .as_deref()
-                                .and_then(|name| assembler.front_title(name)),
-                            caffeinate: caffeinate_fact,
-                            possessed: false,
-                        };
-                        let was_addressed = live.addressed;
-                        if live.addressed {
-                            live.pace.after_reactive();
+                let reactive_wake =
+                    if let (Some(model), Some(activity)) = (&live.model, last_activity.as_ref()) {
+                        if director::session_due(
+                            live.addressed,
+                            live.since_proactive,
+                            &live.pace,
+                            activity.displays_asleep,
+                            instance.do_not_disturb(),
+                            config.proactive_allowed,
+                            instance.possessed(),
+                        ) && config.enabled
+                        {
+                            let context = Context {
+                                activity: activity.clone(),
+                                recent: live.recent.clone(),
+                                // The two authored layers, the package's and
+                                // this Instance's own (ADR-0012). Read off the
+                                // roster, which is where a save lands.
+                                personality: live.character.personality.clone(),
+                                instance_prompt: instance.prompt().to_string(),
+                                state: frame.state,
+                                happened: live.happened.clone(),
+                                lately: live.recency.take(&live.happened),
+                                standing: assembler.standing_on(frame.position),
+                                front_title: activity
+                                    .frontmost_application
+                                    .as_deref()
+                                    .and_then(|name| assembler.front_title(name)),
+                                caffeinate: caffeinate_fact,
+                                possessed: instance.possessed(),
+                            };
+                            let was_addressed = live.addressed;
+                            if live.addressed {
+                                live.pace.after_reactive();
+                            } else {
+                                live.pace.after_ambient();
+                            }
+                            live.addressed = false;
+                            live.happened = Happened::Proactive;
+                            live.since_proactive = Duration::ZERO;
+                            let line = instance
+                                .whereabouts(&displays.frames, &displays.usable_frames)
+                                .prompt_line();
+                            // The panel shows this copy. The worker appends `line`
+                            // after `request`, so an in-flight reply can still open
+                            // the session before this wake is sent.
+                            let reply_language = crate::i18n::reply_language();
+                            let mut payload = model.prompt(&context, reply_language);
+                            if !payload.ends_with('\n') {
+                                payload.push('\n');
+                            }
+                            payload.push_str(&line);
+                            // Read before the `Context` is handed to the slot,
+                            // and applied only if the slot took the call.
+                            let caret = cancelled_caret(live.chat_turn, &context.happened);
+                            let chat_turn = matches!(context.happened, Happened::Chat(_));
+                            let touched =
+                                director::claim(&context.happened) == director::Claim::Interaction;
+                            let cell = director::happened_cell(&context.happened);
+                            match slots.wake_with_prompt(
+                                &live.id,
+                                Arc::clone(model),
+                                context,
+                                line,
+                                reply_language,
+                            ) {
+                                // The call on the wire is the truer one
+                                // (ADR-0016). This wake is dropped, not queued:
+                                // the bookkeeping above has already spent it.
+                                completer::Woke::Dropped => false,
+                                // A touch the character cannot answer yet points at
+                                // the question. A Summon already opens Chat, a
+                                // typed line is already in it, and a tick is nobody's.
+                                completer::Woke::AwaitingUser => {
+                                    asking = touched;
+                                    false
+                                }
+                                completer::Woke::Started => {
+                                    // One panel for however many Instances are running, so it shows
+                                    // the newest call, and the last payload sent is the honest answer.
+                                    if let Ok(mut inspect) = inspect.lock() {
+                                        inspect.last_payload = Some(payload);
+                                        inspect.wake_secs = live.pace.wait().as_secs();
+                                    }
+                                    // A new call cancels the one before it (ADR-0016). Tell a
+                                    // typed line on the wire its caret was cancelled, and by which wake.
+                                    if let Some(note) = caret {
+                                        let _ = app.emit_to(chat_label(&live.id), CHAT_EVENT, note);
+                                    }
+                                    session_log::begin_turn(&app, &live.id);
+                                    live.chat_turn = chat_turn;
+                                    live.happened_last = Some(cell);
+                                    // The first successful wake after first connection proves
+                                    // the completer works. Emit the deferred "something can
+                                    // answer now" message now that we know it's true.
+                                    if pending_first_connection_message {
+                                        session_log::new_session(
+                                            &app,
+                                            &live.id,
+                                            "something can answer now",
+                                        );
+                                        pending_first_connection_message = false;
+                                    }
+                                    was_addressed
+                                }
+                            }
                         } else {
-                            live.pace.after_ambient();
-                        }
-                        live.addressed = false;
-                        live.happened = Happened::Proactive;
-                        live.since_proactive = Duration::ZERO;
-                        let line = instance
-                            .whereabouts(&displays.frames, &displays.usable_frames)
-                            .prompt_line();
-                        // The panel shows this copy. The worker appends `line`
-                        // after `request`, so an in-flight reply can still open
-                        // the session before this wake is sent.
-                        let mut payload = model.prompt(&context);
-                        if !payload.ends_with('\n') {
-                            payload.push('\n');
-                        }
-                        payload.push_str(&line);
-                        // Read before the `Context` is handed to the slot,
-                        // and applied only if the slot took the call.
-                        let caret = cancelled_caret(live.chat_turn, &context.happened);
-                        let chat_turn = matches!(context.happened, Happened::Chat(_));
-                        let touched =
-                            director::claim(&context.happened) == director::Claim::Interaction;
-                        let cell = director::happened_cell(&context.happened);
-                        match slots.wake_with_prompt(&live.id, Arc::clone(model), context, line) {
-                            // The call on the wire is the truer one
-                            // (ADR-0016). This wake is dropped, not queued:
-                            // the bookkeeping above has already spent it.
-                            completer::Woke::Dropped => false,
-                            // A touch the character cannot answer yet points at
-                            // the question. A Summon already opens Chat, a
-                            // typed line is already in it, and a tick is nobody's.
-                            completer::Woke::AwaitingUser => {
-                                asking = touched;
-                                false
-                            }
-                            completer::Woke::Started => {
-                                // One panel for however many Instances are running, so it shows
-                                // the newest call, and the last payload sent is the honest answer.
-                                if let Ok(mut inspect) = inspect.lock() {
-                                    inspect.last_payload = Some(payload);
-                                    inspect.wake_secs = live.pace.wait().as_secs();
-                                }
-                                // A new call cancels the one before it (ADR-0016). Tell a
-                                // typed line on the wire its caret was cancelled, and by which wake.
-                                if let Some(note) = caret {
-                                    let _ = app.emit_to(chat_label(&live.id), CHAT_EVENT, note);
-                                }
-                                session_log::begin_turn(&app, &live.id);
-                                live.chat_turn = chat_turn;
-                                live.happened_last = Some(cell);
-                                // The first successful wake after first connection proves
-                                // the completer works. Emit the deferred "something can
-                                // answer now" message now that we know it's true.
-                                if pending_first_connection_message {
-                                    session_log::new_session(
-                                        &app,
-                                        &live.id,
-                                        "something can answer now",
-                                    );
-                                    pending_first_connection_message = false;
-                                }
-                                was_addressed
-                            }
+                            false
                         }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
 
                 if tracing_clicks && (frame.addressed || reactive_wake || !world.verbs.is_empty()) {
                     let skip = if reactive_wake {
@@ -2046,14 +2396,27 @@ pub(crate) fn run_frame_loop(
                         eprintln!("director: {} {played}", live.id);
                     }
                 }
+                // A digit plays an Animation, not a Behavior, so the
+                // Director's memory never hears it: it could not propose it.
+                if tracing_frames {
+                    if let Some(DigitAnimation::Played(played)) = &frame.digit {
+                        eprintln!("possession: {} {played}", live.id);
+                    }
+                }
 
-                // A Behavior the State gate refused. Under the Director flag,
-                // beside the near-miss line. Names the State, not the reason:
-                // the Poke cooldown also refuses, on the sprite's feet.
-                if let Some(refused) = &frame.refused {
-                    if model::tracing() {
+                // What the State gate refused. Under the Director flag, beside
+                // the near-miss line. Names the State, not the reason: the
+                // Poke cooldown also refuses, on the sprite's feet.
+                if model::tracing() {
+                    if let Some(refused) = &frame.refused {
                         eprintln!(
                             "director: {} {refused} refused in {:?}",
+                            live.id, frame.state
+                        );
+                    }
+                    if let Some(DigitAnimation::Refused(refused)) = &frame.digit {
+                        eprintln!(
+                            "possession: {} {refused} refused in {:?}",
                             live.id, frame.state
                         );
                     }
@@ -2092,7 +2455,23 @@ pub(crate) fn run_frame_loop(
                     live.traced_last = None;
                 }
 
-                // Pushed on change for the same reason. `proactive_coming` is
+                // The Engine names an Animation and how long it has been
+                // playing. Resolve here, not in the webview, so hit-test and
+                // the frame the user sees stay the same one.
+                let art_name = frame.art_name();
+                let Some(drawn) = live.character.draw(
+                    art_name,
+                    frame.animation_ms,
+                    frame.ring_choice(),
+                    frame.facing,
+                ) else {
+                    // No drawable Animation, which a validated package cannot
+                    // be. Left out of `placed` and the bar's push; the webview
+                    // reads absence as dismissal. Why nothing else in this loop
+                    // may skip an Instance silently.
+                    continue;
+                };
+                // Pushed on change, like the trace. `proactive_coming` is
                 // `session_due`'s proactive arm, so the bar counts down only
                 // to a wake that is coming.
                 let proactive_coming = config.enabled
@@ -2108,15 +2487,7 @@ pub(crate) fn run_frame_loop(
                         .saturating_sub(live.since_proactive)
                         .as_millis() as u64
                 });
-                let status = ChatStatus {
-                    behavior: frame.playing_behavior.clone(),
-                    primitive: frame.playing_primitive,
-                    animation: frame.animation,
-                    state: frame.state,
-                    happened: live.happened_last,
-                    facing: frame.facing as i8,
-                    thinking,
-                };
+                let status = chat_status(&frame, drawn.animation, live.happened_last, thinking);
                 // Asks whether the deadline moved — a wake landing, the pace
                 // growing under it — not whether it ran down, which it does
                 // every tick and which no push has to say.
@@ -2137,20 +2508,6 @@ pub(crate) fn run_frame_loop(
                     live.status_wake_ms = wake_ms;
                 }
 
-                // The Engine names an Animation and how long it has been
-                // playing. Resolve here, not in the webview, so hit-test and
-                // the frame the user sees stay the same one.
-                let Some(drawn) = live.character.draw(
-                    frame.animation,
-                    frame.animation_ms,
-                    frame.variant_draw,
-                    frame.facing,
-                ) else {
-                    // No drawable Animation, which a validated package cannot
-                    // be. Left out of `placed`; the webview reads absence as
-                    // dismissal. Why nothing else in this loop may skip an Instance silently.
-                    continue;
-                };
                 let scale = live.character.scale as i32;
                 let (width, height) = (
                     drawn.frame_size.0 as i32 * scale,
@@ -2173,6 +2530,11 @@ pub(crate) fn run_frame_loop(
                     // Instance last so everything before it stands where it
                     // did when one character was all there was.
                     // scripts/verify-overlay.sh matches this prefix.
+                    let token = match &frame.idle_beat {
+                        Some(IdleBeat::IdleGesture(_)) => "gesture",
+                        Some(IdleBeat::IdleLoop(_)) => "idle",
+                        None => art_name,
+                    };
                     eprintln!(
                         "frame: {} {:?} pos({:.0},{:.0}) sprite({},{}) {}#{} {}",
                         at_ms,
@@ -2181,7 +2543,7 @@ pub(crate) fn run_frame_loop(
                         frame.position.y,
                         sprite.x,
                         sprite.y,
-                        frame.animation,
+                        token,
                         drawn.index,
                         live.id,
                     );
@@ -2195,30 +2557,43 @@ pub(crate) fn run_frame_loop(
                     .hit(&sprite, cursor_at.0, cursor_at.1, drawn.mirrored);
                 live.drawn_last = Some(Drawn {
                     rect: sprite,
-                    animation: frame.animation,
-                    animation_ms: frame.animation_ms,
-                    variant_draw: frame.variant_draw,
-                    facing: frame.facing,
+                    frame: frame.clone(),
                 });
 
                 let owner = bubble_owner((frame.position.x, frame.position.y), &displays.frames);
-                let dialogue = super::carry_line(
+                // Tested live on macOS and Windows. On Linux it is speculative:
+                // no multi-display Linux machine has run it.
+                let possessed_here = session
+                    .as_mut()
+                    .filter(|session| session.instance == live.id);
+                if let (Some(session), Some(index)) = (possessed_here, owner) {
+                    follow_possession_display(&app, session, overlay_label(index), Instant::now());
+                }
+                let listening =
+                    owner.is_some_and(|index| platform::overlay_listening(&overlay_label(index)));
+                let dialogue = super::draw_response(
                     &mut live.spoken,
-                    frame.dialogue.as_deref(),
+                    frame.dialogue.as_ref(),
                     owner,
+                    listening,
                     Instant::now(),
                 );
                 let overlay_drops_the_bubble = !presence.visible && presence.fade_ms == 0;
-                speech::note_speech(
+                speech::note_dialogue(
                     &mut live.speech,
                     Instant::now(),
-                    dialogue.as_deref(),
+                    dialogue.as_ref(),
                     asking,
                     presence.visible,
                     overlay_drops_the_bubble,
                 );
 
                 last_sprite_rects.push((sprite.x, sprite.y, width, height));
+
+                let (possessed, paused) = match session.as_ref() {
+                    Some(session) if session.instance == live.id => (true, session.paused()),
+                    _ => (false, false),
+                };
 
                 placed.push(Placed {
                     id: live.id.clone(),
@@ -2229,17 +2604,31 @@ pub(crate) fn run_frame_loop(
                     animation: drawn.animation.to_string(),
                     frame_index: drawn.index,
                     mirror: if drawn.mirrored { -1 } else { 1 },
-                    dialogue,
+                    // Overlay payloads stay text-only: the source is the
+                    // Chat status's, never the bubble's.
+                    dialogue: dialogue.map(|line| line.text),
                     thinking,
                     asking,
                     // A pressed or held sprite crossing a seam reaches an
                     // overlay that never saw the press, so the Shell holds
                     // the pill.
                     hovered: live.hovering && !live.pointer.gesturing(),
+                    menu_open: live.menu_hold.is_some(),
                     cue: frame.cue,
                     contact: frame.contact,
                     owner,
                     qm: live.qm.clone(),
+                    possessed,
+                    paused,
+                    charge: frame.charge,
+                    digits: if possessed {
+                        digit_animations(&live.character.animations)
+                            .into_iter()
+                            .map(|digit| digit.card_label())
+                            .collect()
+                    } else {
+                        Vec::new()
+                    },
                     mask: drawn.mask.clone(),
                 });
             }
@@ -2279,7 +2668,12 @@ pub(crate) fn run_frame_loop(
                 })
             });
 
+            // X11 does not read this. Its input shape is the click-through, and
+            // tao's ignore-cursor call would replace that shape with a 1x1 dot.
+            #[cfg_attr(all(unix, not(target_os = "macos")), allow(unused_variables))]
             let ignore = !(presence.visible && (over_sprite || over_control || holding));
+            // macOS and Windows assign this when click-through flips. X11 does not.
+            #[cfg_attr(all(unix, not(target_os = "macos")), allow(unused_mut))]
             let mut flipped = false;
 
             #[cfg(all(unix, not(target_os = "macos")))]
@@ -2300,6 +2694,10 @@ pub(crate) fn run_frame_loop(
                     trails.insert(instance.id.clone(), trail);
                 }
             }
+
+            let aside = app
+                .try_state::<QuickMessageAside>()
+                .and_then(|slot| slot.take());
 
             for (index, frame) in displays.frames.iter().enumerate() {
                 let label = overlay_label(index);
@@ -2335,11 +2733,11 @@ pub(crate) fn run_frame_loop(
                     let overlay_index = index;
                     let trace = tracing;
                     let _ = app.run_on_main_thread(move || {
-                        configure_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                        record_for_overlay(&configure_in_flight_clone, overlay_index, false);
                         if let Some(window) = handle.get_webview_window(&label_clone) {
                             match platform::configure_overlay(&window) {
                                 Ok(()) => {
-                                    configured_clone.lock().unwrap()[overlay_index] = true;
+                                    record_for_overlay(&configured_clone, overlay_index, true);
                                     if trace {
                                         eprintln!("overlay: {label_clone} EWMH configured");
                                     }
@@ -2366,12 +2764,25 @@ pub(crate) fn run_frame_loop(
                     .map(|instance| SpritePlacement::new(instance, *display, index))
                     .collect();
 
+                // No usable frame yet: the card insets from the overlay's own corner.
+                let usable = displays.usable_frames.get(index).copied().unwrap_or(*frame);
+                let local = usable_in_overlay(usable, *display);
                 let placement = Placement {
                     sprites,
                     visible: presence.visible,
                     fade_ms: presence.fade_ms,
                     sound: sound_allowed,
                     hover_delay_ms: crate::hover_delay_ms(),
+                    do_not_disturb,
+                    aside,
+                    chat_ui: &chat_ui,
+                    chat_appearance,
+                    work_area: WorkArea {
+                        x: local.x,
+                        y: local.y,
+                        width: local.width,
+                        height: local.height,
+                    },
                 };
 
                 // Skip a repeated instruction: Tauri emit is JS eval
@@ -2435,15 +2846,16 @@ pub(crate) fn run_frame_loop(
 
                 // Click-through is per-window. Every other overlay passes
                 // clicks through, so a click on one display is never swallowed
-                // by a sprite on another.
+                // by a sprite on another. X11 uses the input shape instead.
+                #[cfg(not(all(unix, not(target_os = "macos"))))]
                 let ignore = ignore || on_overlay != Some(index);
 
-                // XShape carves the input region; Tauri must still receive
-                // events. Marshal on the GTK main thread. Only set
-                // ignore-cursor-events false after the mask applies, or the overlay is a click-eater.
+                // XShape is the click-through. tao's ignore-cursor call replaces it
+                // with a 1x1 dot or the whole window, so the mask stays applied
+                // while the overlay is visible and a paused card still takes a click.
                 #[cfg(all(unix, not(target_os = "macos")))]
                 {
-                    if !ignore && presence.visible {
+                    if presence.visible {
                         let sprites_on_overlay = characters_on_display(&placed, *display);
 
                         if !sprites_on_overlay.is_empty() {
@@ -2494,7 +2906,7 @@ pub(crate) fn run_frame_loop(
                                 let trace = tracing;
 
                                 let _ = app.run_on_main_thread(move || {
-                                    mask_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                                    record_for_overlay(&mask_in_flight_clone, overlay_index, false);
                                     if let Some(window) = handle.get_webview_window(&label_clone) {
                                         let (sprite_masks, hotspots) = &mask_params_clone;
                                         let sprites: Vec<platform::SpriteMask<'_>> = masks
@@ -2514,10 +2926,16 @@ pub(crate) fn run_frame_loop(
                                             &window, &sprites, hotspots, false,
                                         ) {
                                             Ok(()) => {
-                                                mask_applied_clone.lock().unwrap()[overlay_index] =
-                                                    true;
-                                                last_mask_clone.lock().unwrap()[overlay_index] =
-                                                    mask_params_clone;
+                                                record_for_overlay(
+                                                    &mask_applied_clone,
+                                                    overlay_index,
+                                                    true,
+                                                );
+                                                record_for_overlay(
+                                                    &last_mask_clone,
+                                                    overlay_index,
+                                                    mask_params_clone,
+                                                );
                                                 if trace {
                                                     eprintln!(
                                                         "overlay: {label_clone} input mask applied"
@@ -2537,20 +2955,6 @@ pub(crate) fn run_frame_loop(
                                     }
                                 });
                             }
-
-                            if mask_applied
-                                .lock()
-                                .unwrap()
-                                .get(index)
-                                .copied()
-                                .unwrap_or(false)
-                                && ignoring[index] != Some(false)
-                            {
-                                flipped = true;
-                                if platform::set_overlay_click_through(&window, false).is_ok() {
-                                    ignoring[index] = Some(false);
-                                }
-                            }
                         } else {
                             let mask_params: MaskParams = Default::default();
 
@@ -2566,18 +2970,14 @@ pub(crate) fn run_frame_loop(
                                         if platform::update_input_region(&window, &[], &[], true)
                                             .is_ok()
                                         {
-                                            last_mask_clone.lock().unwrap()[overlay_index] =
-                                                mask_params_clone;
+                                            record_for_overlay(
+                                                &last_mask_clone,
+                                                overlay_index,
+                                                mask_params_clone,
+                                            );
                                         }
                                     }
                                 });
-                            }
-
-                            if ignoring[index] != Some(true) {
-                                flipped = true;
-                                if platform::set_overlay_click_through(&window, true).is_ok() {
-                                    ignoring[index] = Some(true);
-                                }
                             }
                         }
                     } else {
@@ -2595,18 +2995,14 @@ pub(crate) fn run_frame_loop(
                                     if platform::update_input_region(&window, &[], &[], true)
                                         .is_ok()
                                     {
-                                        last_mask_clone.lock().unwrap()[overlay_index] =
-                                            mask_params_clone;
+                                        record_for_overlay(
+                                            &last_mask_clone,
+                                            overlay_index,
+                                            mask_params_clone,
+                                        );
                                     }
                                 }
                             });
-                        }
-
-                        if ignoring[index] != Some(true) {
-                            flipped = true;
-                            if platform::set_overlay_click_through(&window, true).is_ok() {
-                                ignoring[index] = Some(true);
-                            }
                         }
                     }
                 }
@@ -2615,18 +3011,22 @@ pub(crate) fn run_frame_loop(
                 {
                     if presence.visible {
                         // No sprite here can still leave a bubble straddling the seam.
-                        let art: Vec<[i32; 4]> = characters_on_display(&placed, *display)
-                            .into_iter()
-                            .flat_map(|instance| {
-                                let local = instance.sprite.in_overlay(*display);
-                                let offset =
-                                    (local.x - instance.sprite.x, local.y - instance.sprite.y);
-                                trails
-                                    .get(&instance.id)
-                                    .map(|trail| trail.clip_rects(offset))
-                                    .unwrap_or_default()
-                            })
-                            .collect();
+                        let art: Vec<fidget_core::overlay_region::SpriteArt> =
+                            characters_on_display(&placed, *display)
+                                .into_iter()
+                                .map(|instance| {
+                                    let local = instance.sprite.in_overlay(*display);
+                                    let offset =
+                                        (local.x - instance.sprite.x, local.y - instance.sprite.y);
+                                    fidget_core::overlay_region::SpriteArt {
+                                        instance: instance.id.clone(),
+                                        rects: trails
+                                            .get(&instance.id)
+                                            .map(|trail| trail.clip_rects(offset))
+                                            .unwrap_or_default(),
+                                    }
+                                })
+                                .collect();
                         // A bubble rides with its sprite, so it is kept over the
                         // same trail the sprite's ink is swept over.
                         let rects = fidget_core::overlay_region::follow_placements(
@@ -2685,7 +3085,7 @@ pub(crate) fn run_frame_loop(
                                 let click_through = ignore;
 
                                 let _ = app.run_on_main_thread(move || {
-                                    mask_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                                    record_for_overlay(&mask_in_flight_clone, overlay_index, false);
                                     if let Some(window) = handle.get_webview_window(&label_clone) {
                                         let (art, rects) = &mask_params_clone;
                                         match platform::update_input_region(
@@ -2695,12 +3095,21 @@ pub(crate) fn run_frame_loop(
                                             click_through,
                                         ) {
                                             Ok(passes_clicks) => {
-                                                mask_applied_clone.lock().unwrap()[overlay_index] =
-                                                    true;
-                                                last_mask_clone.lock().unwrap()[overlay_index] =
-                                                    mask_params_clone;
-                                                applied_ignoring_clone.lock().unwrap()[overlay_index] =
-                                                    Some(passes_clicks);
+                                                record_for_overlay(
+                                                    &mask_applied_clone,
+                                                    overlay_index,
+                                                    true,
+                                                );
+                                                record_for_overlay(
+                                                    &last_mask_clone,
+                                                    overlay_index,
+                                                    mask_params_clone,
+                                                );
+                                                record_for_overlay(
+                                                    &applied_ignoring_clone,
+                                                    overlay_index,
+                                                    Some(passes_clicks),
+                                                );
                                                 if trace {
                                                     eprintln!(
                                                         "overlay: {label_clone} input mask applied"
@@ -2730,7 +3139,11 @@ pub(crate) fn run_frame_loop(
                                 let click_through = ignore;
 
                                 let _ = app.run_on_main_thread(move || {
-                                    toggle_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                                    record_for_overlay(
+                                        &toggle_in_flight_clone,
+                                        overlay_index,
+                                        false,
+                                    );
                                     if let Some(window) = handle.get_webview_window(&label_clone) {
                                         if platform::toggle_click_through_only(
                                             &window,
@@ -2738,8 +3151,11 @@ pub(crate) fn run_frame_loop(
                                         )
                                         .is_ok()
                                         {
-                                            applied_ignoring_clone.lock().unwrap()[overlay_index] =
-                                                Some(click_through);
+                                            record_for_overlay(
+                                                &applied_ignoring_clone,
+                                                overlay_index,
+                                                Some(click_through),
+                                            );
                                             if trace {
                                                 eprintln!(
                                                     "overlay: {label_clone} click-through toggled"
@@ -2788,15 +3204,25 @@ pub(crate) fn run_frame_loop(
                                 let overlay_index = index;
 
                                 let _ = app.run_on_main_thread(move || {
-                                    toggle_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                                    record_for_overlay(
+                                        &toggle_in_flight_clone,
+                                        overlay_index,
+                                        false,
+                                    );
                                     if let Some(window) = handle.get_webview_window(&label_clone) {
                                         if platform::toggle_click_through_only(&window, true)
                                             .is_ok()
                                         {
-                                            applied_ignoring_clone.lock().unwrap()[overlay_index] =
-                                                Some(true);
-                                            last_mask_clone.lock().unwrap()[overlay_index] =
-                                                (Vec::new(), Vec::new());
+                                            record_for_overlay(
+                                                &applied_ignoring_clone,
+                                                overlay_index,
+                                                Some(true),
+                                            );
+                                            record_for_overlay(
+                                                &last_mask_clone,
+                                                overlay_index,
+                                                (Vec::new(), Vec::new()),
+                                            );
                                         }
                                     }
                                 });
@@ -2843,11 +3269,14 @@ pub(crate) fn run_frame_loop(
                             let overlay_index = index;
 
                             let _ = app.run_on_main_thread(move || {
-                                toggle_in_flight_clone.lock().unwrap()[overlay_index] = false;
+                                record_for_overlay(&toggle_in_flight_clone, overlay_index, false);
                                 if let Some(window) = handle.get_webview_window(&label_clone) {
                                     if platform::toggle_click_through_only(&window, true).is_ok() {
-                                        applied_ignoring_clone.lock().unwrap()[overlay_index] =
-                                            Some(true);
+                                        record_for_overlay(
+                                            &applied_ignoring_clone,
+                                            overlay_index,
+                                            Some(true),
+                                        );
                                     }
                                 }
                             });
@@ -2937,10 +3366,16 @@ pub(crate) fn run_frame_loop(
     });
 }
 
-/// Throw this Instance's conversation away and leave it ready to open a new one
-/// on the same Completer. Both halves or neither (ADR-0012). Action Log and Chat
-/// stay with the caller: only it knows why the session was replaced.
-fn replace_session(
+/// What a Completer retarget does to the Harness conversation.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HarnessSession {
+    /// Leave it. A Character switch and a settings retarget.
+    Keep,
+    /// Forget it, so the next wake opens `session/new`.
+    Drop,
+}
+
+fn retarget_live(
     slots: &mut completer::Slots,
     live: &mut InstanceState,
     director: &model::DirectorSettings,
@@ -2955,9 +3390,55 @@ fn replace_session(
         director,
         configured,
     );
-    if let Some(attached) = harness::attached() {
-        attached.drop_conversation(&live.id);
+}
+
+/// Retarget the Completer and record the new session in the same call.
+/// `Drop` forgets the Harness conversation. `Keep` leaves it. Sessions are
+/// keyed by Character, and changing host does not end one.
+pub(crate) fn replace_session(
+    host: &impl session_log::SessionSurface,
+    slots: &mut completer::Slots,
+    live: &mut InstanceState,
+    director: &model::DirectorSettings,
+    configured: bool,
+    why: &str,
+    harness_session: HarnessSession,
+) {
+    retarget_live(slots, live, director, configured);
+    if harness_session == HarnessSession::Drop {
+        if let Some(attached) = harness::attached() {
+            attached.drop_conversation(&live.id);
+        }
     }
+    session_log::new_session(host, &live.id, why);
+}
+
+/// Record the session a settings retarget ended, except on a first
+/// connection. Nothing could answer before that, so the banner waits
+/// for a wake that proves one can. Emitting now scrolls Chat off a spawn error.
+fn retarget_for_settings(
+    host: &impl session_log::SessionSurface,
+    slots: &mut completer::Slots,
+    live: &mut InstanceState,
+    director: &model::DirectorSettings,
+    configured: bool,
+    first_connection: bool,
+    pending_first_connection_message: &mut bool,
+) {
+    if first_connection {
+        retarget_live(slots, live, director, configured);
+        *pending_first_connection_message = true;
+        return;
+    }
+    replace_session(
+        host,
+        slots,
+        live,
+        director,
+        configured,
+        "settings changed what answers",
+        HarnessSession::Keep,
+    );
 }
 
 /// Dispatch one `tools/call` against the live Instances, not stubs, and answer
@@ -2992,6 +3473,9 @@ fn answer_tool_call(
                 app_instructions: director::app_instructions(
                     super::behavior_names_of(characters, instance),
                     blank,
+                    // Only a Harness can call this tool, and it has tools.
+                    true,
+                    crate::i18n::reply_language(),
                 ),
                 personality_prompt: match blank {
                     true => String::new(),
@@ -3030,6 +3514,7 @@ fn answer_tool_call(
             instances: &spots,
         },
         caffeinate,
+        animation_source: fidget_core::engine::AnimationSource::AiMcp,
     };
     let _ = call
         .reply
@@ -3051,6 +3536,13 @@ fn touched(verbs: &[Verb], grab_started: bool, poke_settled: bool) -> Option<Hap
     } else {
         None
     }
+}
+
+/// What the wake says happened when the sprite changes State. A possessed
+/// sprite perches where the user steered it, so that landing is not news.
+fn landed(last: Option<State>, now: State, possessed: bool) -> Option<Happened> {
+    let became_perched = last.is_some() && now == State::Perched && last != Some(State::Perched);
+    (became_perched && !possessed).then_some(Happened::Perch)
 }
 
 /// Drop front and `before` names without WindowNames consent or when excluded
@@ -3082,17 +3574,155 @@ fn trace_schedule_switch(was: scheduler::ScheduleMode, now: scheduler::ScheduleM
     eprintln!("click-trace: {name} t={:.1}", platform::trace_ms());
 }
 
+/// The first-run gesture tips: app-authored Talk, so no AI call or named
+/// Behavior supplies it. The empty name is what asks the Engine for Talk.
+fn tour_proposal() -> BehaviorProposal {
+    BehaviorProposal {
+        behavior: String::new(),
+        dialogue: Some(
+            "Double-click me any time to open Chat.\n\n\
+             Click once to Poke and get a reaction.\n\n\
+             Right-click to open the menu."
+                .to_string(),
+        ),
+        direction: None,
+        source: fidget_core::engine::AnimationSource::Onboarding,
+    }
+}
+
+/// A reply line still growing. `slots` hands over only the current epoch's
+/// delivery, so a superseded stream never reaches this.
+fn streamed_line(line: String) -> BehaviorProposal {
+    BehaviorProposal {
+        behavior: String::new(),
+        dialogue: Some(line),
+        direction: None,
+        source: fidget_core::engine::AnimationSource::AiRequested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use fidget_core::character::{
         Animation, Behavior, Character, CursorReaction, GravityScale, Primitive,
-        DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER, REQUIRED_ANIMATIONS,
+        DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_MODEL_BASE, DEFAULT_MODEL_POWER,
+        DEFAULT_SLEEP_AFTER_S, DEFAULT_SLEEP_FOR_S, REQUIRED_ANIMATIONS,
     };
     use fidget_core::engine::Point;
     use fidget_core::window_source::{Capabilities, WorldGeometry};
     use serde_json::json;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn the_first_run_tour_is_onboarding_talk_with_no_behavior() {
+        let tour = super::tour_proposal();
+        assert_eq!(tour.behavior, "", "an empty name asks for Talk");
+        assert!(tour
+            .dialogue
+            .is_some_and(|line| line.contains("Double-click")));
+        assert_eq!(
+            tour.source,
+            fidget_core::engine::AnimationSource::Onboarding
+        );
+    }
+
+    /// A streamed line is the reply arriving, so it reads as the reply will
+    /// once it lands: no source change between streaming and the final.
+    #[test]
+    fn a_streamed_reply_line_is_ai_requested() {
+        let streamed = super::streamed_line("he".to_string());
+        assert_eq!(
+            (streamed.behavior.as_str(), streamed.dialogue.as_deref()),
+            ("", Some("he"))
+        );
+        assert_eq!(
+            streamed.source,
+            fidget_core::engine::AnimationSource::AiRequested
+        );
+    }
+
+    /// A wake superseded on the wire delivers neither its words nor its
+    /// reply, so no Frame ever reports the source of a moment the fidget left.
+    #[test]
+    fn a_superseded_delivery_never_reaches_the_animation_source() {
+        use fidget_core::engine::AnimationSource;
+
+        let mut character = character();
+        for name in ["stroll", "nap"] {
+            let mut behavior = character.behaviors["wave"].clone();
+            behavior.primitives = vec![Primitive::Walk];
+            character.behaviors.insert(name.to_string(), behavior);
+        }
+        let mut roster = Roster::new();
+        let id = roster.spawn(&character, "Pip".to_string(), Point { x: 100.0, y: 0.0 });
+        // A floor to stand on: a falling sprite defers every proposal.
+        let floor = || fidget_core::engine::WorldSnapshot {
+            displays: vec![fidget_core::window_source::Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 1000.0,
+                height: 800.0,
+            }],
+            elapsed_ms: 16,
+            ..Default::default()
+        };
+        for _ in 0..200 {
+            roster.get_mut(&id).expect("spawned").tick(&floor());
+        }
+
+        let mut slots = completer::Slots::new();
+        slots.wake(
+            &id,
+            completer::tests::answering("stroll\nstale words", 60),
+            completer::tests::wake_context(),
+        );
+        slots.wake(
+            &id,
+            completer::tests::answering("nap\nfresh words", 0),
+            Context {
+                happened: Happened::Poke,
+                ..completer::tests::wake_context()
+            },
+        );
+
+        let mut seen = Vec::new();
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while std::time::Instant::now() < until {
+            let proposal = match slots.take(&id) {
+                Some(completer::Arrived::Dialogue(line)) => Some(super::streamed_line(line)),
+                Some(completer::Arrived::Answered(answered)) => match answered.wake {
+                    Wake::Proposed(proposal) => Some(proposal),
+                    Wake::Failed => None,
+                },
+                None => None,
+            };
+            let world = fidget_core::engine::WorldSnapshot {
+                proposal,
+                ..floor()
+            };
+            let frame = roster.get_mut(&id).expect("spawned").tick(&world);
+            seen.push((
+                frame.behavior.clone(),
+                frame.dialogue.as_ref().map(|said| said.text.clone()),
+                frame.animation_source,
+            ));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        assert!(
+            seen.iter().any(|(behavior, _, source)| {
+                behavior.as_deref() == Some("nap") && *source == AnimationSource::AiRequested
+            }),
+            "the winning reply plays as AI Requested: {seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|(behavior, said, _)| {
+                behavior.as_deref() == Some("stroll") || said.as_deref() == Some("stale words")
+            }),
+            "the superseded call reached a Frame: {seen:?}"
+        );
+    }
 
     fn activity(frontmost: Option<&str>) -> Activity {
         Activity {
@@ -3169,6 +3799,8 @@ mod tests {
                         fps: 8,
                         looping: true,
                         variants: Vec::new(),
+                        variant_of: None,
+                        same_as: None,
                         left_strip: None,
                         // core keeps its own default private, and this test
                         // only needs a Behavior something can pick.
@@ -3182,9 +3814,12 @@ mod tests {
             "wave".to_string(),
             Behavior {
                 primitives: vec![Primitive::React],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
             },
         );
         Character {
@@ -3200,6 +3835,9 @@ mod tests {
             near_reaction: CursorReaction::default(),
             rush_reaction: CursorReaction::default(),
             gravity_scale: GravityScale::DEFAULT,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
             source: None,
         }
     }
@@ -3238,6 +3876,41 @@ mod tests {
         let frame = roster.get_mut(&id).expect("still there").tick(&snapshot);
         assert_eq!(frame.behavior.as_deref(), Some("wave"));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A Character with no climb art climbs in its walk art.
+    #[test]
+    fn the_status_names_the_drawn_animation_and_the_one_asked_for() {
+        let png = include_bytes!("../../crates/core/tests/fixtures/alpha-2x2.png");
+        let mut character = character();
+        character.art.insert(
+            "walk-0.png".to_string(),
+            fidget_core::character::Art {
+                png: png.to_vec(),
+                mask: fidget_core::overlay::AlphaMask::from_png(png, 128)
+                    .expect("the fixture decodes"),
+                facing: fidget_core::character::Facing::Right,
+            },
+        );
+        let mut roster = Roster::new();
+        let id = roster.spawn(&character, "Pip".to_string(), Point { x: 0.0, y: 0.0 });
+        let snapshot =
+            SnapshotAssembler::new(EmptyDesktop).assemble(16, Point { x: 0.0, y: 0.0 }, Vec::new());
+        let mut frame = roster.get_mut(&id).expect("just spawned").tick(&snapshot);
+        frame.animation = "climb";
+        let drawn = character
+            .draw(
+                frame.art_name(),
+                frame.animation_ms,
+                frame.ring_choice(),
+                frame.facing,
+            )
+            .expect("climb falls back to walk");
+
+        let status = chat_status(&frame, drawn.animation, None, false);
+
+        assert_eq!(status.animation, "walk");
+        assert_eq!(status.asked_animation, "climb");
     }
 
     /// A session the Harness opened mid-run never heard its opening turn. It
@@ -3281,7 +3954,7 @@ mod tests {
         assert_eq!(pip["id"], json!(id));
         assert_eq!(
             pip["app_instructions"],
-            json!(director::app_instructions(["wave"], false))
+            json!(director::app_instructions(["wave"], false, true, None))
         );
         assert_eq!(pip["personality_prompt"], json!("a shy robot."));
         assert_eq!(pip["instance_prompt"], json!("Answer in haiku."));
@@ -3363,12 +4036,44 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn a_callback_that_runs_after_its_display_is_gone_records_nothing() {
+        let configured = Arc::new(Mutex::new(vec![false; 2]));
+        let queued: Vec<Box<dyn FnOnce()>> = (0..2)
+            .map(|overlay_index| {
+                let configured = Arc::clone(&configured);
+                Box::new(move || record_for_overlay(&configured, overlay_index, true))
+                    as Box<dyn FnOnce()>
+            })
+            .collect();
+
+        // The next tick sees one display and shrinks the list to fit.
+        configured.lock().unwrap().resize(1, false);
+        for callback in queued {
+            callback();
+        }
+
+        assert_eq!(*configured.lock().unwrap(), vec![true]);
+    }
+
     fn click() -> Vec<bool> {
         vec![true, false]
     }
 
     fn wait(ms: usize) -> Vec<bool> {
         vec![false; ms / 16]
+    }
+
+    #[test]
+    fn a_possessed_landing_does_not_wake_the_director() {
+        let falling = Some(State::Falling);
+        assert_eq!(
+            landed(falling, State::Perched, false),
+            Some(Happened::Perch)
+        );
+        assert_eq!(landed(falling, State::Perched, true), None);
+        assert_eq!(landed(Some(State::Perched), State::Perched, false), None);
+        assert_eq!(landed(None, State::Perched, false), None);
     }
 
     #[test]
@@ -3475,6 +4180,7 @@ mod tests {
             rect: [50, 60, 200, 80],
             clickable: false,
             follows: None,
+            see_through: false,
         }];
         assert_eq!(
             decide_region_action(&[], &bubble, true),
@@ -3561,5 +4267,218 @@ mod tests {
             None,
             "Chat has no dialogue to show when both sources are None"
         );
+    }
+
+    struct Recording {
+        log: Mutex<session_log::Log>,
+        shown: Mutex<Vec<(String, String)>>,
+    }
+
+    impl session_log::SessionSurface for Recording {
+        fn forget_turns(&self, instance: &str) {
+            self.log.lock().expect("session log").forget(instance);
+        }
+
+        fn announce_session(&self, instance: &str, why: &str) {
+            self.shown
+                .lock()
+                .expect("announced sessions")
+                .push((instance.to_string(), why.to_string()));
+        }
+    }
+
+    impl Recording {
+        fn holding(lines: &[(&str, &str)]) -> Self {
+            let mut log = session_log::Log::new();
+            for (instance, said) in lines {
+                log.log_you(instance, *said, UNIX_EPOCH);
+            }
+            Self {
+                log: Mutex::new(log),
+                shown: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn said(&self, instance: &str) -> Vec<String> {
+            self.log
+                .lock()
+                .expect("session log")
+                .replay(instance)
+                .into_iter()
+                .filter_map(|turn| turn.said)
+                .collect()
+        }
+    }
+
+    fn instance_state(id: &str, director: &model::DirectorSettings) -> InstanceState {
+        let character = Arc::new(character());
+        let config = model::config_from(director, harness::test_attached());
+        InstanceState {
+            id: id.to_string(),
+            director: fidget_core::director::StaticDirector::new(character.behaviors.clone(), 0),
+            pace: paced(&config, &character),
+            character,
+            model: None,
+            recent: Vec::new(),
+            recency: fidget_core::director::Recency::default(),
+            since_wake: Duration::ZERO,
+            since_proactive: Duration::ZERO,
+            previous_idle: Duration::MAX,
+            chat_turn: false,
+            chat_said: false,
+            happened_last: None,
+            since_state: Duration::ZERO,
+            last_state: None,
+            last_position: Point { x: 0.0, y: 0.0 },
+            addressed: false,
+            happened: Happened::Proactive,
+            pointer: fidget_core::input::Pointer::with_double_click_ms(500),
+            spoken: None,
+            speech: fidget_core::speech::SpeechBubble::default(),
+            drawn_last: None,
+            hovering: false,
+            qm: None,
+            verbs: Vec::new(),
+            menu_hold: None,
+            traced_last: None,
+            status_last: None,
+            status_wake_ms: None,
+            first_draw: crate::FirstDraw::Running,
+        }
+    }
+
+    fn session_line(dir: &std::path::Path) -> serde_json::Value {
+        let text = std::fs::read_to_string(dir.join(crate::action_log::FILE)).expect("action log");
+        serde_json::from_str(text.lines().next().expect("one session line")).expect("json")
+    }
+
+    /// Production change that would fail this: a settings change that installs
+    /// a new Completer and leaves the old turns on screen, or a first connection
+    /// that tells Chat the session ended before a wake has proved one can answer.
+    #[test]
+    fn a_settings_retarget_records_the_session_only_once_something_could_answer() {
+        model::tests::with_env(None, None, None, || {
+            let director = model::resolve("http://localhost:11434", "gemma4", None);
+            let configured = model::config_from(&director, harness::test_attached()).configured;
+            assert!(configured, "a local endpoint needs no key");
+            let id = "buddy-1".to_string();
+
+            let first_dir =
+                std::env::temp_dir().join(format!("fidget-session-first-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&first_dir).expect("temp dir");
+            session_log::with_session_dir(first_dir.clone(), || {
+                let mut slots = completer::tests::slots_awaiting_a_wake(&id);
+                let mut live = instance_state(&id, &director);
+                let host =
+                    Recording::holding(&[("buddy-1", "still talking"), ("buddy-2", "other")]);
+                let mut pending = false;
+
+                retarget_for_settings(
+                    &host,
+                    &mut slots,
+                    &mut live,
+                    &director,
+                    configured,
+                    true,
+                    &mut pending,
+                );
+
+                assert!(pending, "the banner waits for a wake that succeeds");
+                assert!(host.shown.lock().expect("shown").is_empty());
+                assert_eq!(host.said("buddy-1"), ["still talking"]);
+                assert_eq!(host.said("buddy-2"), ["other"]);
+                assert!(!slots.waiting(&id), "the wake on the old target is dropped");
+                assert!(live.model.is_some(), "the new Completer is installed");
+                assert!(
+                    !first_dir.join(crate::action_log::FILE).exists(),
+                    "no session line before anything can answer"
+                );
+            });
+            std::fs::remove_dir_all(&first_dir).ok();
+
+            let later_dir =
+                std::env::temp_dir().join(format!("fidget-session-later-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&later_dir).expect("temp dir");
+            session_log::with_session_dir(later_dir.clone(), || {
+                let mut slots = completer::tests::slots_awaiting_a_wake(&id);
+                let mut live = instance_state(&id, &director);
+                let host =
+                    Recording::holding(&[("buddy-1", "still talking"), ("buddy-2", "other")]);
+                let mut pending = false;
+
+                retarget_for_settings(
+                    &host,
+                    &mut slots,
+                    &mut live,
+                    &director,
+                    configured,
+                    false,
+                    &mut pending,
+                );
+
+                assert!(!pending);
+                assert_eq!(
+                    host.shown.lock().expect("shown").as_slice(),
+                    [(
+                        "buddy-1".to_string(),
+                        "settings changed what answers".to_string()
+                    )]
+                );
+                assert!(host.said("buddy-1").is_empty(), "the old turns go");
+                assert_eq!(host.said("buddy-2"), ["other"]);
+                assert!(!slots.waiting(&id));
+                assert!(live.model.is_some());
+                let line = session_line(&later_dir);
+                assert_eq!(line["event"], "session");
+                assert_eq!(line["instance"], "buddy-1");
+                assert_eq!(line["why"], "settings changed what answers");
+            });
+            std::fs::remove_dir_all(&later_dir).ok();
+        });
+    }
+
+    /// Production change that would fail this: New Session retargets the
+    /// Completer and leaves Chat and the Action Log on the conversation it ended.
+    #[test]
+    fn replacing_a_session_drops_the_wake_and_records_why() {
+        model::tests::with_env(None, None, None, || {
+            let director = model::resolve("http://localhost:11434", "gemma4", None);
+            let configured = model::config_from(&director, harness::test_attached()).configured;
+            let id = "buddy-1".to_string();
+            let dir =
+                std::env::temp_dir().join(format!("fidget-session-new-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).expect("temp dir");
+            session_log::with_session_dir(dir.clone(), || {
+                let mut slots = completer::tests::slots_awaiting_a_wake(&id);
+                let mut live = instance_state(&id, &director);
+                let host = Recording::holding(&[("buddy-1", "old conversation")]);
+
+                replace_session(
+                    &host,
+                    &mut slots,
+                    &mut live,
+                    &director,
+                    configured,
+                    "a new session was started",
+                    HarnessSession::Drop,
+                );
+
+                assert!(
+                    !slots.waiting(&id),
+                    "the wake on the old session is dropped"
+                );
+                assert!(live.model.is_some());
+                assert!(host.said("buddy-1").is_empty());
+                assert_eq!(
+                    host.shown.lock().expect("shown").as_slice(),
+                    [(
+                        "buddy-1".to_string(),
+                        "a new session was started".to_string()
+                    )]
+                );
+                assert_eq!(session_line(&dir)["why"], "a new session was started");
+            });
+            std::fs::remove_dir_all(&dir).ok();
+        });
     }
 }

@@ -4,6 +4,32 @@
       "title": "Presence",
       "sections": [
         {
+          "heading": "Language",
+          "serves": null,
+          "rows": [
+            {
+              "type": "Popup",
+              "id": "language",
+              "label": null,
+              "writes": "Language",
+              "help": "Preferred language for the character's replies. The interface stays in English.",
+              "options": [
+                "System",
+                "English",
+                "Français",
+                "Español"
+              ],
+              "frozen": false,
+              "batched": false,
+              "disclosure": "The character may follow the user's language when they write in another language. Behavior names are never translated.",
+              "status": null
+            }
+          ],
+          "comment": null,
+          "disclosure": null,
+          "status": null
+        },
+        {
           "heading": "Do Not Disturb",
           "serves": null,
           "rows": [
@@ -970,7 +996,7 @@
               "type": "TextField",
               "id": "hover_delay_ms",
               "label": "Hover delay, in milliseconds",
-              "placeholder": "1500",
+              "placeholder": "2500",
               "writes": "HoverDelayMs",
               "help": "How long to rest on the Character before the quick message opens.",
               "frozen": false,
@@ -980,21 +1006,45 @@
             }
           ],
           "comment": "Also for development and testing. Leave empty for the default.",
-          "disclosure": "Hover delay: how long the pointer rests on the Character before the quick message opens. Leave empty for 1500 milliseconds (the default). A change applies to the next hover.",
+          "disclosure": "Hover delay: how long the pointer rests on the Character before the quick message opens. Leave empty for 2500 milliseconds (the default). A change applies to the next hover.",
+          "status": null
+        },
+        {
+          "heading": "Action Log",
+          "serves": null,
+          "rows": [
+            {
+              "type": "Composite",
+              "id": "action_log_actions",
+              "controls": [
+                {
+                  "type": "Button",
+                  "id": "action_log_open",
+                  "label": "Open in editor",
+                  "frozen": false
+                }
+              ],
+              "help": null,
+              "disclosure": null
+            }
+          ],
+          "comment": "Also for development and testing. Opens the log of Harness actions.",
+          "disclosure": "The Action Log is one JSON line per Harness action. Open in editor hands the current file to the system editor. Rotated copies stay beside it.",
           "status": null
         }
       ]
     }
   ],
   "operations": {
-    "byo_copy": "CopyByoSnippet",
-    "byo_copy_token": "CopyByoToken",
-    "clear_key": "ClearKey",
-    "director_apply": "Apply",
-    "director_cancel": "Cancel",
-    "memory_open": "OpenMemory",
-    "memory_wipe": "WipeMemory",
-    "new_session": "NewSession",
-    "spawn": "Spawn"
+    "byo_copy": "copy_byo_snippet",
+    "byo_copy_token": "copy_byo_token",
+    "clear_key": "clear_key",
+    "director_apply": "apply",
+    "director_cancel": "cancel",
+    "action_log_open": "open_action_log",
+    "memory_open": "open_memory",
+    "memory_wipe": "wipe_memory",
+    "new_session": "new_session",
+    "spawn": "spawn"
   }
 }

@@ -2,8 +2,8 @@
 # version, sha256, url, app, quit, zap, caveat, and livecheck stanzas from
 # one Release disk image; livecheck follows GitHub's latest Release.
 cask "fidget" do
-  version "0.7.0"
-  sha256 "f858b5fbf918922dfc51fe9b5501218780d466bac6a941fe6c260e3e77adefb8"
+  version "0.10.0"
+  sha256 "266a214d62d023c5b853524c661ed7b2894e4d25ab19bbc00fb5c6ea4f3f548b"
 
   url "https://github.com/omesser/fidget/releases/download/v#{version}/Fidget_#{version}_aarch64.dmg"
   name "Fidget"

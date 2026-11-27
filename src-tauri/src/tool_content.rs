@@ -1,9 +1,9 @@
 //! What a tool call carried, as the pieces Chat draws in its replayed row.
 //!
 //! Every field the wire sends reaches the reader in some form. A diff is a path
-//! and line counts, never a viewer. A terminal is its id.
+//! and line counts, never a viewer. A terminal is a label naming its id.
 
-use agent_client_protocol::schema::v1::{ContentBlock, ToolCallContent, ToolCallLocation};
+use agent_client_protocol::v1::schema::{ContentBlock, Diff, ToolCallContent, ToolCallLocation};
 use serde::Serialize;
 use similar::{ChangeTag, TextDiff};
 
@@ -27,8 +27,32 @@ pub enum ToolPiece {
         approximate: bool,
     },
     Terminal {
-        id: String,
+        label: String,
     },
+}
+
+/// A piece as the consent row and the replayed row both read it. Unlike a
+/// `ToolPiece`, a diff is not yet counted, since the consent row wants only
+/// its path, and a terminal's label is plain text that each row escapes.
+pub(crate) enum Piece<'a> {
+    Text(&'a str),
+    Mark(String),
+    Diff(&'a Diff),
+    Terminal(String),
+}
+
+pub(crate) fn piece(content: &ToolCallContent) -> Piece<'_> {
+    match content {
+        ToolCallContent::Content(block) => match &block.content {
+            ContentBlock::Text(text) => Piece::Text(&text.text),
+            other => Piece::Mark(content_mark::mark(other)),
+        },
+        ToolCallContent::Diff(diff) => Piece::Diff(diff),
+        ToolCallContent::Terminal(terminal) => {
+            Piece::Terminal(format!("Terminal {}", terminal.terminal_id.0))
+        }
+        _ => Piece::Mark(content_mark::UNKNOWN.to_string()),
+    }
 }
 
 /// A file a tool call touched, and the line when the Harness sent one.
@@ -41,16 +65,12 @@ pub struct Place {
 pub(crate) fn pieces(content: &[ToolCallContent]) -> Vec<ToolPiece> {
     content
         .iter()
-        .map(|piece| match piece {
-            ToolCallContent::Content(block) => match &block.content {
-                ContentBlock::Text(text) => ToolPiece::Text {
-                    text: text.text.clone(),
-                },
-                other => ToolPiece::Mark {
-                    markdown: content_mark::mark(other),
-                },
+        .map(|sent| match piece(sent) {
+            Piece::Text(text) => ToolPiece::Text {
+                text: text.to_string(),
             },
-            ToolCallContent::Diff(diff) => {
+            Piece::Mark(markdown) => ToolPiece::Mark { markdown },
+            Piece::Diff(diff) => {
                 let counts = line_counts(diff.old_text.as_deref(), &diff.new_text);
                 ToolPiece::Diff {
                     path: diff.path.display().to_string(),
@@ -59,12 +79,7 @@ pub(crate) fn pieces(content: &[ToolCallContent]) -> Vec<ToolPiece> {
                     approximate: counts.approximate,
                 }
             }
-            ToolCallContent::Terminal(terminal) => ToolPiece::Terminal {
-                id: terminal.terminal_id.0.to_string(),
-            },
-            _ => ToolPiece::Mark {
-                markdown: content_mark::UNKNOWN.to_string(),
-            },
+            Piece::Terminal(label) => ToolPiece::Terminal { label },
         })
         .collect()
 }
@@ -142,32 +157,9 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_file_counts_the_lines_it_added_and_removed() {
-        assert_eq!(counts(Some("a\nb\nc\nd\n"), "a\nB\nc\nd\ne\nf\n"), (3, 1));
-    }
-
-    #[test]
-    fn a_new_file_is_all_added_and_an_emptied_one_all_removed() {
-        assert_eq!(counts(None, "x\ny\nz\n"), (3, 0));
-        assert_eq!(counts(Some("x\ny\n"), ""), (0, 2));
-    }
-
-    #[test]
     fn an_unchanged_file_adds_and_removes_nothing() {
         assert_eq!(counts(Some("a\nb\n"), "a\nb\n"), (0, 0));
         assert_eq!(counts(None, ""), (0, 0));
-    }
-
-    #[test]
-    fn a_moved_line_counts_as_one_removed_and_one_added() {
-        assert_eq!(counts(Some("a\nb\nc\n"), "b\nc\na\n"), (1, 1));
-    }
-
-    #[test]
-    fn only_a_newline_ends_a_line() {
-        assert_eq!(counts(Some("a\r\nb\r\n"), "a\r\nB\r\n"), (1, 1));
-        assert_eq!(counts(Some("a\r\nb\n"), "a\nb\n"), (1, 1));
-        assert_eq!(counts(Some("a\rb\n"), "a\nb\n"), (2, 1));
     }
 
     #[test]

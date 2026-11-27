@@ -15,10 +15,19 @@ fidget_alive() {
 
 # tail -F follows a file through kqueue (BSD) or inotify (GNU). GNU tail
 # treats some file systems as remote (overlayfs, NFS) and falls back to a
-# poll every second, so ask it for 50 ms there; it stops with Fidget, too.
-follow() { # <first line: +1 for the whole file, 0 for new lines> <file>
+# poll every second, so ask it for 50 ms there; on macOS, caffeinate watches Fidget.
+follow() { # <first line: +1 for the whole file, +N from line N, 0 for new lines> <file>
   if tail --version > /dev/null 2>&1; then
     tail -s 0.05 ${pid:+--pid="$pid"} -n "$1" -F "$2" 2> /dev/null
+  elif [ -n "${pid:-}" ] && command -v caffeinate > /dev/null; then
+    local tail_pid watcher_pid
+    tail -n "$1" -F "$2" 2> /dev/null &
+    tail_pid=$!
+    caffeinate -w "$pid" 2> /dev/null &
+    watcher_pid=$!
+    wait "$watcher_pid" 2> /dev/null || true
+    kill "$tail_pid" 2> /dev/null || true
+    wait "$tail_pid" 2> /dev/null || true
   else
     tail -n "$1" -F "$2" 2> /dev/null
   fi
@@ -26,7 +35,7 @@ follow() { # <first line: +1 for the whole file, 0 for new lines> <file>
 
 # Feed a file's lines to a reader until the reader exits or the seconds run
 # out. A timer kills the reader, so nothing here re-reads or polls.
-wait_on_lines() { # <seconds> <+1|0> <file> <reader...>
+wait_on_lines() { # <seconds> <+1|+N|0, as follow takes> <file> <reader...>
   local seconds=$1
   follow_from=$2 follow_file=$3
   shift 3
@@ -49,13 +58,25 @@ wait_on_source() { # <seconds> <source command> <reader...>
   reader_pid=$!
   { sleep "$seconds" && kill "$reader_pid"; } > /dev/null 2>&1 &
   timer_pid=$!
-  wait "$reader_pid" 2> /dev/null && result=0 || result=1
+  wait "$reader_pid" 2> /dev/null && result=0 || result=$?
   pkill -P "$timer_pid" 2> /dev/null || true
   pkill -P "$source_pid" 2> /dev/null || true
   kill "$timer_pid" "$source_pid" 2> /dev/null || true
   wait "$timer_pid" "$source_pid" 2> /dev/null || true
   rm -f "$fifo"
-  return "$result"
+  # 143: the timer's TERM ended the reader, so the seconds ran out.
+  [ "$result" != 143 ] || dump_stacks
+  [ "$result" = 0 ]
+}
+
+# A wait that ran out with Fidget still up saves every thread's stack in the
+# evidence folder ($out): a stall that never reproduces leaves no other trace.
+dump_stacks() {
+  fidget_alive && [ -n "${pid:-}" ] && command -v eu-stack > /dev/null || return 0
+  local file
+  file="${out:-${TMPDIR:-/tmp}}/stacks-$(now_ms).txt"
+  eu-stack -p "$pid" > "$file" 2>&1 || true
+  echo "a wait ran out; Fidget's thread stacks are in $file" >&2
 }
 
 # Wait for a line matching an extended regex to land in a file.
@@ -73,11 +94,25 @@ wait_for_marks() { # <seconds> <marks file> <pattern>
   wait_for_line "$@"
 }
 
+# A cold WebKit on a hosted runner can draw the overlay seconds late. The
+# 3 s this used to get missed on slow e2e-macos runners (#1765), even after a
+# warm-up launch, because every leaf starts in a private HOME with its own
+# WebKit cache. 30 s matches the warm-up's budget; a leaf's 3 min cap still
+# bounds a launch that never gets up.
+FIDGET_STARTUP_WAIT_SECONDS=30
+
 # Fidget is up once it writes its `overlay:` line, which lands before it
 # attaches a Harness. A wait for a harness mark starts here, so the mark gets
 # the whole budget instead of sharing it with the app's launch.
-wait_for_up() { # <seconds> <app log>
-  wait_for_line "$1" "$2" '^overlay:'
+wait_for_up() { # <app log>
+  wait_for_line "$FIDGET_STARTUP_WAIT_SECONDS" "$1" '^overlay:'
+}
+
+# Wait for the first mark of the first wake. The Director's clock starts at the
+# overlay's first draw, seconds after the `overlay:` line on a cold WebKit, so
+# that wake is part of the launch and gets the launch's budget.
+wait_for_first_wake() { # <marks file> <pattern>
+  wait_for_marks "$FIDGET_STARTUP_WAIT_SECONDS" "$@"
 }
 
 # Wait for a file to exist. tail -F cannot see an empty file appear, so this
@@ -177,49 +212,25 @@ stop_fidget() {
   wait "$timer" 2> /dev/null || true
 }
 
-# True when the newest five frame lines all show the sprite resting
-# (Grounded or Perched, not walking) in one spot. Frames land every draw, so
-# this needs no second look after a pause.
+# True when the newest five frame lines all show the sprite resting: Grounded
+# or Perched, in one spot, on an idle loop. A gesture, a sit, or a walk is
+# still in motion even when the feet have not moved. The frame index may change.
 sprite_at_rest() { # <log>
   grep '^frame: ' "$1" 2> /dev/null | tail -5 | awk '
-    !/ (Grounded|Perched) / || / walk#/ { bad = 1 }
+    !/ (Grounded|Perched) / || !/ idle#[0-9]+($| )/ { bad = 1 }
     { match($0, /sprite\(-?[0-9]+,-?[0-9]+\)/); at = substr($0, RSTART, RLENGTH); if (n++ && at != last) bad = 1; last = at }
     END { exit (bad || n < 5) }'
 }
 
-# Wait for the sprite to rest. Each move restarts the 3 s window; 10 s from
-# the start is the ceiling if it never stops.
+# A sprite can stand still for seconds without resting: a launch holds the spawn
+# pose up to 3 s for its first draw, then falls, says its landing line and may
+# sit for 4 s. 20 s is twice the slowest such launch e2e-macos has shown.
+FIDGET_REST_WAIT_SECONDS=20
+
+# Wait for the sprite to rest, checking again on each new line of its log.
 wait_for_rest() { # <log>
-  local flag result start
-  start=$(now_ms)
-  flag=$(mktemp "${TMPDIR:-/tmp}/fidget-rest.XXXXXX")
-  while :; do
-    sprite_at_rest "$1" && result=0 && break
-    if [ $(($(now_ms) - start)) -ge 10000 ]; then
-      echo "sprite never came to rest within 10s" >&2
-      result=1 && break
-    fi
-    : > "$flag"
-    wait_on_lines 3 0 "$1" rest_or_moved "$1" "$flag" || { result=1 && break; }
-    [ -s "$flag" ] || { result=0 && break; }
-  done
-  rm -f "$flag"
-  return "$result"
-}
-# Reader for wait_for_rest: exits on rest, or on a move after noting it.
-rest_or_moved() { # <log> <flag file>
-  local line spot last
-  last=$(grep '^frame: ' "$1" 2> /dev/null | tail -1 | grep -oE 'sprite\(-?[0-9]+,-?[0-9]+\)')
-  while IFS= read -r line; do
-    [[ $line == frame:* ]] || continue
-    sprite_at_rest "$1" && return 0
-    spot=$(grep -oE 'sprite\(-?[0-9]+,-?[0-9]+\)' <<< "$line")
-    if [ -n "$last" ] && [ "$spot" != "$last" ]; then
-      echo moved > "$2"
-      return 0
-    fi
-    last=$spot
-  done
+  wait_log=$1 wait_until "$FIDGET_REST_WAIT_SECONDS" sprite_at_rest "$1" && return 0
+  echo "sprite never came to rest within ${FIDGET_REST_WAIT_SECONDS}s" >&2
   return 1
 }
 

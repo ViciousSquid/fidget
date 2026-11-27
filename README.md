@@ -26,6 +26,12 @@ Try the gestures in your browser: [Fidget Cues](https://omesser.github.io/fidget
 
 ## What It Does
 
+<p align="center">
+<img src="./docs/readme/buddy-bot-perch-poke.gif" width="480" alt="Buddy Bot walks off a terminal window, drops onto another window, and reacts when poked" /><br>
+<b>Perch and poke</b><br>
+<sub>Buddy Bot hops off a terminal, lands on the next window, and flinches when you poke it.</sub>
+</p>
+
 - **Keeps you company:** It walks, naps, and reacts to your open windows. It works offline, with no AI account or subscription, for presence and play; hook it up to an AI and it takes on a life of its own, with full conversation and tool use.
 - **Pick a built-in character, or build your own:** Each character has its own sprites, animation loops, and personality. Edit any character's prompt or behavior using a plain-text personality file and a simple [manifest format](./docs/DEVELOPMENT.md#character-packages). Create your own characters, or [import and convert](./docs/DEVELOPMENT.md#importing-pets) one from the [Pets Codex](https://petscodex.com/) and [Shimeji Shop](https://shimejishop.com/) galleries.
 - **Personalize your Fidget's behavior:** Write your own text for any fidget's behavior through its Instance Prompt. It holds on top of its Character's personality, and changes how that fidget reacts. See [Give It an Instance Prompt](#give-it-an-instance-prompt) for examples.
@@ -37,7 +43,7 @@ Try the gestures in your browser: [Fidget Cues](https://omesser.github.io/fidget
 
 ## Characters
 
-Buddy Bot is the default. Ten Characters ship; each moves and speaks differently. A name links to its full prompt.
+Buddy Bot is the default. Eleven Characters ship; each moves and speaks differently. A name links to its full prompt.
 
 <table>
 <tr>
@@ -56,9 +62,18 @@ Buddy Bot is the default. Ten Characters ship; each moves and speaks differently
 <td align="center" colspan="2"><img src="./docs/readme/rubber-duck-talk.gif" height="96" alt="Rubber Duck" /><br><b><a href="./characters/rubber-duck/personality.txt">Rubber Duck</a></b><br><sub>Patient listener. One small question at a time.</sub></td>
 <td align="center" colspan="2"><img src="./docs/readme/tux-recover-card.gif" height="96" alt="Tux" /><br><b><a href="./characters/tux/personality.txt">Tux</a></b><br><sub>Cozy penguin. Small commands and a flipper salute.</sub></td>
 </tr>
+<tr>
+<td align="center" colspan="4"><img src="./docs/readme/tuxedo-bean-review.gif" height="96" alt="Tuxedo Bean" /><br><b><a href="./characters/tuxedo-bean/personality.txt">Tuxedo Bean</a></b><br><sub>Aloof tuxedo cat. Chases the cursor, then naps.</sub></td>
+</tr>
 </table>
 
 See them all in the [Character Gallery](https://omesser.github.io/fidget/characters.html).
+
+<p align="center">
+<img src="./docs/readme/rubber-duck-import.gif" width="480" alt="Settings imports a Rubber Duck character ZIP, and Rubber Duck replaces Buddy Bot on the desktop" /><br>
+<b>Bring your own character</b><br>
+<sub>Import a character ZIP in Settings, and Rubber Duck clocks in for Buddy Bot.</sub>
+</p>
 
 ### Trump takes the stage
 
@@ -133,13 +148,19 @@ Developers and CI can override Settings with optional environment variables:
 FIDGET_HARNESS=claude cargo run -p fidget
 
 # Optional. Overrides Settings → Character.
-# Any of: buddy-bot (default), black-mage, bmo, cat, jotaro-kujo, nim, rubber-duck, timber-wolf, trump, tux
+# Any of: buddy-bot (default), black-mage, bmo, cat, jotaro-kujo, nim, rubber-duck, timber-wolf, trump, tux, tuxedo-bean
 FIDGET_CHARACTER=nim cargo run -p fidget
 ```
 
 The full variable list, including `FIDGET_DIRECTOR_*`, is in [harness.md](./docs/harness.md#director-environment).
 
 ### First Run
+
+<p align="center">
+<img src="./docs/readme/settings-switch-character.gif" width="480" alt="Right-click menu opens Settings, and the Character tab switches Buddy Bot to Cat" /><br>
+<b>Switch between characters</b><br>
+<sub>Right-click, open Settings, and trade Buddy Bot for Cat in the Character tab.</sub>
+</p>
 
 It works offline with no key. With nothing configured, Static weights pick idle Behaviors from the Character.
 
@@ -153,15 +174,32 @@ Character packages are in [DEVELOPMENT.md](./docs/DEVELOPMENT.md#character-packa
 
 ## Interact
 
-![Buddy Bot react](./docs/readme/buddy-bot-react.gif)
+<table>
+<tr>
+<td align="center" valign="bottom" width="50%"><img src="./docs/readme/buddy-bot-react.gif" width="144" alt="Buddy Bot react" /><br><b>Poke</b><br><sub>One click and Buddy Bot jumps, then gets back to its business.</sub></td>
+<td align="center" valign="bottom" width="50%"><img src="./docs/readme/buddy-bot-throw.gif" width="400" alt="Buddy Bot is picked up, thrown in an arc, and lands on an editor window" /><br><b>Throw</b><br><sub>Grab it, fling it, and it arcs across the screen onto your editor.</sub></td>
+</tr>
+</table>
 
 - **Poke** - click once for a react, then it resumes.
 - **Summon** - double-click to open a chat window for that fidget.
 - **Pick up** - click and drag; the pressed point stays under the pointer.
 - **Throw** - release while moving; it flies on an arc and lands.
 - **Perch** - let it settle on a window's top edge; drag slowly to ride, fling to drop.
+- **Possess** - take the keyboard and drive it ([Possess It](#possess-it)).
 - **Hide** - Control-Option-Command-B (the default; change it in Settings) toggles the fidget instantly.
 - **Fullscreen** - fades out for fullscreen apps, fades back when you exit.
+
+### Possess It
+
+Take the keyboard and drive your fidget manually, like a platformer on your live desktop. Choose **Possess** from the menu. Space charges a jump. Click elsewhere and it pauses until you Focus; Escape releases it. The Director only hears that it was possessed and released, then comes to dazed.
+
+<table>
+<tr>
+<td align="center" valign="bottom" width="50%"><img src="./docs/readme/buddy-bot-possess.gif" width="400" alt="A ghost swoops into Buddy Bot; he walks along a window, charges a jump, and lands on the next; the ghost leaves" /><br><b>Drive it</b><br><sub>A ghost swoops in; Buddy Bot walks a window edge, charges a jump, and lands on the next.</sub></td>
+<td align="center" valign="bottom" width="50%"><a href="./docs/readme/possession-bindings.png"><img src="./docs/readme/possession-bindings.png" width="240" alt="The Possession bindings card, headed Manually drive the fidget on your screen, listing walk, climb, drop, jump, and Buddy Bot's animation digits, with Release and Focused buttons" /></a><br><b>The bindings</b><br><sub>The keys, plus Focus for when another window has the keyboard. Click to enlarge.</sub></td>
+</tr>
+</table>
 
 ### Talk to It
 
@@ -170,7 +208,12 @@ conversation that decides what it does on your desktop, so an answer arrives as
 words and a Behavior, not only as text. Lines it says unprompted appear here
 too, labelled with what it was reacting to.
 
-<img src="./docs/readme/chat-surface.png" width="420" alt="The chat surface: a line labelled WHEN SUMMONED, a typed question, and BMO's answer, over a status bar naming the Behavior, State and next wake" />
+<table>
+<tr>
+<td align="center" valign="bottom" width="50%"><img src="./docs/readme/buddy-bot-chat.gif" width="400" alt="Double-clicking Buddy Bot opens its chat; asked for its best dance move, it answers in the chat and a speech bubble" /><br><b>Ask it anything</b><br><sub>Double-click to chat; ask for its best dance move and it answers in the chat and a speech bubble.</sub></td>
+<td align="center" valign="bottom" width="50%"><a href="./docs/readme/chat-surface.png"><img src="./docs/readme/chat-surface.png" width="240" alt="The chat surface: a line labelled WHEN SUMMONED, a typed question, and BMO's answer, over a status bar naming the Behavior, State and next wake" /></a><br><b>Inside the chat</b><br><sub>A line it said on its own, your question, BMO's answer, and a status bar showing what it's up to. Click to enlarge.</sub></td>
+</tr>
+</table>
 
 The bar at the bottom says what the fidget is doing and when it next thinks.
 Advanced opens the ladder: Behavior, Primitive, Animation, State, Facing, and
@@ -191,6 +234,12 @@ The examples below need this setup:
 | `When I tell you what I'm eating, review it like a food critic, in one dramatic line.` | Tell it what you're eating in the chat and it reviews the dish in one line. |
 | `You're a theatre critic. When you're perched on a window, review that app in one dramatic line.` | Perch it on a window and it reviews the app it's standing on. |
 | `When I tell you how my day's going, give it as a weather report.` | Tell it how your day is going and it answers with a forecast. |
+
+<p align="center">
+<img src="./docs/readme/buddy-bot-instance-prompt.gif" width="480" alt="The movie-stunt Instance Prompt is saved in the Prompt tab, then Buddy Bot is thrown and calls out its mid-air stunt" /><br>
+<b>Give it a stunt to brag about</b><br>
+<sub>Save the movie-stunt Instance Prompt, throw Buddy Bot, and it calls out its own mid-air stunt.</sub>
+</p>
 
 ## How It Works
 
@@ -324,11 +373,12 @@ Tools each harness keeps under ACP, session and auth behavior, and per-harness s
 
 Fidget attaches to a Harness over ACP on stdio. The Harness calls back over MCP, on the route the [MCP transport column](./docs/harness.md#harness-support) describes. [harness.md](./docs/harness.md#mcp-server) has the transport details.
 
-**Eight tools** from `crates/core/src/dispatch.rs`. The opening turn of the Character Prompt tells the model to use the tools it has, without naming them, so this table stays the only catalog (#917). There is no tool for saying something: a Character says things only in its reply (ADR-0040).
+**Nine tools** from `crates/core/src/dispatch.rs`. The opening turn of the Character Prompt tells the model to use the tools it has, without naming them, so this table stays the only catalog (#917). There is no tool for saying something: a Character says things only in its reply (ADR-0040).
 
 | Tool | Category | What it does |
 |---|---|---|
-| `play_behavior` | Expression | Play a named Behavior |
+| `play_behavior` | Expression | Play a named Behavior; pass `direction` (`left` or `right`) to aim a walk instead of letting it keep its last heading |
+| `move` | Expression | Walk a Character Instance left or right, by a distance or for a time, or to a spot from `whereabouts`. Say at once whether the walk started, or why not |
 | `list_windows` | Sensing | List visible windows with bounds, and their names under consent |
 | `describe_screen` | Sensing | Describe screen (v1: window metadata only) |
 | `recall` | Memory | Read everything Memory holds |
@@ -355,7 +405,7 @@ Fidget never reads screen pixels. Sensing is OS window metadata: bounds and idle
 
 That bounds Fidget's own code, not the agent you attach to it. An agent that needs to see and act on your desktop still can. The capability comes from the Harness itself, or from a computer-use MCP server you attach to the Harness, never through Fidget, whose MCP serves no input events.
 
-The portable option across the Harnesses above is [cua-driver](https://github.com/trycua/cua) (MIT; macOS, Windows, Linux), attached over stdio MCP. [Connect your agent to Cua Driver](https://cua.ai/docs/how-to-guides/driver/connect-your-agent) carries the per-client registration, and [MCP tools](https://cua.ai/docs/reference/cua-driver/mcp-tools) lists what it exposes. Attach it deliberately: it drives the real desktop with your signed-in sessions, and its permission mode is chosen by the process that owns the driver runtime, not by the agent asking. Some Harnesses bring computer use of their own instead; the [Capture decision note](./docs/research/capture-drop-and-harness-cu-path.md) has the per-Harness table and the other drivers surveyed.
+The portable option across the Harnesses above is [cua-driver](https://github.com/trycua/cua) (MIT; macOS, Windows, Linux), attached over stdio MCP. [The cua-driver guide](./docs/computer-use.md) has the install for each OS, the permission each one grants, the config for each Harness above, and one way to check the agent can see its tools. Attach it deliberately: it drives the real desktop with your signed-in sessions, and its permission mode is chosen by the process that owns the driver runtime, not by the agent asking. Some Harnesses bring computer use of their own instead; the [Capture decision note](./docs/research/capture-drop-and-harness-cu-path.md) has the per-Harness table and the other drivers surveyed.
 
 ## Platform Support
 
@@ -457,7 +507,7 @@ The Chat window's mind mark - the small brain beside what answers - is the
 under [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) and inlined as
 a path in `src/chat.html`. The license asks for the credit; this is it.
 
-Character provenance is in each Character Package manifest, under `[source]`, and on the [Character Gallery](https://omesser.github.io/fidget/characters.html). In short: Buddy Bot and Nim are this project's own art. Timber Wolf derives, with the creator's permission, from [MekaRamen](https://mekaramen.com/)'s [Sketchfab model](https://sketchfab.com/3d-models/clans-timberwolf-battlemech-74e4d72e0cf3409ba3992cd0d895bc2f). BMO is cut from the [shimejishop BMO pack](https://shimejishop.com/free/bmo-shimeji/). Cat, Jotaro Kujo, Rubber Duck, Trump, and Tux are cut from [petscodex](https://petscodex.com/) pets. Black Mage is sliced from GigaGuy's sprite sheet on The Spriters Resource. A package is prose, a manifest and art: the personality and the manifest - animations, Behaviors, Director and cursor tuning - are this project's work and MIT throughout. The art is not always ours. Some characters adapt art that declares no license, and each manifest names what it adapts and whose IP the character is.
+Character provenance is in each Character Package manifest, under `[source]`, and on the [Character Gallery](https://omesser.github.io/fidget/characters.html). In short: Buddy Bot and Nim are this project's own art. Timber Wolf derives, with the creator's permission, from [MekaRamen](https://mekaramen.com/)'s [Sketchfab model](https://sketchfab.com/3d-models/clans-timberwolf-battlemech-74e4d72e0cf3409ba3992cd0d895bc2f). BMO is cut from the [shimejishop BMO pack](https://shimejishop.com/free/bmo-shimeji/). Cat, Jotaro Kujo, Rubber Duck, Trump, Tux, and Tuxedo Bean are cut from [petscodex](https://petscodex.com/) pets. Black Mage is sliced from GigaGuy's sprite sheet on The Spriters Resource. A package is prose, a manifest and art: the personality and the manifest - animations, Behaviors, Director and cursor tuning - are this project's work and MIT throughout. The art is not always ours. Some characters adapt art that declares no license, and each manifest names what it adapts and whose IP the character is.
 
 ## License
 

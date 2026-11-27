@@ -30,13 +30,15 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: .
           key: e2e-macos
@@ -50,9 +52,9 @@ jobs:
           cargo test -p fidget --no-run
 
       - name: Warm up WebKit
-        # A fresh runner draws Fidget's first frame seconds late, past a leaf's
-        # 3 s launch wait. One launch here takes that cold start, which ran past
-        # 3 s itself on macOS, so this one wait gets 30 s.
+        # A fresh runner draws Fidget's first frame seconds late. One launch
+        # here takes that cold start, which ran past 3 s itself on macOS, so
+        # this wait gets the same 30 s budget as a leaf's startup wait.
         env:
           FIDGET_DIRECTOR_API_KEY: x
         run: |
@@ -129,7 +131,11 @@ jobs:
             summary+=$(printf '%-28s %s' "$name" "$verdict")$'\n'
           done
           printf '%s' "$summary"
-          printf '```\n%s```\n' "$summary" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            printf '%s' "$summary"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
           exit "$failed"
 
       - name: Gather evidence
@@ -141,13 +147,15 @@ jobs:
           rsync -a --exclude home --exclude fidget-scenario-tools "$RUNNER_TEMP/evidence/" "$RUNNER_TEMP/upload/" || true
           cd "$RUNNER_TEMP/evidence" || exit 0
           for f in */home/Library/Application\ Support/fidget/process.log; do
-            [ -e "$f" ] && cp "$f" "$RUNNER_TEMP/upload/${f%%/*}/" || true
+            if [ -e "$f" ]; then
+              cp "$f" "$RUNNER_TEMP/upload/${f%%/*}/" || true
+            fi
           done
           cp "$RUNNER_TEMP/warmup/home/Library/Application Support/fidget/process.log" "$RUNNER_TEMP/upload/warmup-process.log" || true
 
       - name: Upload evidence
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: e2e-macos-evidence
           path: ${{ runner.temp }}/upload

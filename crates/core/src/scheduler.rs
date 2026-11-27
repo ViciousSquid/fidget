@@ -74,10 +74,14 @@ mod tests {
             velocity: crate::engine::Point { x: 0.0, y: 0.0 },
             state: State::Grounded,
             animation: "idle",
+            animation_source: crate::engine::AnimationSource::IdleLoop,
             animation_ms: 0,
+            playing_gesture: None,
             variant_draw: 0,
+            idle_beat: None,
             dialogue: None,
             behavior: None,
+            digit: None,
             playing_behavior: None,
             playing_primitive: None,
             riding: false,
@@ -86,6 +90,8 @@ mod tests {
             cue: None,
             contact: None,
             refused: None,
+            charge: None,
+            possessed: false,
         }
     }
 

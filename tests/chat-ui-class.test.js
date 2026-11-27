@@ -83,9 +83,12 @@ test("applyChatUiClass normalizes unknown designs to minimal", () => {
   applyChatUiClass(root, "terminal");
   assert.ok(root.classList.contains("chat-ui-terminal"), "terminal should be applied");
 
+  // A hostile class name: the test proves it never reaches classList.
+  // nosemgrep: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag
   applyChatUiClass(root, "malicious<script>");
   assert.ok(!root.classList.contains("chat-ui-terminal"), "terminal should be removed");
   assert.ok(root.classList.contains("chat-ui-minimal"), "should fall back to minimal");
+  // nosemgrep: javascript.lang.security.audit.unknown-value-with-script-tag.unknown-value-with-script-tag
   assert.ok(!root.classList.contains("chat-ui-malicious<script>"), "malicious class should not be added");
   assert.equal(root.className, "chat-ui-minimal");
 });
@@ -111,13 +114,13 @@ test("applyChatUiClass handles empty/null design gracefully", () => {
   assert.equal(root.className, "chat-ui-minimal");
 });
 
-test("applyPlatform flags Linux and macOS and nothing else", () => {
+test("applyPlatform flags supported operating systems and clears unknown values", () => {
   const root = { dataset: {} };
-  for (const flagged of ["linux", "macos"]) {
+  for (const flagged of ["linux", "macos", "windows"]) {
     applyPlatform(root, flagged);
     assert.equal(root.dataset.platform, flagged);
   }
-  for (const other of ["windows", "", undefined]) {
+  for (const other of ["unknown", "", undefined]) {
     applyPlatform(root, other);
     assert.equal(root.dataset.platform, undefined, String(other));
   }

@@ -157,6 +157,82 @@ static OVERLAY_RECTS: Mutex<Vec<(String, OverlayRect)>> = Mutex::new(Vec::new())
 /// Empty elsewhere, so every overlay is drawn from the frame it asked for.
 static OVERLAY_ORIGINS: Mutex<Vec<(String, (f64, f64))>> = Mutex::new(Vec::new());
 
+/// Overlays whose page has attached its frame listener. Cleared whenever the
+/// page starts loading again.
+static OVERLAYS_LISTENING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Mark whether `label`'s page hears frames.
+pub fn set_overlay_listening(label: &str, listening: bool) {
+    let Ok(mut all) = OVERLAYS_LISTENING.lock() else {
+        return;
+    };
+    all.retain(|owner| owner != label);
+    if listening {
+        all.push(label.to_string());
+    }
+}
+
+/// Each (overlay, Instance) whose art that overlay's page has put on screen.
+/// Never cleared: only a launch Instance reads it, once, so a reload holds nothing.
+static OVERLAYS_DREW: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// Record that `label`'s page drew Instance `id`. A reload says it again.
+pub fn set_overlay_drew(label: &str, id: &str) {
+    let Ok(mut all) = OVERLAYS_DREW.lock() else {
+        return;
+    };
+    if !all
+        .iter()
+        .any(|(owner, drawn)| owner == label && drawn == id)
+    {
+        all.push((label.to_string(), id.to_string()));
+    }
+}
+
+/// Whether `label`'s page has drawn Instance `id`'s art yet.
+pub fn overlay_drew(label: &str, id: &str) -> bool {
+    OVERLAYS_DREW.lock().is_ok_and(|all| {
+        all.iter()
+            .any(|(owner, drawn)| owner == label && drawn == id)
+    })
+}
+
+/// How many times each overlay's page has started loading.
+static OVERLAY_PAGE_LOADS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+
+/// `label`'s page started loading again, so it no longer hears frames. WebView2
+/// can send the first Started after the page already listened, so a listen on
+/// load 0 survives it; a later Started (reload) still clears.
+pub fn overlay_page_load_started(label: &str) {
+    let keep = overlay_page_loads(label) == 0 && overlay_listening(label);
+    if !keep {
+        set_overlay_listening(label, false);
+    }
+    let Ok(mut all) = OVERLAY_PAGE_LOADS.lock() else {
+        return;
+    };
+    match all.iter_mut().find(|(owner, _)| owner == label) {
+        Some((_, loads)) => *loads += 1,
+        None => all.push((label.to_string(), 1)),
+    }
+}
+
+/// How many times `label`'s page has started loading.
+pub fn overlay_page_loads(label: &str) -> u32 {
+    OVERLAY_PAGE_LOADS.lock().map_or(0, |all| {
+        all.iter()
+            .find(|(owner, _)| owner == label)
+            .map_or(0, |(_, loads)| *loads)
+    })
+}
+
+/// Whether `label`'s page hears frames yet.
+pub fn overlay_listening(label: &str) -> bool {
+    OVERLAYS_LISTENING
+        .lock()
+        .is_ok_and(|all| all.iter().any(|owner| owner == label))
+}
+
 /// The window manager reported where `label`'s overlay now is.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn set_overlay_origin(label: &str, origin: (f64, f64)) {
@@ -336,6 +412,9 @@ mod x11;
 mod windows;
 
 #[cfg(any(test, not(unix)))]
+mod press_origin;
+
+#[cfg(any(test, not(unix)))]
 mod windows_perch;
 
 #[cfg(any(test, not(unix)))]
@@ -456,7 +535,7 @@ pub fn overlay_focus_follows_pill() -> bool {
 /// Remember the active window before a pill takes the keyboard, unless it
 /// is one of Fidget's overlays. Wayland has no X window to remember.
 #[cfg(all(unix, not(target_os = "macos")))]
-pub fn remember_foreground(window: &tauri::Window) {
+pub fn remember_foreground(window: &tauri::WebviewWindow) {
     let Some(caller) = x11_window(window) else {
         return;
     };
@@ -719,7 +798,29 @@ pub fn open_url(url: &str) -> Result<(), String> {
     // A parsed URL always starts with its scheme, so it can never be read as an
     // option by `open` or `xdg-open`. `Command` execs directly with no shell,
     // so there is no metacharacter to quote either.
-    hand_over(std::ffi::OsStr::new(&openable(url)?))
+    let log = std::env::var("FIDGET_OPEN_URL_LOG").ok();
+    hand_over(std::ffi::OsStr::new(&open_handed(url, log.as_deref())?))
+}
+
+/// The parsed URL handed to the opener, after appending it to `log` when that
+/// path is set. ShellExecuteW is not a program on PATH, so a Windows scenario
+/// cannot replace it the way a fake `open` replaces the macOS one.
+fn open_handed(url: &str, log: Option<&str>) -> Result<String, String> {
+    let handed = openable(url)?;
+    if let Some(path) = log.filter(|path| !path.is_empty()) {
+        append_handoff(path, &handed)?;
+    }
+    Ok(handed)
+}
+
+fn append_handoff(path: &str, target: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|error| format!("could not record the opened URL: {error}"))?;
+    writeln!(file, "{target}").map_err(|error| format!("could not record the opened URL: {error}"))
 }
 
 /// The URL to hand over, or why this one is not handed over.
@@ -889,6 +990,7 @@ pub fn configure_overlay(window: &tauri::WebviewWindow) -> Result<(), String> {
 /// Click-through for one overlay.
 /// On Windows the tool-window bits are put back after tao's style rewrite,
 /// on the event-loop thread, or that rewrite lands last and clears them.
+#[cfg_attr(all(unix, not(target_os = "macos")), allow(dead_code))]
 pub fn set_overlay_click_through(
     window: &tauri::WebviewWindow,
     ignore: bool,
@@ -911,6 +1013,12 @@ pub fn set_overlay_click_through(
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn cleanup_overlay_window(window: &tauri::WebviewWindow) {
     x11::cleanup_overlay_window(window)
+}
+
+/// Free the regions kept for a destroyed overlay window.
+#[cfg(not(unix))]
+pub fn cleanup_overlay_window(window: &tauri::WebviewWindow) {
+    windows::cleanup_overlay_window(window)
 }
 
 /// Whether a compositor blends the overlays' transparent pixels. Without one
@@ -988,7 +1096,7 @@ pub use x11::SpriteMask;
 #[cfg(not(unix))]
 pub fn update_input_region(
     window: &tauri::WebviewWindow,
-    art: Option<&[[i32; 4]]>,
+    art: Option<&[fidget_core::overlay_region::SpriteArt]>,
     rects: &[OverlayRect],
     click_through: bool,
 ) -> Result<bool, String> {
@@ -1090,6 +1198,32 @@ pub fn buttons_down() -> ButtonsDown {
     macos::buttons_down()
 }
 
+/// The frontmost app's pid, or `None` when that is Fidget or nothing. Main
+/// thread.
+#[cfg(target_os = "macos")]
+pub fn other_app_in_front() -> Option<i32> {
+    macos::other_app_in_front()
+}
+
+/// Activate `pid` again after the launch's first window showed. Main thread.
+#[cfg(target_os = "macos")]
+pub fn give_front_back(pid: i32) {
+    macos::give_front_back(pid);
+}
+
+/// Start noting which presses AppKit has delivered. Main thread, once.
+#[cfg(target_os = "macos")]
+pub fn watch_delivered_presses() {
+    macos::watch_delivered_presses();
+}
+
+/// Dispatch the press a menu is about to open for, if AppKit still holds it.
+/// Main thread.
+#[cfg(target_os = "macos")]
+pub fn deliver_pending_press() {
+    macos::deliver_pending_press();
+}
+
 /// X11 on Linux: XI2's raw button edges alone. Wayland has no global pointer,
 /// so there, and on X11 without XI2, only the overlay latch. The latch is read
 /// every call, so if XI2 stops, its fallback holds no press from before.
@@ -1099,18 +1233,31 @@ pub fn buttons_down() -> ButtonsDown {
     x11::buttons_down().unwrap_or(overlay)
 }
 
-/// Where the latest press began, in the cursor's pixels, when the source
-/// knows: XI2 on X11. A press dragged away before the tick is hit-tested here,
-/// not where the tick finds the cursor.
+/// Where the latest XI2 press began, in the cursor's pixels. A drag before
+/// the tick is hit-tested here, not where the tick finds the cursor.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn press_point() -> Option<(i32, i32)> {
     x11::press_point()
 }
 
-/// Elsewhere the tick's cursor stands in for where the press began.
-#[cfg(not(all(unix, not(target_os = "macos"))))]
+/// Consume the low-level hook's recent button-down point. Without one,
+/// the tick's cursor stands in.
+#[cfg(not(unix))]
+pub fn press_point() -> Option<(i32, i32)> {
+    windows::press_point()
+}
+
+/// macOS wakes on the press, so the tick's cursor is still where it began.
+#[cfg(target_os = "macos")]
 pub fn press_point() -> Option<(i32, i32)> {
     None
+}
+
+/// A button edge wakes the Windows idle wait. `None` when the hook will not
+/// install, and the loop keeps sleeping out its back-off.
+#[cfg(not(unix))]
+pub fn spawn_press_listener() -> Option<std::sync::mpsc::Receiver<()>> {
+    windows::spawn_press_listener()
 }
 
 /// Windows: GetAsyncKeyState for both buttons, or the overlay latch. Both
@@ -1633,6 +1780,41 @@ mod tests {
         }
     }
 
+    /// The scenario log is the string the opener receives, not the caller's
+    /// text. A refused scheme must not append a line.
+    #[test]
+    fn the_open_log_is_the_parsed_url_and_skips_a_refused_scheme() {
+        let path = std::env::temp_dir().join(format!(
+            "fidget-open-url-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _ = fs::remove_file(&path);
+        let path_str = path.to_str().expect("temp path is UTF-8");
+
+        let handed = open_handed("https://nodejs.org", Some(path_str)).expect("https opens");
+        assert_eq!(handed, "https://nodejs.org/");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "https://nodejs.org/\n");
+
+        let other = open_handed("https://example.test/nope", Some(path_str)).expect("https opens");
+        assert_eq!(other, "https://example.test/nope");
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "https://nodejs.org/\nhttps://example.test/nope\n"
+        );
+
+        assert!(open_handed("javascript:alert(1)", Some(path_str)).is_err());
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "https://nodejs.org/\nhttps://example.test/nope\n",
+            "a refused scheme must not be recorded"
+        );
+        let _ = fs::remove_file(&path);
+    }
+
     /// What is handed to the OS is the parsed form, never the caller's string.
     /// Validating one and opening the other is how a gate gets walked past.
     #[test]
@@ -1677,11 +1859,13 @@ mod tests {
             rect: [10, 20, 30, 40],
             clickable: true,
             follows: None,
+            see_through: false,
         };
         let bubble = OverlayRect {
             rect: [0, 0, 100, 80],
             clickable: false,
             follows: None,
+            see_through: false,
         };
         set_overlay_rects("overlay-test-a", vec![open_chat.clone(), bubble.clone()]);
         set_overlay_rects("overlay-test-b", vec![bubble.clone()]);

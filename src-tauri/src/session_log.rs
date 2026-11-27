@@ -1,5 +1,5 @@
 //! Current-session Chat turns, held because `emit_to` only reaches windows that
-//! exist. Permission asks already wait on `PendingAsks`; Speech of this
+//! exist. Permission asks already wait on `PendingAsks`; Dialogue of this
 //! Completer session belongs in the same log (ADR-0018) even when Chat was
 //! never opened, and so does the thinking that led to it (ADR-0034).
 
@@ -442,21 +442,66 @@ pub fn forget(app: &tauri::AppHandle, instance: &str) {
     with_log(app, |log| log.forget(instance));
 }
 
+/// Who holds an Instance's turns and can tell its Chat the session ended.
+pub(crate) trait SessionSurface {
+    fn forget_turns(&self, instance: &str);
+    fn announce_session(&self, instance: &str, why: &str);
+}
+
+impl SessionSurface for tauri::AppHandle {
+    fn forget_turns(&self, instance: &str) {
+        forget(self, instance);
+    }
+
+    fn announce_session(&self, instance: &str, why: &str) {
+        let _ = self.emit_to(
+            crate::chat_label(instance),
+            crate::chat_surface::CHAT_SESSION_EVENT,
+            why,
+        );
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SESSION_DIR: std::cell::RefCell<Option<std::path::PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Point this thread's session lines at `dir` for `body`. The user's data
+/// folder is the default, and a test must not write a line there.
+#[cfg(test)]
+pub(crate) fn with_session_dir<T>(dir: std::path::PathBuf, body: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            SESSION_DIR.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    SESSION_DIR.with(|slot| *slot.borrow_mut() = Some(dir));
+    let _reset = Reset;
+    body()
+}
+
+fn session_dir() -> std::path::PathBuf {
+    #[cfg(test)]
+    {
+        if let Some(dir) = SESSION_DIR.with(|slot| slot.borrow().clone()) {
+            return dir;
+        }
+    }
+    fidget_core::memory::data_dir()
+}
+
 /// The Completer session behind `instance` was replaced, for the reason `why`.
-///
-/// Turns, the Chat surface, and the Action Log move together. Call beside `completer::retarget_model`.
-pub fn new_session(app: &tauri::AppHandle, instance: &str, why: &str) {
-    forget(app, instance);
+pub fn new_session(host: &impl SessionSurface, instance: &str, why: &str) {
+    host.forget_turns(instance);
     crate::action_log::append(
-        &fidget_core::memory::data_dir(),
+        &session_dir(),
         "session",
         serde_json::json!({ "instance": instance, "why": why }),
     );
-    let _ = app.emit_to(
-        crate::chat_label(instance),
-        crate::chat_surface::CHAT_SESSION_EVENT,
-        why,
-    );
+    host.announce_session(instance, why);
 }
 
 #[cfg(test)]
@@ -465,7 +510,7 @@ mod tests {
     use std::time::{Duration, UNIX_EPOCH};
 
     /// Production change that would fail this: dropping a spoken line because
-    /// no Chat surface was listening. ADR-0018 puts every Speech in that log.
+    /// no Chat surface was listening. ADR-0018 puts every Dialogue in that log.
     #[test]
     fn a_spoken_line_is_still_there_when_chat_opens_later() {
         let mut log = Log::new();
@@ -536,7 +581,7 @@ mod tests {
         );
     }
 
-    /// Production change that would fail this: replaying Instance A's Speech
+    /// Production change that would fail this: replaying Instance A's Dialogue
     /// into Instance B's window.
     #[test]
     fn replay_is_the_instance_that_said_it() {
@@ -563,7 +608,7 @@ mod tests {
     /// Production change that would fail this: holding a Behavior-only wake
     /// that has no words (ADR-0018: nothing is held for that).
     #[test]
-    fn a_wake_with_no_speech_is_not_held() {
+    fn a_wake_with_no_dialogue_is_not_held() {
         let mut log = Log::new();
         log.log_them("buddy-1", None, None, UNIX_EPOCH);
         assert!(log.replay("buddy-1").is_empty());
@@ -1000,10 +1045,13 @@ mod tests {
                 "bmo",
                 false,
             )
-            .prompt(&Context {
-                happened,
-                ..Context::quiet()
-            })
+            .prompt(
+                &Context {
+                    happened,
+                    ..Context::quiet()
+                },
+                None,
+            )
         };
         let typed = frame(Happened::Chat("what are you standing on?".to_string()));
         let ambient = frame(Happened::Proactive);

@@ -1,6 +1,6 @@
 # Scenarios
 
-End-to-end scenarios that drive the real app and assert on what it shows. Each
+End-to-end scenarios that run the real app and assert on what it shows. Each
 one launches Fidget, so each run is a GUI takeover. Read
 [`docs/agents/gui-takeover.md`](../../docs/agents/gui-takeover.md) before you
 run one: set up, post the prompt, and wait for a go-ahead for that run.
@@ -89,6 +89,13 @@ dump that the bubble grows, never shows the Behavior name, and ends on the
 whole line, and from the frame trace that `talk` plays while it grows. It has
 no X11 or Windows leaf yet.
 
+`tool-narration.sh` takes the same two binaries. Its fixture replies the way
+grok does: planning, a tool call, then `behavior: walk` with the dialogue on
+its line, and no `messageId`. It checks from the overlay's and Chat's
+Accessibility dumps that both say only the dialogue, never the planning or
+the marker, and that Chat has a Thinking row. It has no X11 or Windows leaf
+yet.
+
 `poke-mid-climb.sh` takes only the app binary and runs no Harness. It throws
 the sprite at a display's side edge with a real drag
 (`scripts/scenarios/helpers/throw-sprite.swift`), then clicks it until one click lands
@@ -98,6 +105,25 @@ climb frame for the first 2.3 s of the 2.5 s cooldown, and that it climbs on
 by 3.5 s (`poke-mid-climb-check.py`). Set `FIDGET_SCENARIO_TRACE` to a saved
 app log to run only the check, as `fixtures/poke-mid-climb-trace.txt` does in
 `crates/verify`.
+
+`possession-keyup.sh` takes only the app binary and runs no Harness. It
+right-drags from the sprite onto the Possess row
+(`scripts/scenarios/helpers/possession-input.swift`), and posts arrow key
+edges. From the frame trace, it checks that a held arrow walks the sprite and
+that its keyup stops it for the next 30 frames. It then holds the arrow, brings
+Finder to the front so the keyup lands there, clicks the sprite to give the
+overlay focus back, and checks that the sprite still stands. It has no X11 or
+Windows leaf yet.
+
+`possession-card-drag.sh` takes only the app binary and runs no Harness. It
+possesses the sprite from the menu bar icon's Possess row (`ax open <pid>
+Possess ""`, where an empty title waits for no window), drags the bindings card by its heading with
+`throw-sprite.swift`'s slow drag, clicks a `type-target.swift` window, drags
+the paused card, and clicks it. From the `FIDGET_TRACE_BUBBLE` card line, it
+checks that the card follows each drag and does not move when focus leaves or
+comes back, that a plain click on the paused card resumes it in place, that
+an arrow still walks the sprite, and that the next possession seats the
+card in the corner again. It has no X11 or Windows leaf yet.
 
 `launcher-dies-at-startup.sh` takes the same two binaries. Its fixture aborts
 on the first launch, the way `npx` does over a broken Node. It opens Chat from
@@ -128,6 +154,10 @@ unless Chat is open.
 
 ## Windows and X11
 
+`quick-grab.win.ps1` presses on a resting sprite and drags away immediately,
+without waiting for a hit-test flip. It asserts that the recorded press remains
+on the sprite after the cursor leaves and that the gesture becomes a Grab.
+
 `thinking-row`, `chat-header-narrow`, `landing-link-click`,
 `launcher-dies-at-startup`, `sign-in-button`, `question-bubble`,
 `control-click-menu` and `poke-mid-climb` each have `.x11.sh` and `.win.ps1`
@@ -155,6 +185,33 @@ starts it cold, and that run says to rerun if it misses a step.
 `fidget-verify scenario <name>` prints the leaf for this host. With `--go` it
 runs that leaf, or skips when this host has none.
 
+`possession-displays` has a macOS `.sh` and a Windows `.win.ps1` leaf. It has
+no X11 leaf: Xvfb gives GDK one display (#2147). It needs a display beside the
+sprite's display at the sprite's height, and skips without one. It
+possesses BMO from the menu and holds the arrow toward that display until the
+whole sprite is past the border. It checks that the new display's overlay
+takes the keyboard, that the arrow's keyup lands there and stops the sprite,
+and that an arrow and Space still drive it. It then checks that the card
+follows to that display, that a click into Notepad pauses possession and a
+click on the card resumes it there, and that Escape releases. Both overlays
+are titled Fidget, so it reads the card through the new overlay's own window,
+found by its top-left corner. The macOS leaf clicks a fidget-type-target
+window instead of Notepad, and reads the card from every overlay's
+Accessibility dump, keeping the one on the new display.
+
+`tray-taskbar-icons-hidpi` has only a `.win.ps1` leaf. It is the live check
+for the taskbar icon at a HiDPI scale (#2054), and it never changes the scale:
+set the primary display to 150% or 200% before the run. It sends no input. It reads the
+icons off Fidget's `FidgetAnchor` window and checks that `WM_GETICON`
+`ICON_SMALL` and `GCLP_HICONSM` are `SM_CXSMICON`×`SM_CYSMICON` at Fidget's
+own system DPI (`GetSystemDpiForProcess`), and that `ICON_BIG` and
+`GCLP_HICON` are 256×256. System DPI is set per process at launch, so a scale
+changed in this session can leave Fidget at 100% until you sign out. The run
+prints Fidget's scale and the taskbar display's scale, and skips when Fidget's
+is 100%. It saves `taskbar-button.png` and `tray-icon.png`, small crops around
+each, for a person to compare with a 100% run. `FIDGET_SCENARIO_ICONS` judges
+a line of saved readings, as `readings.txt` holds them, and launches nothing.
+
 These stay macOS only on purpose:
 
 - `chat-level` asserts focused Chat stays at macOS layer 0 so it remains a
@@ -178,18 +235,46 @@ header row with no sideways scroll.
 `landing-link-click`, `launcher-dies-at-startup` and `sign-in-button` open
 Chat from the tray's Chat… row. X11 clicks it over the tray's dbusmenu
 (`ax-window-linux.py tray`), so it needs a StatusNotifierWatcher and skips
-without one. Windows clicks the taskbar icon and invokes the row
+without one. Windows clicks the taskbar icon and then the row
 (`ax-window-win.ps1 tray`), so the icon must not sit in the hidden-icons
 overflow. On X11 a recording `xdg-open` on `PATH` takes the URL, as `open`
-does on macOS. Windows hands it to `ShellExecuteW`, so its leaves do not
-record the URL and a real browser opens.
+does on macOS. Windows hands it to `ShellExecuteW`, which is not a program
+on `PATH`. `landing-link-click` records the URL passed to `ShellExecuteW`
+and still opens the browser. `sign-in-button` does not record its URL.
 
 `question-bubble` and `control-click-menu` find the sprite from the frame
 trace, as on macOS. `question-bubble` pokes it with a real click and dumps the
 overlay window, titled `Fidget`. X11 and Windows have no Control-click, so
 `control-click-menu` right-clicks the sprite instead. `ax-window-linux.py menu`
 and `ax-window-win.ps1 menu` send that click, print the open menu's items and
-press Escape.
+press Escape. Pass a row name and that row is pressed instead.
+
+`possession-live` opens that same menu and presses Possess. It holds Right and
+Space, clicks a scratch editor, and checks the frame trace: the sprite walked,
+the pause did not launch the held jump, and Escape released possession after
+a click on the paused card. The editor's text has to contain the letter typed
+while the card was paused. The X11 leaf is in `ci/`. The macOS and Windows
+leaves stay in `manual-only/` until they pass an automatic run.
+
+`possession-card-shots` is a Windows-only manual leaf. It seats a plain grey
+window behind the bindings card, possesses BMO through the same menu path as
+`possession-live`, holds Space, and writes `win-card-charging.png` and
+`win-card-paused.png` only when every margin pixel is that grey. It takes
+`-OutDir` (default `.verify/possession-card-shots` under the checkout) and
+builds `target/debug/fidget.exe` when `--go` does not name a binary. There is
+no prompt. The helper checks in `helpers/test-possession-card-shots.ps1` parse
+the card line, size the crop (no bar on the paused card), read a part-full
+charge bar, and refuse a leaking margin or a card the grab missed. It presses Space
+through `helpers/send-input.win.ps1`, whose `helpers/test-send-input.ps1`
+checks that the INPUT struct is the size SendInput expects; `--self-test`
+runs both.
+
+The macOS leaf asserts each step live instead of reading the trace afterwards.
+It right-drags from the sprite onto the Possess row, which it finds through
+Accessibility: on macOS 27 the pop-up menu is not in the window list as a
+Fidget window at layer 100. It types into `helpers/type-target.swift`, a
+window that logs the keys it receives, and after the card click it checks
+that Right walks again.
 
 `poke-mid-climb` clicks the same way as on macOS, from the frame trace and
 the `overlay:` lines, but places the sprite instead of throwing it. It holds

@@ -1,6 +1,6 @@
 //! Spatial queries over a `WorldSnapshot`.
 
-use super::{Point, Rect, Window, WorldSnapshot, EDGE_CLEARANCE};
+use super::{Point, Rect, State, Window, WorldSnapshot, EDGE_CLEARANCE};
 use crate::window_source::DOCK_PERCH_ID;
 
 /// A surface the sprite can come to rest on.
@@ -82,9 +82,15 @@ pub(super) fn footing(
     swallowing: impl Fn(&Window) -> bool,
 ) -> Option<Support> {
     // The floor is exempt: it is under every window and the sprite is drawn in
-    // front of them all, so the floor is never the trapped-inside case
-    // (DESIGN.md decision 7). Anything behind the Dock contains the floor.
+    // front of them all (DESIGN.md decision 7). Not the Dock, drawn in front of
+    // the sprite: at rest behind it, the sprite stands on its top instead.
     if floor_under(position.x, snapshot) == Some(position.y) {
+        if let Some(dock) = dock_in(snapshot).filter(|_| behind_dock(position, snapshot)) {
+            return Some(Support {
+                y: dock.y,
+                surface: Surface::Perch,
+            });
+        }
         return support_below(position, snapshot, clearance);
     }
 
@@ -154,6 +160,96 @@ pub(super) fn ceiling_over(x: f64, snapshot: &WorldSnapshot, clearance: f64) -> 
         .min_by(f64::total_cmp)
 }
 
+/// How far a full jump bar lifts the feet. The display under them, at its
+/// raw height: not the clearance, and not the room left above the feet, so
+/// the bar can later reach a display stacked above this one.
+pub(super) fn usable_height_under(feet: Point, snapshot: &WorldSnapshot) -> Option<f64> {
+    displays_spanning(feet.x, snapshot)
+        .find(|display| feet.y >= display.y && feet.y <= display.bottom())
+        .map(|display| display.height)
+}
+
+/// How far along x a walk may go. It always holds the feet, so a clamp to it
+/// can stop a walk short and never turn it round.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct Reach {
+    left_x: f64,
+    right_x: f64,
+}
+
+impl Reach {
+    pub(super) fn clamp(self, x: f64) -> f64 {
+        x.clamp(self.left_x, self.right_x)
+    }
+}
+
+/// How far a move may walk the Surface underfoot. The span stays on this
+/// display, `EDGE_CLEARANCE` in from its sides so the sprite never meets a
+/// wall it would climb, and on a Perch it stays on the Perch.
+pub(super) fn standing_reach(feet: Point, state: State, snapshot: &WorldSnapshot) -> Option<Reach> {
+    let display = displays_spanning(feet.x, snapshot)
+        .find(|display| feet.y >= display.y && feet.y <= display.bottom())?;
+    let mut left_x = display.x + EDGE_CLEARANCE;
+    let mut right_x = display.x + display.width - EDGE_CLEARANCE;
+    if state == State::Perched {
+        if let Some(perch) = perch_at(feet, &snapshot.windows) {
+            left_x = left_x.max(perch.rect.x);
+            right_x = right_x.min(perch.rect.x + perch.rect.width);
+        }
+    } else if let Some(dock) = dock_reach(feet, snapshot) {
+        left_x = left_x.max(dock.left_x);
+        right_x = right_x.min(dock.right_x);
+    }
+    Some(Reach {
+        left_x: left_x.min(feet.x),
+        right_x: right_x.max(feet.x),
+    })
+}
+
+/// Whether a step at `x` heading `direction` would leave the outermost display
+/// edge's inset, `EDGE_CLEARANCE`, where a standing sprite shows whole.
+pub(super) fn edge_ahead(x: f64, direction: f64, snapshot: &WorldSnapshot) -> bool {
+    let left = snapshot
+        .displays
+        .iter()
+        .map(|display| display.x)
+        .min_by(f64::total_cmp);
+    let right = snapshot
+        .displays
+        .iter()
+        .map(|display| display.x + display.width)
+        .max_by(f64::total_cmp);
+    match (left, right) {
+        (Some(left), Some(right)) => {
+            (direction > 0.0 && x >= right - EDGE_CLEARANCE)
+                || (direction < 0.0 && x <= left + EDGE_CLEARANCE)
+        }
+        _ => false,
+    }
+}
+
+/// The wall a standing sprite is against, as the x a climb holds and the side:
+/// the outermost display edge inside the inset a walk stops at.
+pub(super) fn wall_beside(feet: Point, snapshot: &WorldSnapshot) -> Option<(f64, f64)> {
+    [-1.0, 1.0].into_iter().find_map(|side| {
+        let edges = snapshot.displays.iter().map(|display| {
+            if side < 0.0 {
+                display.x
+            } else {
+                display.x + display.width
+            }
+        });
+        let outermost = if side < 0.0 {
+            edges.min_by(f64::total_cmp)
+        } else {
+            edges.max_by(f64::total_cmp)
+        };
+        outermost
+            .filter(|_| edge_ahead(feet.x, side, snapshot))
+            .map(|x| (x, side))
+    })
+}
+
 /// The clearance actually applied on one display: no display gives up more
 /// than half its height to the ceiling, or art taller than the screen would
 /// leave nowhere to stand.
@@ -211,72 +307,47 @@ pub(super) fn dock_in(snapshot: &WorldSnapshot) -> Option<Rect> {
         .map(|window| window.rect)
 }
 
-/// Where to stand when the Dock is in the way: clear of its nearer side, on the
-/// floor or in the air. The Dock is the one thing drawn in front of the sprite,
-/// so under it the sprite can be neither seen nor grabbed; its side is a wall.
-pub(super) fn dock_side_reached(
-    position: Point,
-    velocity_x: f64,
-    snapshot: &WorldSnapshot,
-) -> Option<f64> {
-    let dock = dock_in(snapshot)?;
-    // `EDGE_CLEARANCE` out from the Dock's edge, the same half-sprite
-    // `at_horizontal_edge` keeps on screen, so a sprite put on the line stands
-    // beside the Dock and stays put rather than being set back a step.
-    let (left, right) = (
-        dock.x - EDGE_CLEARANCE,
-        dock.x + dock.width + EDGE_CLEARANCE,
-    );
-    if position.y <= dock.y || position.x <= left || position.x >= right {
-        return None;
-    }
-
-    // Behind the Dock's own display, not merely its x-range, or a display
-    // stacked below would keep every sprite on its floor behind the Dock. The
-    // Dock's center picks the display, whose bottom is the floor.
+/// The Dock, when `feet` are on its own display's floor below its top: the
+/// floor it is drawn in front of. A display stacked below shares its x-range
+/// and none of its floor, so the Dock's center picks the display.
+fn dock_over_floor(feet: Point, snapshot: &WorldSnapshot) -> Option<Rect> {
+    let dock = dock_in(snapshot).filter(|dock| feet.y > dock.y)?;
     let center = (dock.x + dock.width / 2.0, dock.y + dock.height / 2.0);
-    snapshot.displays.iter().find(|display| {
-        display.spans_x(center.0)
-            && center.1 >= display.y
-            && center.1 <= display.bottom()
-            && display.spans_x(position.x)
-            && position.y <= display.bottom()
-    })?;
-
-    // Nearer side, not the side it came from: the Dock can unhide around a
-    // resting sprite, and a dropped sprite arrives from above.
-    let nearer_left = position.x - left <= right - position.x;
-
-    // Strictly inside, so a sprite level with the Dock's own edge counts as
-    // out in the margin and may leave. It is the position stepping off the top
-    // lands on, and treating it as behind would keep the trap shut.
-    let behind = position.x > dock.x && position.x < dock.x + dock.width;
-    let into_dock = if nearer_left {
-        velocity_x > 0.0
-    } else {
-        velocity_x < 0.0
-    };
-    // In the margin the side is a wall only for a sprite moving into the Dock,
-    // as `wall_reached` treats a display edge. Strictly behind there is no such
-    // reprieve: the way out from under a real Dock is long and unseen.
-    if !behind && !into_dock {
-        return None;
-    }
-
-    Some(if nearer_left { left } else { right })
+    snapshot
+        .displays
+        .iter()
+        .any(|display| {
+            display.spans_x(center.0)
+                && (display.y..=display.bottom()).contains(&center.1)
+                && display.spans_x(feet.x)
+                && feet.y <= display.bottom()
+        })
+        .then_some(dock)
 }
 
-/// Where a climb beside the Dock steps onto its top, once the feet reach it:
-/// `EDGE_CLEARANCE` in from the side climbed, so the whole sprite stands where
-/// `perch_at` agrees is the Dock. `None` for a climb nowhere near the Dock.
-pub(super) fn dock_top_at(x: f64, dock: Rect) -> Option<f64> {
-    let (left, right) = (dock.x, dock.x + dock.width);
-    if (left - EDGE_CLEARANCE..=left + EDGE_CLEARANCE).contains(&x) {
-        Some((left + EDGE_CLEARANCE).min(right))
-    } else if (right - EDGE_CLEARANCE..=right + EDGE_CLEARANCE).contains(&x) {
-        Some((right - EDGE_CLEARANCE).max(left))
-    } else if dock.spans_x(x) {
-        Some(x)
+/// Whether the Dock hides `feet`: on its display's floor, strictly inside its
+/// sides. Level with a side counts as beside it, not behind.
+pub(super) fn behind_dock(feet: Point, snapshot: &WorldSnapshot) -> bool {
+    dock_over_floor(feet, snapshot)
+        .is_some_and(|dock| dock.x < feet.x && feet.x < dock.x + dock.width)
+}
+
+/// How far a floor walk beside the Dock may go: half a sprite short of its
+/// nearer side, and never back past the feet. Only the side the Dock is on
+/// is bounded, so walking away from it, toward a display edge, is not.
+pub(super) fn dock_reach(feet: Point, snapshot: &WorldSnapshot) -> Option<Reach> {
+    let dock = dock_over_floor(feet, snapshot)?;
+    let right = dock.x + dock.width;
+    if feet.x <= dock.x {
+        Some(Reach {
+            left_x: f64::NEG_INFINITY,
+            right_x: (dock.x - EDGE_CLEARANCE).max(feet.x),
+        })
+    } else if feet.x >= right {
+        Some(Reach {
+            left_x: (right + EDGE_CLEARANCE).min(feet.x),
+            right_x: f64::INFINITY,
+        })
     } else {
         None
     }

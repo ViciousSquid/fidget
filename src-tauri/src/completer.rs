@@ -44,6 +44,10 @@ impl Completer for AnyCompleter {
             AnyCompleter::Harness(session) => session.awaiting_user(instance),
         }
     }
+
+    fn has_tools(&self) -> bool {
+        matches!(self, AnyCompleter::Harness(_))
+    }
 }
 
 /// The Completer `configured` promises. Harness first: with one attached the
@@ -114,9 +118,9 @@ struct Delivered {
 
 /// What `take` hands the frame loop for the Instance's current call.
 pub enum Arrived {
-    /// The Speech so far, while the reply is still arriving. Each one
+    /// The Dialogue so far, while the reply is still arriving. Each one
     /// replaces the last, and the reply settles it.
-    Speech(String),
+    Dialogue(String),
     Answered(Box<Answered>),
 }
 
@@ -186,7 +190,7 @@ impl Slots {
         director: Arc<ModelDirector<C>>,
         context: Context,
     ) -> Woke {
-        self.wake_sending(id, director, context, None)
+        self.wake_sending(id, director, context, None, None)
     }
 
     /// Append `line` to the Director's prompt and send it. Newest-wins, except
@@ -198,8 +202,9 @@ impl Slots {
         director: Arc<ModelDirector<C>>,
         context: Context,
         line: String,
+        reply_language: Option<&'static str>,
     ) -> Woke {
-        self.wake_sending(id, director, context, Some(line))
+        self.wake_sending(id, director, context, Some(line), reply_language)
     }
 
     fn wake_sending<C: Completer + Send + Sync + 'static>(
@@ -208,6 +213,7 @@ impl Slots {
         director: Arc<ModelDirector<C>>,
         context: Context,
         line: Option<String>,
+        reply_language: Option<&'static str>,
     ) -> Woke {
         let claim = director::claim(&context.happened);
         let reactive = claim != Claim::Ambient;
@@ -243,11 +249,11 @@ impl Slots {
             let speaking = |line| {
                 let _ = tx.send(Delivered {
                     epoch,
-                    arrived: Arrived::Speech(line),
+                    arrived: Arrived::Dialogue(line),
                 });
             };
             let woken = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut request = director.request(&context);
+                let mut request = director.request(&context, reply_language);
                 if let Some(line) = line {
                     if !request.prompt.ends_with('\n') {
                         request.prompt.push('\n');
@@ -286,11 +292,11 @@ impl Slots {
     }
 
     /// The reply for `id`, with the moment it was computed for, or else the
-    /// newest Speech of a reply still arriving. A superseded reply and its
-    /// Speech are dropped here rather than handed out to compare.
+    /// newest Dialogue of a reply still arriving. A superseded reply and its
+    /// Dialogue are dropped here rather than handed out to compare.
     pub fn take(&mut self, id: &InstanceId) -> Option<Arrived> {
         let slot = self.slots.get_mut(id)?;
-        let mut speech = None;
+        let mut dialogue = None;
         while let Ok(delivered) = slot.rx.try_recv() {
             if delivered.epoch != slot.epoch {
                 continue;
@@ -300,9 +306,9 @@ impl Slots {
                 slot.reactive = false;
                 return Some(delivered.arrived);
             }
-            speech = Some(delivered.arrived);
+            dialogue = Some(delivered.arrived);
         }
-        speech
+        dialogue
     }
 
     /// Drop whatever `id` has on the wire, and forget the Instance.
@@ -466,10 +472,7 @@ pub(crate) mod tests {
                 &settings,
                 config.configured,
             );
-            assert!(
-                model.is_some(),
-                "Director off must still leave a Completer for ToggleDirector"
-            );
+            assert!(model.is_some(), "Director off must still leave a Completer");
         });
     }
 
@@ -562,7 +565,7 @@ pub(crate) mod tests {
 
     /// A Completer that answers with a fixed Behavior name after a delay, so
     /// a test can tell one call apart from the one that superseded it.
-    struct Answers {
+    pub(crate) struct Answers {
         behavior: &'static str,
         delay: Duration,
     }
@@ -575,7 +578,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn answering(behavior: &'static str, delay_ms: u64) -> Arc<ModelDirector<Answers>> {
+    /// `pub(crate)` for the frame loop's supersede test.
+    pub(crate) fn answering(behavior: &'static str, delay_ms: u64) -> Arc<ModelDirector<Answers>> {
         Arc::new(ModelDirector::new(
             Answers {
                 behavior,
@@ -615,7 +619,7 @@ pub(crate) mod tests {
         let mut slots = Slots::new();
         let line = "displays: 1; on display: 0; placement: (100, 200); frame: 1920x1080";
 
-        slots.wake_with_prompt(&id, director, wake_context(), line.to_string());
+        slots.wake_with_prompt(&id, director, wake_context(), line.to_string(), None);
 
         assert!(polled(&mut slots, &id).is_some(), "the wake answers");
         let got = prompt.lock().expect("prompt lock").clone();
@@ -714,7 +718,7 @@ pub(crate) mod tests {
         assert_eq!(answered.context.happened, Happened::Poke);
     }
 
-    /// A name nobody declared arrives as speech, so the name is the only
+    /// A name nobody declared arrives as dialogue, so the name is the only
     /// thing that tells the two apart. The Action Log is written at `take`,
     /// so the near-miss has to survive the trip.
     #[test]
@@ -730,7 +734,7 @@ pub(crate) mod tests {
         assert_eq!(
             behavior_of(&answered.wake),
             "",
-            "a near miss is still played as speech"
+            "a near miss is still played as dialogue"
         );
     }
 
@@ -835,26 +839,26 @@ pub(crate) mod tests {
         );
     }
 
-    /// The frame loop hears the Speech while the reply is still on the wire,
+    /// The frame loop hears the Dialogue while the reply is still on the wire,
     /// with the Behavior name already cut from it, and then the reply.
     #[test]
-    fn take_hands_over_the_speech_before_the_reply() {
+    fn take_hands_over_the_dialogue_before_the_reply() {
         use std::sync::{Arc, Barrier};
 
         struct SynchronizedAnswers {
             behavior: &'static str,
-            speech_barrier: Arc<Barrier>,
+            dialogue_barrier: Arc<Barrier>,
         }
 
         impl Completer for SynchronizedAnswers {
             fn complete(&self, _: &WakeRequest, said: &dyn Fn(&str)) -> Result<Reply, String> {
                 said(self.behavior);
-                self.speech_barrier.wait();
+                self.dialogue_barrier.wait();
                 Ok(Reply::whole(self.behavior))
             }
         }
 
-        let speech_barrier = Arc::new(Barrier::new(2));
+        let dialogue_barrier = Arc::new(Barrier::new(2));
         let mut slots = Slots::new();
         let id = "fidget".to_string();
 
@@ -863,7 +867,7 @@ pub(crate) mod tests {
             Arc::new(ModelDirector::new(
                 SynchronizedAnswers {
                     behavior: "stroll\nhey there",
-                    speech_barrier: Arc::clone(&speech_barrier),
+                    dialogue_barrier: Arc::clone(&dialogue_barrier),
                 },
                 ["stroll", "nap"],
                 "fidget",
@@ -880,25 +884,25 @@ pub(crate) mod tests {
                     seen.push(Arrived::Answered(answered));
                     break;
                 }
-                Some(speech) => {
-                    seen.push(speech);
-                    speech_barrier.wait();
+                Some(dialogue) => {
+                    seen.push(dialogue);
+                    dialogue_barrier.wait();
                 }
                 None => thread::sleep(Duration::from_millis(5)),
             }
         }
 
-        let speech: Vec<&str> = seen
+        let dialogue: Vec<&str> = seen
             .iter()
             .filter_map(|arrived| match arrived {
-                Arrived::Speech(line) => Some(line.as_str()),
+                Arrived::Dialogue(line) => Some(line.as_str()),
                 Arrived::Answered(_) => None,
             })
             .collect();
-        assert_eq!(speech, ["hey there"]);
+        assert_eq!(dialogue, ["hey there"]);
         assert!(
             matches!(seen.last(), Some(Arrived::Answered(answered)) if behavior_of(&answered.wake) == "stroll"),
-            "the reply still lands after its Speech"
+            "the reply still lands after its Dialogue"
         );
     }
 
@@ -920,15 +924,15 @@ pub(crate) mod tests {
         );
         thread::sleep(Duration::from_millis(200));
 
-        let mut speech = Vec::new();
+        let mut dialogue = Vec::new();
         while let Some(arrived) = slots.take(&id) {
-            if let Arrived::Speech(line) = arrived {
-                speech.push(line);
+            if let Arrived::Dialogue(line) = arrived {
+                dialogue.push(line);
             }
         }
         assert!(
-            !speech.iter().any(|line| line == "stale words"),
-            "got {speech:?}"
+            !dialogue.iter().any(|line| line == "stale words"),
+            "got {dialogue:?}"
         );
     }
 }

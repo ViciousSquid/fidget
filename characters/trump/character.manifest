@@ -33,8 +33,8 @@ weight = 30
 [animations.waiting]
 frames = ["frames/waiting-0.png", "frames/waiting-1.png", "frames/waiting-2.png", "frames/waiting-3.png", "frames/waiting-4.png", "frames/waiting-5.png"]
 fps = 4
-variant_of = "idle"
 weight = 20
+variant_of = "idle-gesture"
 
 [animations.walk]
 frames = ["frames/walk-0.png", "frames/walk-1.png", "frames/walk-2.png", "frames/walk-3.png", "frames/walk-4.png", "frames/walk-5.png", "frames/walk-6.png", "frames/walk-7.png"]
@@ -129,3 +129,8 @@ when = "idle over 2m"
 play = ["jump"]
 weight = 3
 when = "idle over 30s"
+
+[behaviors.waiting]
+play = ["waiting"]
+weight = 0
+when = "idle over 10s"

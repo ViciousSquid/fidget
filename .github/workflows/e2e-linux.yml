@@ -30,7 +30,9 @@ jobs:
 
     steps:
       - name: Check out the repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install the X11 session packages
         # The build's packages from tests.yml, then the display, window
@@ -46,13 +48,17 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf \
             libayatana-appindicator3-dev \
             xvfb xfwm4 icewm picom xdotool x11-utils inotify-tools mousepad \
-            ayatana-indicator-application at-spi2-core dbus-x11 python3-pyatspi python3-pil
+            ayatana-indicator-application at-spi2-core dbus-x11 python3-pyatspi python3-pil \
+            elfutils
+          # A wait that runs out attaches eu-stack to Fidget, which is not its
+          # child; Yama's default lets a process trace only its children.
+          sudo sysctl -w kernel.yama.ptrace_scope=0
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal
 
       - name: Cache cargo build
-        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        uses: Swatinem/rust-cache@v2.9.3
         with:
           workspaces: .
           key: e2e-linux
@@ -140,12 +146,13 @@ jobs:
         # Each leaf's private HOME holds caches and sockets; keep only its logs.
         run: |
           rsync -rlt --exclude home/ "$RUNNER_TEMP/evidence/" "$RUNNER_TEMP/upload/" || true
-          cd "$RUNNER_TEMP/evidence" &&
+          if cd "$RUNNER_TEMP/evidence"; then
             find . -path '*/home/*' -name '*.log' -exec cp --parents {} "$RUNNER_TEMP/upload/" \; || true
+          fi
 
       - name: Upload evidence
         if: always()
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: e2e-linux-evidence
           path: ${{ runner.temp }}/upload

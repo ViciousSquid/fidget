@@ -5,16 +5,24 @@
 //! what lets every spatial property be tested by constructing snapshots and
 //! asserting frames, with no windowing system, no model and no waiting.
 
-use crate::character::{Behavior, CursorReaction, GravityScale, Primitive};
+use crate::character::{
+    animation_of, Behavior, CursorReaction, GravityScale, IdleBeat, IdleMember, IdlePlan, OnePass,
+    Primitive, RingChoice, DEFAULT_IDLE_GESTURE_EVERY_S, DEFAULT_SLEEP_AFTER_S,
+    DEFAULT_SLEEP_FOR_S,
+};
 use crate::director::Seeded;
 use crate::overlay::{display_index_for, stands_on};
+use crate::possession::{Charge, Intent, Walk};
 use crate::turn_motion::Moment;
 use crate::visibility::Desktop;
 pub use crate::window_source::{Rect, WindowId};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+mod destination;
 mod geometry;
 mod transition;
+use destination::{footing_refusal, heading_to, Destination, Heading};
+pub use destination::{Distance, Extent, GlobalX, MoveRefusal, MoveRequest};
 use geometry::*;
 
 /// A point in the one coordinate space the Engine works in: points, y growing
@@ -71,7 +79,7 @@ pub enum Verb {
     Throw { velocity: Point },
     /// A click on the sprite.
     Poke,
-    /// A right-click on the sprite. Opens the same menu the tray icon opens.
+    /// A right-click on the sprite. Opens the context menu.
     Menu,
 
     /// A double-click on the sprite. Opens the Chat surface the Shell draws.
@@ -100,6 +108,10 @@ pub enum Cue {
     /// The sprite landed after being let go moving. The Drop cue played harder
     /// rather than a sixth shape and a sixth sound.
     Throw,
+    /// The keyboard took the sprite.
+    Possess,
+    /// The keyboard let it go, by any route. A pause is neither edge.
+    Unpossess,
 }
 
 impl Cue {
@@ -114,6 +126,8 @@ impl Cue {
             Self::Pickup => "pickup",
             Self::Drop => "drop",
             Self::Throw => "throw",
+            Self::Possess => "possess",
+            Self::Unpossess => "unpossess",
         }
     }
 
@@ -130,13 +144,75 @@ impl Cue {
     }
 }
 
+/// Which way a walk goes, when the caller says. A Primitive carries no
+/// direction, so a walk without one goes the way the sprite last faced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Direction {
+    Left,
+    Right,
+}
+
+impl Direction {
+    /// This direction as the `facing` the Engine steers by.
+    pub fn facing(self) -> f64 {
+        match self {
+            Self::Left => -1.0,
+            Self::Right => 1.0,
+        }
+    }
+}
+
+/// Who owns the Animation on screen: the producer of the playback, not the
+/// latest request. The Chat status shows it so the same art from different
+/// causes reads differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnimationSource {
+    /// The Engine's own unrequested idle loops and idle-gestures.
+    IdleLoop,
+    /// State and physics playback: falls, landings, climbs, rides, sleep.
+    Engine,
+    /// The Static Director's weighted pick, including a failed call's fallback.
+    LocalDirector,
+    /// What an AI Director reply asked for, streamed or final.
+    AiRequested,
+    /// What an MCP Expression tool asked for. The route, not an author.
+    AiMcp,
+    /// What the user's own hand, keys or cursor set off.
+    UserInvoked,
+    /// Harness turn beats and the question-wait ask, which no reply proposed.
+    AiFeedback,
+    /// The first-run gesture tips.
+    Onboarding,
+}
+
+/// A line to speak, and who produced it. The bubble's hold keeps the source
+/// for as long as the line holds the feet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dialogue {
+    pub text: String,
+    pub source: AnimationSource,
+}
+
+/// Who started the playback on screen, and the Behavior it came from. `None`
+/// for a Behavior is the Engine's own moment, a startle or a turn beat.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PlaybackOwner {
+    source: AnimationSource,
+    behavior: Option<String>,
+}
+
 /// What the Director proposed since the previous tick. Advisory: the Engine
 /// plays the named Behavior only if the Character declares it and the State
-/// permits its Primitives. The line is spoken regardless: speech moves nothing.
+/// permits its Primitives. The line is spoken regardless: dialogue moves nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BehaviorProposal {
     pub behavior: String,
     pub dialogue: Option<String>,
+    /// Which way a walk in `behavior` goes. `None` keeps the last heading.
+    pub direction: Option<Direction>,
+    /// Who asked. The producer says so where it builds the proposal; nothing
+    /// downstream infers it from the name or the wake.
+    pub source: AnimationSource,
 }
 
 /// Everything the Engine is told about the world for one tick.
@@ -169,9 +245,25 @@ pub struct WorldSnapshot {
     /// This Instance's quick message has the caret. Walk and chase stop;
     /// idle, sit and a perch in place do not.
     pub composing: bool,
-    /// A speech bubble or the quick-message pill is showing. Walk and chase
-    /// stop and none starts; a sprite on its feet draws `talk` meanwhile.
-    pub locomotion_frozen: bool,
+    /// Who the sprite speaks for while a speech bubble or the quick-message
+    /// pill is showing. Walk and chase stop and none starts; a sprite on its
+    /// feet draws `talk` meanwhile, as theirs.
+    pub speaking_for: Option<AnimationSource>,
+    /// The user sent a line to the AI this tick. Not a sixth verb: the Shell
+    /// already hears that line on the chat channel and sets this for one tick.
+    pub chat: bool,
+    /// What the keys ask of a possessed sprite this tick. Read only while
+    /// possessed; the default asks for nothing.
+    pub possession: Intent,
+}
+
+/// What a possession digit did this tick, by the Animation it names.
+#[derive(Clone, Debug, PartialEq)]
+pub enum DigitAnimation {
+    /// One pass started.
+    Played(String),
+    /// The State forbids it, as it would a proposal.
+    Refused(String),
 }
 
 /// Everything the renderer is told after one tick.
@@ -184,30 +276,44 @@ pub struct Frame {
     pub state: State,
     /// The Animation to play, by the name every Character Package must supply.
     pub animation: &'static str,
+    /// Who owns the art `art_name` resolves to.
+    pub animation_source: AnimationSource,
 
     /// How long the current Animation has been playing, in milliseconds. Not a
     /// frame index: `character::Animation::frame_at` maps it via the Manifest.
     pub animation_ms: u32,
 
-    /// The draw that picks which member of the Animation's variant ring shows.
-    /// Held while the Animation plays, redrawn when it changes, so a Behavior
-    /// stepping through `idle` shows one strip instead of swapping costumes.
+    /// The draw that picks a ring member, held for the whole Animation.
+    /// The Engine's own idle does not use it: `idle_beat` names the loop or
+    /// the gesture, and a weighed draw would play a different animation.
     pub variant_draw: u64,
+    /// Set while the Engine plays its own idle. `None` for a Behavior's idle
+    /// and for every other Animation, which still weigh `variant_draw`.
+    pub idle_beat: Option<IdleBeat>,
     /// A line to speak on this frame only. Dialogue is an event, not a state.
-    pub dialogue: Option<String>,
+    pub dialogue: Option<Dialogue>,
 
-    /// The Behavior that started on this frame, if a proposal was taken. For
-    /// the Shell: what the Director suggested and what the user saw are
-    /// different lists, and repetition is suppressed on the second.
+    /// The Behavior a proposal started on this frame. For the Shell: what was
+    /// asked and what the user saw are different lists, and repetition is
+    /// suppressed on the second. Never a digit's Animation: see `digit`.
     pub behavior: Option<String>,
+
+    /// The Animation a possession digit played or was refused this frame.
+    /// Its own field, because `behavior` feeds the Director's memory of
+    /// Behaviors and a digit names an Animation the Director cannot propose.
+    pub digit: Option<DigitAnimation>,
 
     /// The Behavior whose Primitives are still playing, on every tick of the
     /// span. `None` for Engine-played moments no Director named.
     pub playing_behavior: Option<String>,
 
     /// The Primitive on screen. `None` once a chain has run out, even while
-    /// a walk it started carries on under its own velocity.
+    /// a walk it started carries on under its own velocity, and while a
+    /// named idle-gesture step is the one playing.
     pub playing_primitive: Option<Primitive>,
+    /// The idle-gesture a Behavior step is playing, one pass. `None` for a
+    /// Primitive. `draw` uses this name; the Engine's own idle uses `idle_beat`.
+    pub playing_gesture: Option<String>,
     /// Whether this tick carried the sprite with a moving Perch. The Shell
     /// polls the window list at the frame rate only then.
     pub riding: bool,
@@ -231,33 +337,54 @@ pub struct Frame {
     /// Reported so a refusal and a model that proposed nothing differ in the
     /// trace. `crates/core` does no I/O, so the Shell prints it.
     pub refused: Option<String>,
+
+    /// How full the jump bar is while a possessed sprite's Space is held, from
+    /// 0 to 1. `None` hides the bar.
+    pub charge: Option<f64>,
+    /// The keys drive the sprite this frame, so what it does is not its own.
+    pub possessed: bool,
+}
+
+impl Frame {
+    /// Animation name `Character::draw` should resolve: the Animation a Behavior
+    /// is playing, otherwise the Engine's animation token.
+    pub fn art_name(&self) -> &str {
+        self.playing_gesture.as_deref().unwrap_or(self.animation)
+    }
+
+    /// What `Character::draw` should weigh this frame with. A Behavior names
+    /// one Animation: the family base's name is also the ring, and weighing it
+    /// would play a sibling.
+    pub fn ring_choice(&self) -> RingChoice<'_> {
+        if let Some(name) = self.playing_gesture.as_deref() {
+            return RingChoice::Named(name);
+        }
+        RingChoice::from_beat(self.idle_beat.as_ref(), self.variant_draw)
+    }
 }
 
 /// How long one Primitive holds the screen.
 ///
-/// ponytail: one duration for every Primitive of every Character. The Engine
-/// deliberately does not know an Animation's length — fps and loop mode are the
-/// Character Manifest's — so it cannot play a Primitive until the art runs out.
-/// Art shorter than the turn costs nothing: `loop = once` holds its last frame
-/// for the remainder, which is what a brief startle looks like. Longer art is
-/// the ceiling, and Blip already sits on it — sleep's `fps = 1` over
-/// two frames is a 2000ms strip the sprite leaves at frame 0. Give a Primitive
-/// its own duration when a Character's art needs to outlast this one.
+/// ponytail: one duration for every Primitive but `react` and `possessed`,
+/// which play one pass of their art (`Engine::turn_ms`) as the Engine's own
+/// idle does. The rest are not timed to their art, so cannot play until it
+/// runs out. Art shorter than the turn holds its last frame. Give another
+/// Primitive a pass when a Character's art needs one.
 const PRIMITIVE_MS: u32 = 600;
 
-/// How long a poked sprite stands still after reacting. `PRIMITIVE_MS` is the
-/// `react` art, not a pause that reads as noticing you. 2.5 s registers without
+/// How long a poked sprite stands still after reacting. One pass of `react`
+/// is the art, not a pause that reads as noticing you. 2.5 s registers without
 /// a click ever feeling like a freeze.
 const POKE_COOLDOWN_MS: u32 = 2_500;
 
-/// How long a resting, untouched sprite waits before it goes to sleep. A tuning
-/// knob: long enough not to nod off mid-chat, short enough that a sprite
-/// on an unattended desktop settles down.
-const SLEEP_AFTER_MS: u32 = 60_000;
+/// How long the cursor rests inside the dwell radius before that counts as
+/// the user staying, and resets sleep. Longer than `DWELL_MS`, which only
+/// addresses the Director.
+const SLEEP_DWELL_MS: u32 = 10_000;
 
 /// How long a sprite rests on a Perch before leaving sit and idling in place.
 /// Long enough to read as settling, short of nodding off. It bounds how much of
-/// a long idle strip a perched sprite plays before the next wake.
+/// a long idle animation a perched sprite plays before the next wake.
 const PERCHED_IDLE_AFTER_MS: u32 = 4_000;
 
 /// Points per second the sprite hauls itself up a screen edge. A tuning knob.
@@ -266,7 +393,11 @@ const CLIMB_SPEED: f64 = 200.0;
 /// Points per second the sprite walks along whatever it is standing on. A
 /// tuning knob, slower than a climb: hauling yourself up an edge is urgent and
 /// strolling along a title bar is not.
-const WALK_SPEED: f64 = 120.0;
+pub(crate) const WALK_SPEED: f64 = 120.0;
+
+/// Points per second a possessed sprite walks, half again `WALK_SPEED`: a held
+/// arrow should get somewhere, not stroll.
+const POSSESSED_WALK_SPEED: f64 = 180.0;
 
 /// Points per second squared, a tuning knob: a fall that reads as heavy rather
 /// than floaty is found by watching. 3600 keeps a Throw on the display long
@@ -312,6 +443,10 @@ const NEAR_RADIUS: f64 = 150.0;
 /// immediate.
 const DWELL_MS: u32 = 400;
 
+/// How close the cursor must be to count as Dwell, in points. 30 is a typical
+/// sprite half-width. `NEAR_RADIUS` would address from a window away.
+const DWELL_RADIUS: f64 = 30.0;
+
 /// Minimum cursor speed to count as a Rush, in points per second. A flick
 /// past startles the same as a flick at it. Fast enough to read as a startle,
 /// slow enough that ordinary travel near the sprite does not trigger it.
@@ -322,17 +457,17 @@ const RUSH_VELOCITY: f64 = 800.0;
 /// that never closes disengages. Boredom is the realism.
 const CHASE_TIMEOUT_MS: u32 = 8000;
 
-/// How close the sprite's x must get to the cursor's x to arrive, in points.
-/// Close enough to read as catching it, loose enough not to overshoot and
+/// How close the sprite's x must get to the x it walks toward, in points.
+/// Close enough to read as getting there, loose enough not to overshoot and
 /// backtrack.
-const CHASE_ARRIVAL_THRESHOLD: f64 = 30.0;
+pub(crate) const ARRIVAL_THRESHOLD: f64 = 30.0;
 
 pub struct Engine {
     position: Point,
     velocity: Point,
     state: State,
-    /// Milliseconds the sprite has spent on its feet, untouched.
-    idle_ms: u32,
+    /// Untouched milliseconds on its feet or playing an awake Behavior.
+    awake_ms: u32,
     /// Milliseconds the sprite has been quietly resting while Perched: not
     /// riding, not walking, no Primitive playing.
     perched_rest_ms: u32,
@@ -340,11 +475,36 @@ pub struct Engine {
 
     animation_ms: u32,
 
-    /// The draw the renderer weighs against the variant ring, and its source.
-    /// The Engine knows when an Animation starts, not the art; which strip the
-    /// number lands on is the Character's.
+    /// The draw the renderer weighs against a ring other than the Engine's
+    /// own idle. Idle names its member on `idle_beat` instead of reweighing.
     variant_draw: u64,
     variants: Seeded,
+    /// Calm loops in draw order: base `idle`, then `variant_of` it.
+    idle_loops: Vec<IdleMember>,
+    /// Idle-gestures in name order. Empty stays on the loop and rolls no gap.
+    idle_gestures: Vec<IdleMember>,
+    /// What digits 1 to 9 play while possessed, in digit order.
+    digits: Vec<IdleMember>,
+    /// The art `react` and `possessed` play through once. `None` plays a turn.
+    react_art: Option<OnePass>,
+    possessed_art: Option<OnePass>,
+    /// Inclusive seconds. Rolled into milliseconds when a loop starts.
+    idle_gesture_every_s: (u32, u32),
+    /// Inclusive seconds before sleep, and asleep. Rolled per stretch.
+    sleep_after_s: (u32, u32),
+    sleep_for_s: (u32, u32),
+    /// The rolled awake limit for this stretch. `None` until the first check.
+    sleep_after_ms: Option<u32>,
+    /// Milliseconds of sleep left. Rolled when the sprite nods off.
+    asleep_left_ms: u32,
+    own_idle: OwnIdle,
+    /// A proposal that arrived during an idle-gesture. Applied when the pass
+    /// ends. A user interaction clears it.
+    deferred: Option<BehaviorProposal>,
+    /// Set when a deferred proposal starts at the end of a gesture, so this
+    /// frame can name it. Taken on the way out of `tick`.
+    latched_behavior: Option<String>,
+    latched_refusal: Option<String>,
     /// The Behaviors the Character declares, which a proposal names.
     behaviors: BTreeMap<String, Behavior>,
 
@@ -364,10 +524,14 @@ pub struct Engine {
     /// State would mean deciding what it resumes as.
     playing: Vec<Primitive>,
 
-    /// The name of the Behavior `playing` was flattened from. `chain` merges
-    /// linked Behaviors and two Characters may share Primitives, so the list
-    /// cannot name it. Cleared with `playing` so the pair is never half true.
-    playing_behavior: Option<String>,
+    /// One pass of a named Animation, from a starring Behavior or a digit.
+    /// Mutually exclusive with a non-empty `playing` list.
+    playing_animation: Option<String>,
+
+    /// Who started `playing` / `playing_animation`, and the Behavior it came
+    /// from, which the merged list cannot name. Cleared with them so the
+    /// pair is never half true.
+    playing_owner: Option<PlaybackOwner>,
 
     primitive_ms: u32,
     /// Which way the sprite is pointed, as -1 or 1. A walk needs a direction
@@ -414,6 +578,15 @@ pub struct Engine {
     /// dialogue is not spoken, while Poke/Grab/Throw still work and the
     /// Character stays visible.
     do_not_disturb: bool,
+    /// The user possesses this sprite from the keyboard. A switch, not a State: it
+    /// still falls and is grabbed the usual way, but never sleeps, climbs only
+    /// on Up, and refuses proposals while their Speech still shows.
+    possessed: bool,
+    /// The possession edge `set_possessed` saw, cued on the next tick.
+    possession_cue: Option<Cue>,
+    /// This fall left the feet while possessed, so a held arrow steers it. A
+    /// release from the hand is not one: a throw flies as thrown.
+    steering: bool,
     /// Harness turn beats waiting out the one on screen. `play` leaves each
     /// unnamed, so a Character cannot replace it, and the next waits until
     /// that one-shot ends so a payoff cannot erase a failed beat.
@@ -445,6 +618,14 @@ pub struct Engine {
     /// Typing or a bubble holds the feet this tick. Copied off the snapshot
     /// at the start so a proposal later in the tick sees the same hold.
     feet_held: bool,
+
+    /// Where a move is walking to.
+    destination: Option<Destination>,
+    /// Who set the walk under way going. Velocity outlives the Primitive that
+    /// set it, so the walk is drawn as that owner's until the feet stop.
+    motion_source: Option<AnimationSource>,
+    /// Reach at the last tick's feet, so a move can be judged between ticks.
+    move_reach: Option<Reach>,
 
     /// Whether the previous tick carried `Verb::Menu`. The Shell re-injects it
     /// every tick the popup is held, so the press edge is the cue; a gap clears
@@ -619,6 +800,46 @@ fn row_clears(xs: &[f64], spans: &[f64], stayers: &[(f64, f64)]) -> bool {
     })
 }
 
+/// Where the Engine's own idle is. `Off` for a Behavior's ordinary idle and
+/// for every other Animation.
+#[derive(Clone)]
+enum OwnIdle {
+    Off,
+    Loop { name: String, gap_left_ms: u32 },
+    Gesture { name: String, pass_ms: u32 },
+}
+
+impl OwnIdle {
+    fn beat(&self) -> Option<IdleBeat> {
+        match self {
+            OwnIdle::Off => None,
+            OwnIdle::Loop { name, .. } => Some(IdleBeat::IdleLoop(name.clone())),
+            OwnIdle::Gesture { name, .. } => Some(IdleBeat::IdleGesture(name.clone())),
+        }
+    }
+
+    fn is_on(&self) -> bool {
+        !matches!(self, OwnIdle::Off)
+    }
+}
+
+/// What `take_proposal` did with one proposal.
+enum Taken {
+    Started(String),
+    Refused(String),
+    Talk,
+    Ignored,
+}
+
+/// The first millisecond at which a looping animation would wrap. The gesture
+/// ends there, so the drawn frame stays inside the one pass.
+fn one_pass_ms(frames: u32, fps: u32) -> u32 {
+    if frames == 0 || fps == 0 {
+        return 1;
+    }
+    frames.saturating_mul(1000).saturating_add(fps - 1) / fps
+}
+
 impl Engine {
     /// A sprite placed at `position`, falling until the world says otherwise.
     pub fn new(position: Point) -> Self {
@@ -626,19 +847,34 @@ impl Engine {
             position,
             velocity: Point::default(),
             state: State::Falling,
-            idle_ms: 0,
+            awake_ms: 0,
             perched_rest_ms: 0,
             animation: animation_for(State::Falling),
             animation_ms: 0,
             variant_draw: 0,
             variants: Seeded::new(0),
+            idle_loops: Vec::new(),
+            idle_gestures: Vec::new(),
+            digits: Vec::new(),
+            react_art: None,
+            possessed_art: None,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+            sleep_after_ms: None,
+            asleep_left_ms: 0,
+            own_idle: OwnIdle::Off,
+            deferred: None,
+            latched_behavior: None,
+            latched_refusal: None,
             behaviors: BTreeMap::new(),
             sprite_height: None,
             gravity: GRAVITY,
             previous_windows: Vec::new(),
             previous_position: position,
             playing: Vec::new(),
-            playing_behavior: None,
+            playing_animation: None,
+            playing_owner: None,
             primitive_ms: 0,
             facing: 1.0,
             riding: false,
@@ -654,6 +890,9 @@ impl Engine {
             yank_reference: Point::default(),
             since_yank_ref_s: 0.0,
             do_not_disturb: false,
+            possessed: false,
+            possession_cue: None,
+            steering: false,
             moment_queue: VecDeque::new(),
             moment_holding: false,
             near_reaction: CursorReaction::default(),
@@ -667,6 +906,9 @@ impl Engine {
             chase_ms: 0,
             poke_cooldown_ms: 0,
             feet_held: false,
+            destination: None,
+            motion_source: None,
+            move_reach: None,
             menu_held: false,
         }
     }
@@ -692,10 +934,26 @@ impl Engine {
         self
     }
 
-    /// A climber stands still on the wall through the post-Poke cooldown and
-    /// while its feet are held, as a walker does on the floor.
-    fn climb_paused(&self) -> bool {
-        self.state == State::Climbing && (self.poke_cooldown_ms > 0 || self.feet_held)
+    /// Points per second up the wall, 0 while the climber stands still: through
+    /// the post-Poke cooldown and held feet, as a walker does on the floor, and
+    /// when possessed, under no key, both, or Up at the top of the display.
+    fn climb_speed(&self, snapshot: &WorldSnapshot) -> f64 {
+        let keys = snapshot.possession;
+        let at_top = || {
+            ceiling_over(self.position.x, snapshot, self.ceiling_clearance())
+                .is_some_and(|ceiling| self.position.y <= ceiling)
+        };
+        if self.poke_cooldown_ms > 0 || self.feet_held {
+            0.0
+        } else if !self.possessed {
+            CLIMB_SPEED
+        } else if keys.up == keys.down || (keys.up && at_top()) {
+            0.0
+        } else if keys.down {
+            -CLIMB_SPEED
+        } else {
+            CLIMB_SPEED
+        }
     }
 
     /// How far below a display's usable top the feet may be put down.
@@ -715,6 +973,295 @@ impl Engine {
         self
     }
 
+    /// Loops, idle-gestures, and the gap range. A retarget drops the beat,
+    /// because the previous member may not exist on the new art.
+    pub fn with_idle_plan(mut self, plan: IdlePlan) -> Self {
+        self.set_idle_plan(plan);
+        self
+    }
+
+    /// Replace the idle loops, gestures, and timing ranges; drops the beat.
+    pub fn set_idle_plan(&mut self, plan: IdlePlan) {
+        self.idle_gesture_every_s = plan.idle_gesture_every_s;
+        self.sleep_after_s = plan.sleep_after_s;
+        self.sleep_for_s = plan.sleep_for_s;
+        self.sleep_after_ms = None;
+        self.idle_loops = plan.loops;
+        self.idle_gestures = plan.gestures;
+        self.digits = plan.digits;
+        self.react_art = plan.react;
+        self.possessed_art = plan.possessed;
+        self.own_idle = OwnIdle::Off;
+        self.deferred = None;
+    }
+
+    /// A test gap shorter than the loader's 5 second floor. The manifest
+    /// cannot say it. Clears the beat so the next idle rolls this range.
+    pub fn with_idle_gesture_every_s(mut self, range: (u32, u32)) -> Self {
+        self.idle_gesture_every_s = range;
+        self.own_idle = OwnIdle::Off;
+        self
+    }
+
+    /// A short range keeps a test from waiting minutes. Clears the rolled limit.
+    pub fn with_sleep_after_s(mut self, range: (u32, u32)) -> Self {
+        self.set_sleep_after_s(range);
+        self
+    }
+
+    /// Inclusive seconds of quiet rest before sleep; clears the rolled limit.
+    pub fn set_sleep_after_s(&mut self, range: (u32, u32)) {
+        self.sleep_after_s = range;
+        self.sleep_after_ms = None;
+        // The accrued stretch belonged to the previous range.
+        self.awake_ms = 0;
+    }
+
+    /// Builder for the inclusive seconds a sleep lasts once it starts.
+    pub fn with_sleep_for_s(mut self, range: (u32, u32)) -> Self {
+        self.set_sleep_for_s(range);
+        self
+    }
+
+    /// Inclusive seconds a sleep lasts once the sprite has nodded off.
+    pub fn set_sleep_for_s(&mut self, range: (u32, u32)) {
+        self.sleep_for_s = range;
+    }
+
+    /// Inclusive seconds, as milliseconds. A fixed `[n, n]` is exactly `n`.
+    fn roll_seconds(&mut self, range: (u32, u32)) -> u32 {
+        let (min, max) = range;
+        let max = max.max(min);
+        let span = u64::from(max - min);
+        let seconds = if span == 0 {
+            min
+        } else {
+            min + (self.variants.draw() % (span + 1)) as u32
+        };
+        seconds.saturating_mul(1000)
+    }
+
+    /// The rolled awake limit for this stretch.
+    fn sleep_limit_ms(&mut self) -> u32 {
+        if let Some(limit) = self.sleep_after_ms {
+            return limit;
+        }
+        let limit = self.roll_seconds(self.sleep_after_s);
+        self.sleep_after_ms = Some(limit);
+        limit
+    }
+
+    /// True when this tick finishes the sleep the sprite is already in.
+    fn count_sleep(&mut self, elapsed: u32) -> bool {
+        if self.state != State::Asleep {
+            return false;
+        }
+        self.asleep_left_ms = self.asleep_left_ms.saturating_sub(elapsed);
+        self.asleep_left_ms == 0
+    }
+
+    /// The cursor has stayed inside the dwell radius long enough to count as
+    /// the user remaining, which is past the Director's 400ms dwell.
+    fn long_dwell(&self, snapshot: &WorldSnapshot) -> bool {
+        if self.possessed {
+            return false;
+        }
+        let distance =
+            (snapshot.cursor.x - self.position.x).hypot(snapshot.cursor.y - self.position.y);
+        distance < DWELL_RADIUS
+            && self.cursor_dwell_ms.saturating_add(snapshot.elapsed_ms) >= SLEEP_DWELL_MS
+    }
+
+    /// A poke, drag, grab, summon, chat line, possession, or a long dwell.
+    /// A proposal, a Behavior, and a menu do not.
+    fn resets_sleep(&self, snapshot: &WorldSnapshot, long_dwell: bool) -> bool {
+        long_dwell
+            || snapshot.chat
+            || self.possessed
+            || snapshot.verbs.iter().any(|verb| {
+                matches!(
+                    verb,
+                    Verb::Poke | Verb::Grab | Verb::Summon | Verb::Throw { .. }
+                )
+            })
+    }
+
+    /// The awake clock has run out, the sprite is still, and nothing is left
+    /// to finish: no Behavior on screen and no idle-gesture pass.
+    fn ready_to_sleep(&mut self) -> bool {
+        if self.velocity.x != 0.0 || !self.playing.is_empty() {
+            return false;
+        }
+        if self.gesture_mid_pass() {
+            return false;
+        }
+        if !matches!(self.state, State::Grounded | State::Perched) {
+            return false;
+        }
+        self.awake_ms >= self.sleep_limit_ms()
+    }
+
+    /// Index into `weights`. An empty list is nothing to pick. A list whose
+    /// weights sum to zero keeps the first member and does not draw, so an
+    /// idle with no declared weight still has a loop.
+    fn pick_weighted(&mut self, weights: &[u32]) -> Option<usize> {
+        if weights.is_empty() {
+            return None;
+        }
+        self.variants.pick_index(weights).or(Some(0))
+    }
+
+    fn begin_loop(&mut self) {
+        let weights: Vec<u32> = self.idle_loops.iter().map(|member| member.weight).collect();
+        let name = self
+            .pick_weighted(&weights)
+            .and_then(|index| self.idle_loops.get(index))
+            .map(|member| member.name.clone())
+            .unwrap_or_else(|| "idle".to_string());
+        // No gestures: stay on the loop. Rolling an empty gap would burn the seed.
+        let gap_left_ms = if self.idle_gestures.is_empty() {
+            0
+        } else {
+            self.roll_seconds(self.idle_gesture_every_s)
+        };
+        self.animation_ms = 0;
+        self.own_idle = OwnIdle::Loop { name, gap_left_ms };
+    }
+
+    /// The next weighted idle-gesture, from its first frame. False when none
+    /// can be picked, in which case the loop stays up.
+    fn begin_gesture(&mut self) -> bool {
+        let weights: Vec<u32> = self
+            .idle_gestures
+            .iter()
+            .map(|member| member.weight)
+            .collect();
+        let Some(index) = self.pick_weighted(&weights) else {
+            return false;
+        };
+        let Some(member) = self.idle_gestures.get(index) else {
+            return false;
+        };
+        let name = member.name.clone();
+        let pass_ms = one_pass_ms(member.frames, member.fps);
+        self.animation_ms = 0;
+        self.own_idle = OwnIdle::Gesture { name, pass_ms };
+        true
+    }
+
+    /// The gesture pass ended. A deferred proposal plays instead of the next
+    /// loop. True when that proposal took the screen, so leftover time is not
+    /// fed into a loop that is not on screen.
+    fn finish_gesture(&mut self) -> bool {
+        self.own_idle = OwnIdle::Off;
+        if self.apply_deferred() {
+            return true;
+        }
+        self.begin_loop();
+        false
+    }
+
+    /// Start a proposal held through a mid-pass. True when it took the screen.
+    fn apply_deferred(&mut self) -> bool {
+        let Some(proposal) = self.deferred.take() else {
+            return false;
+        };
+        match self.take_proposal(&proposal) {
+            Taken::Started(name) => {
+                self.latched_behavior = Some(name);
+                self.animation_ms = 0;
+                true
+            }
+            Taken::Talk => {
+                self.animation_ms = 0;
+                true
+            }
+            Taken::Refused(name) => {
+                self.latched_refusal = Some(name);
+                false
+            }
+            Taken::Ignored => false,
+        }
+    }
+
+    /// Shared completed-pass boundary: deferred Director proposal first, else
+    /// a `then` that `walk` could not flatten. True when something new started.
+    /// The continuation keeps the finished owner's source: it is the same
+    /// decision playing on, not a fresh one.
+    fn complete_pass(&mut self, finished: Option<PlaybackOwner>) -> bool {
+        if self.apply_deferred() {
+            return true;
+        }
+        if let Some(PlaybackOwner {
+            source,
+            behavior: Some(name),
+        }) = finished
+        {
+            if let Some((_, Some(next))) = self.walk(&name) {
+                if self.start_behavior(&next, source) == Some(true) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Carry `dt` through the loop's gap and one gesture pass. A tick longer
+    /// than one beat lands in the beat it reached.
+    fn advance_own_idle(&mut self, mut dt: u32) {
+        loop {
+            match self.own_idle.clone() {
+                OwnIdle::Off => self.begin_loop(),
+                OwnIdle::Loop { name, gap_left_ms } => {
+                    if self.idle_gestures.is_empty() {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Loop { name, gap_left_ms };
+                        return;
+                    }
+                    if dt < gap_left_ms {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Loop {
+                            name,
+                            gap_left_ms: gap_left_ms - dt,
+                        };
+                        return;
+                    }
+                    dt -= gap_left_ms;
+                    if !self.begin_gesture() {
+                        self.animation_ms = self.animation_ms.saturating_add(gap_left_ms);
+                        self.own_idle = OwnIdle::Loop {
+                            name,
+                            gap_left_ms: 0,
+                        };
+                        return;
+                    }
+                    if dt == 0 {
+                        return;
+                    }
+                }
+                OwnIdle::Gesture { name, pass_ms } => {
+                    let left = pass_ms.saturating_sub(self.animation_ms);
+                    if left == 0 {
+                        if self.finish_gesture() || dt == 0 {
+                            return;
+                        }
+                        continue;
+                    }
+                    if dt < left {
+                        self.animation_ms = self.animation_ms.saturating_add(dt);
+                        self.own_idle = OwnIdle::Gesture { name, pass_ms };
+                        return;
+                    }
+                    dt -= left;
+                    self.animation_ms = pass_ms;
+                    if self.finish_gesture() || dt == 0 {
+                        return;
+                    }
+                }
+            }
+        }
+    }
+
     /// The Character's cursor reactions.
     pub fn with_cursor_reactions(mut self, near: CursorReaction, rush: CursorReaction) -> Self {
         self.near_reaction = near;
@@ -732,13 +1279,43 @@ impl Engine {
             && (self.is_walking()
                 || matches!(self.on_screen(), Some(Primitive::Walk | Primitive::Chase)))
         {
-            let _ = self.play(&[Primitive::Sit]);
-            self.velocity.x = 0.0;
+            let _ = self.play(&[Primitive::Sit], AnimationSource::Engine);
+            self.end_walk();
         }
     }
 
     pub fn do_not_disturb(&self) -> bool {
         self.do_not_disturb
+    }
+
+    /// Hand the sprite to the keyboard, or give it back. Either way the walk
+    /// under way ends, chosen or from the keys, or it would stride on with no arrow
+    /// held. The keys own the feet from the next tick, and possession start
+    /// plays `possessed`.
+    pub fn set_possessed(&mut self, possessed: bool) {
+        let starting = possessed && !self.possessed;
+        match (self.possessed, possessed) {
+            (false, true) => self.possession_cue = Some(Cue::Possess),
+            (true, false) => self.possession_cue = Some(Cue::Unpossess),
+            _ => {}
+        }
+        self.possessed = possessed;
+        if matches!(self.on_screen(), Some(Primitive::Walk | Primitive::Chase)) {
+            self.stop_playing();
+        }
+        if starting {
+            self.play(&[Primitive::Possessed], AnimationSource::UserInvoked);
+        }
+        // Walk velocity outlives what set it, a Primitive or a held arrow.
+        if self.is_walking() || self.steering {
+            self.end_walk();
+        }
+        self.steering = false;
+    }
+
+    /// Whether the sprite is possessed: the keyboard moves it, not the Director.
+    pub fn possessed(&self) -> bool {
+        self.possessed
     }
 
     /// Queue `moment`. One pending outcome: failed wins over succeeded, and
@@ -796,13 +1373,19 @@ impl Engine {
         self.position = feet;
         self.previous_position = feet;
         self.previous_windows.clear();
+        self.move_reach = None;
         self.velocity = Point::default();
+        self.motion_source = None;
         self.state = State::Grounded;
         self.animation = animation_for(State::Grounded);
         self.animation_ms = 0;
-        self.idle_ms = 0;
+        self.own_idle = OwnIdle::Off;
+        self.deferred = None;
+        self.awake_ms = 0;
+        self.sleep_after_ms = None;
         self.perched_rest_ms = 0;
         self.stop_playing();
+        self.end_move(self.state);
         self.last_perch = None;
         self.hold_offset_x = 0.0;
         self.rest_perch();
@@ -828,19 +1411,21 @@ impl Engine {
 
     pub fn tick(&mut self, snapshot: &WorldSnapshot) -> Frame {
         let dt = f64::from(snapshot.elapsed_ms) / 1000.0;
-        self.feet_held = snapshot.composing || snapshot.locomotion_frozen;
+        self.feet_held = snapshot.composing || snapshot.speaking_for.is_some();
 
-        // Idling is resting untouched. Time spent in the air or in someone's
-        // hand does not count towards nodding off.
-        if snapshot.verbs.is_empty() {
-            self.idle_ms = match self.state {
-                State::Grounded | State::Perched | State::Asleep => {
-                    self.idle_ms.saturating_add(snapshot.elapsed_ms)
-                }
-                _ => 0,
-            };
-        } else {
-            self.idle_ms = 0;
+        // A Behavior counts as awake time even off its feet. Unscripted air
+        // and a hand pause the clock. A user interaction or timed wake
+        // starts the awake time over.
+        let long_dwell = self.long_dwell(snapshot);
+        let timed_wake = self.count_sleep(snapshot.elapsed_ms);
+        if self.resets_sleep(snapshot, long_dwell) || timed_wake {
+            self.awake_ms = 0;
+            self.sleep_after_ms = None;
+        } else if matches!(self.state, State::Grounded | State::Perched)
+            || (self.playing_behavior().is_some()
+                && !matches!(self.state, State::Asleep | State::Dragged))
+        {
+            self.awake_ms = self.awake_ms.saturating_add(snapshot.elapsed_ms);
         }
 
         let quietly_resting_perched = matches!(self.state, State::Perched)
@@ -852,13 +1437,6 @@ impl Engine {
             self.perched_rest_ms = self.perched_rest_ms.saturating_add(snapshot.elapsed_ms);
         } else {
             self.perched_rest_ms = 0;
-        }
-
-        // A proposal holds off sleep but wakes nobody; only a verb does. Reset
-        // here, before the Behavior plays at tick's end, or a sprite nodding
-        // off first is asleep at the gate. Under DND a proposal does not count.
-        if snapshot.proposal.is_some() && !self.do_not_disturb {
-            self.idle_ms = 0;
         }
 
         // Chase times out on wall time, not Primitive turns, so the clock
@@ -874,7 +1452,8 @@ impl Engine {
 
         // `woke` marks a sprite a verb roused, so the footing it is put back
         // on is not mistaken for one it arrived at. See the landing below.
-        let (state, woke) = transition::on_verbs(self.state, &snapshot.verbs);
+        let wake = timed_wake || self.resets_sleep(snapshot, long_dwell);
+        let (state, woke, dragged) = transition::on_verbs(self.state, &snapshot.verbs, wake);
 
         // A grab or a release ends the cooldown, or it would refuse the first
         // walk after landing. A fall the world causes clears it a tick late, at
@@ -890,33 +1469,32 @@ impl Engine {
             self.chase_ms = 0;
         }
 
-        // A Grab outranks the world, usable floor included. The Dragged edge is
-        // the cue: `Verb::Grab` repeats while held; a slow release emits none.
-        // Both States are in hand only between `on_verbs` and `on_contact`.
-        let mut cue = None;
         let mut thrown_now = false;
-        if state == State::Dragged {
-            if self.state != State::Dragged {
-                cue = Some(Cue::Pickup);
-                self.release_cue = None;
-                // The press lands on the art, not the feet. That point stays
-                // under the pointer; snapping the feet to it hangs the cursor
-                // below the sprite. A snapshot with no press point falls back to
-                // the cursor.
+        match dragged {
+            Some(transition::Edge::PickedUp) => {
+                // The press lands on the art, not the feet, and that point stays
+                // under the pointer. Snapping the feet to it hangs the cursor
+                // below the sprite. With no press point, the cursor is used.
                 let pressed = snapshot.pressed_at.unwrap_or(snapshot.cursor);
                 self.grab_offset = Point {
                     x: self.position.x - pressed.x,
                     y: self.position.y - pressed.y,
                 };
             }
+            Some(transition::Edge::LetGo) => {
+                let thrown = thrown_velocity(snapshot);
+                thrown_now = thrown.is_some();
+                self.velocity = thrown.unwrap_or_default();
+                self.motion_source = None;
+            }
+            None => {}
+        }
+        // A Grab outranks the world, usable floor included.
+        if state == State::Dragged {
             self.position.x = snapshot.cursor.x + self.grab_offset.x;
             self.position.y = snapshot.cursor.y + self.grab_offset.y;
             self.velocity = Point::default();
-        } else if self.state == State::Dragged {
-            let thrown = thrown_velocity(snapshot);
-            thrown_now = thrown.is_some();
-            self.velocity = thrown.unwrap_or_default();
-            self.release_cue = Some(if thrown_now { Cue::Throw } else { Cue::Drop });
+            self.motion_source = None;
         }
 
         // The cursor already arrives every tick for hit-testing, so noticing
@@ -940,42 +1518,11 @@ impl Engine {
         };
         self.last_cursor = snapshot.cursor;
 
-        // Crossing into Near plays `near_reaction`, even under DND.
-        if self.cursor_near && !was_near {
+        // Crossing into Near plays `near_reaction`, even under DND. Not while
+        // possessed: the cursor is not what the user is steering with.
+        if self.cursor_near && !was_near && !self.possessed {
             self.rush_reported = false;
-            match self.near_reaction {
-                CursorReaction::Indifferent => {}
-                CursorReaction::Speak => {
-                    started |= self.play(&[Primitive::Talk]);
-                }
-                CursorReaction::Face => {
-                    self.facing = if snapshot.cursor.x > self.position.x {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                }
-                CursorReaction::Toward => {
-                    // A one-shot walk; Chase is what follows.
-                    self.facing = if snapshot.cursor.x > self.position.x {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    started |= self.play(&[Primitive::Walk]);
-                }
-                CursorReaction::Away => {
-                    self.facing = if snapshot.cursor.x < self.position.x {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    started |= self.play(&[Primitive::Walk]);
-                }
-                CursorReaction::React => {
-                    started |= self.play(&[Primitive::React]);
-                }
-            }
+            started |= self.react_to_cursor(self.near_reaction, snapshot.cursor);
         }
 
         // Leaving Near does not cancel a walk the reaction started. Chase is
@@ -988,56 +1535,24 @@ impl Engine {
 
         // Rush (startle): once per Near session, or a fast cursor still in the
         // radius retriggers every tick.
-        if self.cursor_near && !self.rush_reported {
+        if self.cursor_near && !self.rush_reported && !self.possessed {
             let velocity_magnitude = self.cursor_velocity.x.hypot(self.cursor_velocity.y);
             let rushing = velocity_magnitude > RUSH_VELOCITY;
             if rushing {
                 self.rush_reported = true;
-                match self.rush_reaction {
-                    CursorReaction::Indifferent => {}
-                    CursorReaction::Speak => {
-                        started |= self.play(&[Primitive::Talk]);
-                    }
-                    CursorReaction::Face => {
-                        self.facing = if snapshot.cursor.x > self.position.x {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                    }
-                    CursorReaction::Toward => {
-                        self.facing = if snapshot.cursor.x > self.position.x {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        started |= self.play(&[Primitive::Walk]);
-                    }
-                    CursorReaction::Away => {
-                        self.facing = if snapshot.cursor.x < self.position.x {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        started |= self.play(&[Primitive::Walk]);
-                    }
-                    CursorReaction::React => {
-                        started |= self.play(&[Primitive::React]);
-                    }
-                }
+                started |= self.react_to_cursor(self.rush_reaction, snapshot.cursor);
             }
         }
 
-        // Dwell is the cursor on the art, not merely Near: 30 points is a
-        // typical sprite half-width, where `NEAR_RADIUS` would address from a
-        // window away. `addressed` makes the next Director wake reactive.
+        // The next Director wake is reactive because `addressed` is set. Not
+        // while possessed: the user drives it under the cursor, no dwell.
         let mut addressed = false;
-        if cursor_distance < 30.0 {
+        if cursor_distance < DWELL_RADIUS && !self.possessed {
             self.cursor_dwell_ms = self.cursor_dwell_ms.saturating_add(snapshot.elapsed_ms);
             if self.cursor_dwell_ms >= DWELL_MS && !self.cursor_dwell_addressed {
                 self.cursor_dwell_addressed = true;
                 addressed = true;
-                started |= self.play(&[Primitive::Talk]);
+                started |= self.play(&[Primitive::Talk], AnimationSource::UserInvoked);
             }
         } else {
             self.cursor_dwell_ms = 0;
@@ -1049,28 +1564,29 @@ impl Engine {
         // arrival is a swat, not overlap, and a timeout ends an endless chase.
         if matches!(state, State::Grounded | State::Perched) {
             match self.on_screen() {
-                Some(Primitive::Walk) => self.velocity.x = self.facing * WALK_SPEED,
-                Some(Primitive::Chase) => {
-                    let target_x = snapshot.cursor.x;
-                    let distance_x = (target_x - self.position.x).abs();
-
-                    if distance_x < CHASE_ARRIVAL_THRESHOLD {
-                        self.velocity.x = 0.0;
+                Some(Primitive::Walk) => {
+                    self.velocity.x = self.facing * WALK_SPEED;
+                    self.motion_source = Some(self.playing_source());
+                }
+                Some(Primitive::Chase) => match heading_to(self.position.x, snapshot.cursor.x) {
+                    Heading::Arrived => {
+                        // The swat ends the pursuit that earned it, so it is
+                        // that pursuit's: captured before the stop drops it.
+                        let chased_for = self.playing_source();
+                        self.end_walk();
                         self.stop_playing();
-                        started |= self.play(&[Primitive::React]);
-                    } else if self.chase_ms >= CHASE_TIMEOUT_MS {
-                        self.velocity.x = 0.0;
+                        started |= self.play(&[Primitive::React], chased_for);
+                    }
+                    Heading::Toward(_) if self.chase_ms >= CHASE_TIMEOUT_MS => {
+                        self.end_walk();
                         self.stop_playing();
                         started = true;
-                    } else {
-                        self.facing = if target_x > self.position.x {
-                            1.0
-                        } else {
-                            -1.0
-                        };
-                        self.velocity.x = self.facing * WALK_SPEED;
                     }
-                }
+                    Heading::Toward(toward) => {
+                        self.stride(toward, snapshot.cursor.x, dt);
+                        self.motion_source = Some(self.playing_source());
+                    }
+                },
 
                 // Up and forward is an arc. `integrate` reads the rise as lost
                 // footing, `transition` makes it a fall that lands as usual.
@@ -1079,9 +1595,10 @@ impl Engine {
                         x: self.facing * WALK_SPEED,
                         y: -JUMP_SPEED,
                     };
+                    self.motion_source = Some(self.playing_source());
                 }
                 Some(Primitive::Idle | Primitive::Sit | Primitive::Sleep | Primitive::Hold) => {
-                    self.velocity.x = 0.0
+                    self.end_walk()
                 }
                 _ => {}
             }
@@ -1094,17 +1611,43 @@ impl Engine {
                 self.stop_playing();
             }
             if self.on_screen() != Some(Primitive::Jump) {
-                self.velocity.x = 0.0;
+                self.end_walk();
             }
+        }
+
+        // A move strides after the hold above, as the keys do, so a bubble
+        // stops a walk the sprite chose and not this one.
+        self.apply_destination(state, dt, snapshot);
+
+        // The keys own a possessed sprite's feet, after every hold above: a
+        // bubble or a quick message stops a walk the sprite chose, not this.
+        if self.possessed {
+            started |= self.apply_possession(state, snapshot);
         }
 
         let contact = self.integrate(state, dt, snapshot);
 
-        // Still moving is still awake. A walk proposed just before the timer
-        // comes due would otherwise leave the sprite gliding along the edge
-        // playing `sleep`.
-        let rested = self.idle_ms >= SLEEP_AFTER_MS && self.velocity.x == 0.0;
-        self.state = transition::on_contact(state, contact, rested);
+        // Sleep waits until after a proposal: one that starts this tick is a
+        // Behavior to finish, not a pose to cut. Physics settles the footing
+        // first, with `rested` false.
+        self.state = transition::on_contact(state, contact, false);
+        self.steering = self.possessed
+            && self.state == State::Falling
+            && (self.steering || matches!(state, State::Grounded | State::Perched));
+
+        // State is already stored, so it no longer says whether the hand
+        // picked the sprite up or let go. The edge does.
+        let mut cue = None;
+        match dragged {
+            Some(transition::Edge::PickedUp) => {
+                cue = Some(Cue::Pickup);
+                self.release_cue = None;
+            }
+            Some(transition::Edge::LetGo) => {
+                self.release_cue = Some(if thrown_now { Cue::Throw } else { Cue::Drop });
+            }
+            None => {}
+        }
 
         // The release's cue sounds on arrival: floor, Perch, or wall, once.
         // Every landing reports where it touched for the cue ripple.
@@ -1141,7 +1684,7 @@ impl Engine {
 
         // Inset a standing sprite at a display edge so it shows whole, facing
         // away. Dragged, Falling, riding and coasting own their edges; climb
-        // frames put the wall mid-frame. A held walk still drives to the wall.
+        // frames put the wall mid-frame. A held walk still reaches the wall.
         let stationary = matches!(self.state, State::Grounded | State::Perched | State::Asleep)
             && self.velocity.x == 0.0
             && !self.riding
@@ -1182,17 +1725,19 @@ impl Engine {
         // for a sprite woken onto its old footing; that fall only asks what is
         // underneath. A wake with nothing under it still falls and lands later.
         if matches!(contact, Some(transition::Contact::Landed(_))) && !woke {
-            started |= self.play(&[Primitive::Land]);
+            started |= self.play(&[Primitive::Land], AnimationSource::Engine);
         }
 
         // Riding is an event the Director cannot propose in time, the same
-        // as landing. Holding on is not resting, so an Asleep sprite that
-        // has to ride wakes rather than sleeping through the move.
+        // as landing. An awake sprite holds on. An Asleep sprite stays
+        // asleep: window motion is not a user wake, so the sleep
+        // countdown keeps running while the perch carries it.
         if self.riding {
-            self.idle_ms = 0;
-            self.state = State::Perched;
-            if self.on_screen() != Some(Primitive::Hold) {
-                started |= self.play(&[Primitive::Hold]);
+            if self.state != State::Asleep {
+                self.state = State::Perched;
+                if self.on_screen() != Some(Primitive::Hold) {
+                    started |= self.play(&[Primitive::Hold], AnimationSource::Engine);
+                }
             }
         } else if self.on_screen() == Some(Primitive::Hold) {
             self.stop_playing();
@@ -1206,30 +1751,51 @@ impl Engine {
         // The State gate's refusals only. Do Not Disturb is a silence the
         // user asked for, and an undeclared name is traced at the parse.
         let mut refused = None;
+        // Possessed, the user is the one deciding. The Speech still shows: the
+        // Frame carries the proposal's dialogue whatever happens here.
         if let Some(proposal) = &snapshot.proposal {
-            if !self.do_not_disturb {
-                if let Some(primitives) = self.chain(&proposal.behavior) {
-                    // Mid-cooldown, `play` refuses a moving chain whole,
-                    // greeting included. A lone line or gesture plays. After
-                    // the cooldown the Director calls afresh; nothing resumes.
-                    if self.play(&primitives) {
-                        started = true;
-                        behavior = Some(proposal.behavior.clone());
-                        // The only place a name is attached: `play` is reached
-                        // by Engine-played moments too, and it clears the name
-                        // so that they cannot inherit the last proposal's.
-                        self.playing_behavior = behavior.clone();
-                    } else {
-                        refused = Some(proposal.behavior.clone());
-                    }
-                } else if proposal.behavior.is_empty()
-                    && proposal.dialogue.is_some()
-                    && self.play(&[Primitive::Talk])
+            if self.state == State::Asleep {
+                // Asleep is a full stop. A declared name is a refusal the
+                // trace can show; an unknown name was already traced at parse.
+                if !proposal.behavior.is_empty() && self.behaviors.contains_key(&proposal.behavior)
                 {
-                    started = true;
+                    refused = Some(proposal.behavior.clone());
+                }
+            } else if self.gesture_mid_pass() && !self.do_not_disturb && !self.possessed {
+                // One slot. A later proposal in the same pass replaces it.
+                // Covers both the Engine's own-idle gesture and a Behavior
+                // animation mid-pass.
+                self.deferred = Some(proposal.clone());
+            } else if !self.do_not_disturb && !self.possessed {
+                match self.take_proposal(proposal) {
+                    Taken::Started(name) => {
+                        started = true;
+                        behavior = Some(name);
+                    }
+                    Taken::Refused(name) => refused = Some(name),
+                    Taken::Talk => started = true,
+                    Taken::Ignored => {}
                 }
             }
         }
+
+        // Director proposals stay out while possessed. A digit is the user
+        // asking, so it takes the same `permitted` gate.
+        let mut digit = None;
+        if self.possessed {
+            if let Some(name) = self.animation_for_digit(snapshot.possession.play) {
+                // One pass, nameless, so no Behavior's `then` follows it.
+                digit = Some(
+                    if self.play_animation(&name, AnimationSource::UserInvoked) {
+                        started = true;
+                        DigitAnimation::Played(name)
+                    } else {
+                        DigitAnimation::Refused(name)
+                    },
+                );
+            }
+        }
+        let digit_started = matches!(digit, Some(DigitAnimation::Played(_)));
 
         // After a proposal and before a Poke. A one-shot finishes before the
         // next beat. One that cannot play is dropped, so it cannot return
@@ -1238,13 +1804,12 @@ impl Engine {
             let playable = self
                 .moment_queue
                 .iter()
-                .position(|moment| self.permitted(&[moment.primitive()]));
+                .position(|moment| self.permitted_primitive(moment.primitive()));
             if let Some(index) = playable {
                 self.moment_queue.drain(0..index);
                 if let Some(moment) = self.moment_queue.pop_front() {
-                    if self.play(&[moment.primitive()]) {
+                    if self.play(&[moment.primitive()], AnimationSource::AiFeedback) {
                         started = true;
-                        self.idle_ms = 0;
                     } else {
                         self.moment_queue.push_front(moment);
                     }
@@ -1262,10 +1827,10 @@ impl Engine {
         {
             // Noticing you does not keep strolling past, or climbing on.
             if stopped_by_a_poke(self.state) {
-                self.velocity.x = 0.0;
+                self.end_walk();
                 self.poke_cooldown_ms = POKE_COOLDOWN_MS;
             }
-            started |= self.play(&[Primitive::React]);
+            started |= self.play(&[Primitive::React], AnimationSource::UserInvoked);
         }
         // Every way the user reaches for the sprite addresses the Director
         // here and only here. A Poke counts once settled: on its own tick it
@@ -1278,65 +1843,95 @@ impl Engine {
                 .iter()
                 .any(|verb| matches!(verb, Verb::Summon | Verb::Menu));
 
-        // One cue a tick; a hand transition outranks a click. Two clicks cannot
-        // share a tick, so the first click verb wins. Menu repeats every held
-        // tick like Grab, so it cues on the press edge.
+        // One cue a tick: a hand transition, else a click verb, else a started
+        // digit Animation, else a possession edge, which waits for a free tick.
+        // Menu repeats every held tick like Grab, so it cues on the press edge.
         let menu_now = snapshot.verbs.iter().any(|verb| matches!(verb, Verb::Menu));
-        let cue = cue.or_else(|| {
-            snapshot
-                .verbs
-                .iter()
-                .find_map(|verb| match Cue::of_verb(verb) {
-                    Some(Cue::Menu) if self.menu_held => None,
-                    other => other,
-                })
-        });
+        let cue = cue
+            .or_else(|| {
+                snapshot
+                    .verbs
+                    .iter()
+                    .find_map(|verb| match Cue::of_verb(verb) {
+                        Some(Cue::Menu) if self.menu_held => None,
+                        other => other,
+                    })
+            })
+            .or(digit_started.then_some(Cue::Poke))
+            .or_else(|| self.possession_cue.take());
         self.menu_held = menu_now;
+
+        // Nothing left on screen, and the awake clock has run out. An
+        // idle-gesture still in its pass waits until the pass ends.
+        let was_asleep = self.state == State::Asleep;
+        if self.ready_to_sleep() {
+            self.state = State::Asleep;
+        }
+        if self.state == State::Asleep && !was_asleep {
+            self.asleep_left_ms = self.roll_seconds(self.sleep_for_s);
+        }
 
         // A Behavior is drawn over whatever the sprite is doing, so a Poke
         // shows even mid-fall. It changes nothing about where the sprite is.
-        let animation = match self.on_screen() {
-            Some(primitive) => animation_of(primitive),
-            // A walk outlasts the Primitive that starts it: the velocity holds
-            // until the sprite runs out of Perch, so the Animation has to hold
-            // with it rather than dropping back to standing mid-stride.
-            None if self.is_walking() => "walk",
-            // The bubble is the sprite speaking, so its feet held, it says so.
-            None if snapshot.locomotion_frozen
-                && matches!(self.state, State::Grounded | State::Perched) =>
-            {
-                "talk"
+        // Advance the idle machine before the family is published: a gesture
+        // that ends this tick may start the proposal it was holding.
+        let was_own = self.own_idle.is_on();
+        if self.animation_name(snapshot) == "idle" && self.uses_own_idle() {
+            if !was_own {
+                self.begin_loop();
             }
-            // A sprite that rests quietly on a Perch idles in place: still
-            // Perched, same edge, idle art and idle life.
-            None if matches!(self.state, State::Perched)
-                && self.perched_rest_ms >= PERCHED_IDLE_AFTER_MS =>
-            {
-                "idle"
-            }
-            None => animation_for(self.state),
-        };
-        // A fresh variant draw on the Animation, not on the Primitive: `idle`
-        // and a variant of `idle` are one family, and re-drawing every turn of
-        // a 600ms Primitive would flicker between strips mid-Behavior.
+            self.advance_own_idle(snapshot.elapsed_ms);
+        }
+        if let Some(name) = self.latched_behavior.take() {
+            behavior = Some(name);
+            started = true;
+        }
+        if let Some(name) = self.latched_refusal.take() {
+            refused = Some(name);
+        }
+
+        let (animation, animation_source) = self.select_animation(snapshot);
+        // One draw per family, not per Primitive turn, or a 600ms Idle would
+        // flicker animations. The Engine's own idle names its member on the beat.
+        let engine_idle = animation == "idle" && self.uses_own_idle();
+        let behavior_idle =
+            animation == "idle" && self.on_screen() == Some(Primitive::Idle) && !self.idle_typed();
         let new_family = animation != self.animation;
         if new_family {
             self.animation = animation;
+            if !engine_idle {
+                self.variant_draw = self.variants.draw();
+            }
+        } else if behavior_idle && was_own {
+            // The machine may be mid-gesture. The Behavior draws once here,
+            // from the loop member's first frame.
             self.variant_draw = self.variants.draw();
+            self.animation_ms = 0;
         }
 
         // `react` is `loop = once`, so a second Poke restarts its clock or
         // shows nothing. `land` re-enters by a fall, a change of name. The rest
-        // keep their clock, or each turn draws only the strip's first 600ms.
+        // keep their clock, or each turn draws only the animation's first 600ms.
         let startled = self.on_screen() == Some(Primitive::React);
         // A paused climb holds one pose rather than climbing in place.
-        if new_family || (started && startled) {
+        // A gesture step starts at its first frame, then the clock runs.
+        if self.playing_gesture().is_some() && started {
+            self.leave_own_idle();
             self.animation_ms = 0;
-        } else if !(self.climb_paused() && animation == "climb") {
+        } else if engine_idle {
+            // `advance_own_idle` already moved `animation_ms`.
+        } else if new_family || (started && startled) {
+            self.leave_own_idle();
+            self.animation_ms = 0;
+        } else if animation != "climb" || self.climb_speed(snapshot) != 0.0 {
+            self.leave_own_idle();
             self.animation_ms = self.animation_ms.saturating_add(snapshot.elapsed_ms);
+        } else {
+            self.leave_own_idle();
         }
 
         self.previous_windows.clone_from(&snapshot.windows);
+        self.move_reach = standing_reach(self.position, self.state, snapshot);
         self.previous_position = self.position;
         self.last_poll_generation = snapshot.poll_generation;
         if matches!(self.state, State::Perched | State::Asleep) {
@@ -1350,27 +1945,107 @@ impl Engine {
             self.hold_offset_x = 0.0;
         }
 
+        let playing_gesture = self.playing_gesture().map(str::to_string);
         Frame {
             position: self.position,
             velocity: self.velocity,
             state: self.state,
             animation: self.animation,
+            animation_source,
             animation_ms: self.animation_ms,
             variant_draw: self.variant_draw,
-            dialogue: snapshot
-                .proposal
-                .as_ref()
-                .and_then(|proposal| proposal.dialogue.clone()),
+            idle_beat: self.own_idle.beat(),
+            // The line is its proposal's whether or not the Behavior won the
+            // screen: dialogue moves nothing, so nothing gates it.
+            dialogue: snapshot.proposal.as_ref().and_then(|proposal| {
+                proposal.dialogue.clone().map(|text| Dialogue {
+                    text,
+                    source: proposal.source,
+                })
+            }),
             behavior,
-            playing_behavior: self.playing_behavior.clone(),
+            digit,
+            playing_behavior: self.playing_behavior().map(str::to_string),
             playing_primitive: self.on_screen(),
+            playing_gesture,
             riding: self.riding,
             facing: self.facing,
             addressed,
             cue,
             contact: ripple,
             refused,
+            charge: snapshot
+                .possession
+                .charging
+                .filter(|_| self.possessed)
+                .map(Charge::fraction),
+            possessed: self.possessed,
         }
+    }
+
+    /// Apply this tick's keys to a possessed sprite, true when Space launched
+    /// it. A launch plays Jump the way a proposal does, so the flight, `land`
+    /// and the drop Cue are every fall's. In hand the keys do nothing.
+    fn apply_possession(&mut self, state: State, snapshot: &WorldSnapshot) -> bool {
+        let on_feet = matches!(state, State::Grounded | State::Perched);
+        let climbing = state == State::Climbing;
+        if !on_feet && !climbing && !(state == State::Falling && self.steering) {
+            return false;
+        }
+
+        let heading = snapshot.possession.walk.map(|walk| match walk {
+            Walk::Left => -1.0,
+            Walk::Right => 1.0,
+        });
+        if climbing {
+            // A climber faces its wall. An arrow away lets go and Space jumps
+            // off, and either one leaves the wall at a walk.
+            let away = -self.facing;
+            if heading == Some(away) || snapshot.possession.launch.is_some() {
+                self.velocity.x = away * POSSESSED_WALK_SPEED;
+            }
+        } else {
+            if let Some(heading) = heading {
+                self.facing = heading;
+            }
+            // Into the outermost edge the walk stops where a standing sprite
+            // shows whole, rather than walking off and catching the wall.
+            self.velocity.x = match heading {
+                Some(heading) if !edge_ahead(self.position.x, heading, snapshot) => {
+                    heading * POSSESSED_WALK_SPEED
+                }
+                _ => 0.0,
+            };
+        }
+
+        let Some(charge) = snapshot.possession.launch else {
+            return false;
+        };
+        if !(on_feet || climbing) || !self.play(&[Primitive::Jump], AnimationSource::UserInvoked) {
+            return false;
+        }
+        let speed = self.launch_speed(charge, snapshot);
+        self.velocity.y = -speed;
+        // `jump` holds the screen for the rise and `fall` takes over at the
+        // apex, where the upward speed runs out.
+        self.primitive_ms = (speed / self.gravity * 1000.0).ceil() as u32;
+        self.release_cue = Some(Cue::Drop);
+        true
+    }
+
+    /// The upward speed that lifts the feet as high as `charge` asks, from Jump's
+    /// hop to the height of the display under them, wherever on it they stand.
+    /// `integrate` steps velocity before position, topping out half a tick short
+    /// of `v²/2g`, so the launch tick's step is solved for. The ceiling still
+    /// stops a body the bar aimed past it.
+    fn launch_speed(&self, charge: Charge, snapshot: &WorldSnapshot) -> f64 {
+        let hop = JUMP_SPEED * JUMP_SPEED / (2.0 * self.gravity);
+        let full =
+            usable_height_under(self.position, snapshot).map_or(hop, |height| height.max(hop));
+        let height = charge.height(hop, full);
+
+        let half_step = self.gravity * f64::from(snapshot.elapsed_ms) / 1000.0 / 2.0;
+        half_step + (half_step * half_step + 2.0 * self.gravity * height).sqrt()
     }
 
     /// Move the sprite through one tick of `state`'s physics and report what
@@ -1390,68 +2065,63 @@ impl Engine {
                 self.velocity.y += self.gravity * dt;
                 self.position.x += self.velocity.x * dt;
 
-                let wall_from_screen = wall_reached(self.position.x, self.velocity.x, snapshot);
-                let wall_from_dock = dock_side_reached(self.position, self.velocity.x, snapshot);
-                debug_assert!(
-                    wall_from_screen.is_none() || wall_from_dock.is_none(),
-                    "at most one wall check fires: screen at {:?}, dock at {:?}",
-                    wall_from_screen,
-                    wall_from_dock
-                );
-
-                if let Some(wall) = wall_from_screen.or(wall_from_dock) {
+                if let Some(wall) = wall_reached(self.position.x, self.velocity.x, snapshot) {
                     let side = self.velocity.x.signum();
                     self.position.x = wall;
-                    self.velocity = Point::default();
-                    Some(Contact::Wall { side })
-                } else {
-                    let next_y = self.position.y + self.velocity.y * dt;
+                    // A possessed sprite does not climb: it meets the side and
+                    // goes on falling.
+                    if !self.possessed {
+                        self.velocity = Point::default();
+                        self.motion_source = None;
+                        return Some(Contact::Wall { side });
+                    }
+                    self.end_walk();
+                }
+                let next_y = self.position.y + self.velocity.y * dt;
 
-                    // Rising only: a Grab can put the feet above the ceiling,
-                    // and snapping them down would teleport a drop.
-                    if self.velocity.y < 0.0 {
-                        if let Some(ceiling) =
-                            ceiling_over(self.position.x, snapshot, self.ceiling_clearance())
-                        {
-                            let stop_at = self.position.y.min(ceiling);
-                            if next_y < stop_at {
-                                self.position.y = stop_at;
-                                self.velocity.y = 0.0;
-                                return Some(Contact::Ceiling);
-                            }
+                // Rising only: a Grab can put the feet above the ceiling, and
+                // snapping them down would teleport a drop.
+                if self.velocity.y < 0.0 {
+                    if let Some(ceiling) =
+                        ceiling_over(self.position.x, snapshot, self.ceiling_clearance())
+                    {
+                        let stop_at = self.position.y.min(ceiling);
+                        if next_y < stop_at {
+                            self.position.y = stop_at;
+                            self.velocity.y = 0.0;
+                            return Some(Contact::Ceiling);
                         }
                     }
+                }
 
-                    match support_below(self.position, snapshot, self.ceiling_clearance()) {
-                        Some(support) if next_y >= support.y => {
-                            self.position.y = support.y;
-                            self.velocity = Point::default();
-                            Some(Contact::Landed(support.surface))
-                        }
-                        _ => {
-                            self.position.y = next_y;
-                            Some(Contact::Airborne)
-                        }
+                match support_below(self.position, snapshot, self.ceiling_clearance()) {
+                    Some(support) if next_y >= support.y => {
+                        self.position.y = support.y;
+                        self.velocity = Point::default();
+                        self.motion_source = None;
+                        Some(Contact::Landed(support.surface))
+                    }
+                    _ => {
+                        self.position.y = next_y;
+                        Some(Contact::Airborne)
                     }
                 }
             }
             State::Climbing => {
-                let speed = if self.climb_paused() {
-                    0.0
-                } else {
-                    CLIMB_SPEED
-                };
+                // Only possession moves a climber sideways, off the wall.
+                if self.velocity.x != 0.0 {
+                    return Some(Contact::Airborne);
+                }
+                let speed = self.climb_speed(snapshot);
                 let next_y = self.position.y - speed * dt;
 
-                // Climbing the Dock's side ends on its top: the Dock is a
-                // Perch, so its top edge is a landing, not a ceiling. The step
-                // inward puts the feet on it; stopping clear stands beside it.
-                if let Some(dock) = dock_in(snapshot) {
-                    if self.position.y > dock.y && next_y <= dock.y {
-                        if let Some(x) = dock_top_at(self.position.x, dock) {
-                            self.position = Point { x, y: dock.y };
-                            return Some(Contact::Landed(Surface::Perch));
-                        }
+                // Down the wall ends on the floor or Perch under it, where the
+                // sprite stands rather than pushing through.
+                if speed < 0.0 {
+                    let under = support_below(self.position, snapshot, self.ceiling_clearance());
+                    if let Some(support) = under.filter(|support| next_y >= support.y) {
+                        self.position.y = support.y;
+                        return Some(Contact::Landed(support.surface));
                     }
                 }
                 self.position.y = next_y;
@@ -1459,14 +2129,15 @@ impl Engine {
                 // Off the top of the display there is nothing left to hold, so
                 // it lets go. A sprite over no display at all is already
                 // holding nothing, hence its own y as the fallback ceiling.
-                let ceiling = ceiling_over(self.position.x, snapshot, self.ceiling_clearance())
-                    .unwrap_or(self.position.y);
-                if self.position.y <= ceiling {
-                    self.position.y = ceiling;
-                    Some(Contact::Ceiling)
-                } else {
-                    None
+                let over = ceiling_over(self.position.x, snapshot, self.ceiling_clearance());
+                let ceiling = over.unwrap_or(self.position.y);
+                if self.position.y > ceiling {
+                    return None;
                 }
+                self.position.y = ceiling;
+                // A possessed climber stops at the top instead: letting go
+                // would drop it to the floor under the user's own held Up.
+                (!self.possessed || over.is_none()).then_some(Contact::Ceiling)
             }
 
             // Resting is only ever on something. When it moves slowly the
@@ -1479,20 +2150,49 @@ impl Engine {
                 if self.velocity.y < 0.0 {
                     return Some(Contact::Airborne);
                 }
+                if self.possessed {
+                    let keys = snapshot.possession;
+                    if let Some((x, side)) = keys
+                        .climb
+                        .then(|| wall_beside(self.position, snapshot))
+                        .flatten()
+                    {
+                        self.position.x = x;
+                        self.facing = side;
+                        self.velocity = Point::default();
+                        self.motion_source = None;
+                        return Some(Contact::Wall { side });
+                    }
+                    // A point under the edge, so the fall that follows does
+                    // not land straight back on the Perch it left. Not the
+                    // Dock, which hides what falls behind it.
+                    let on_dock = dock_in(snapshot).is_some_and(|dock| {
+                        dock.y == self.position.y && dock.spans_x(self.position.x)
+                    });
+                    if keys.drop && state == State::Perched && !on_dock {
+                        self.position.y += 1.0;
+                        self.rest_perch();
+                        return Some(Contact::Airborne);
+                    }
+                }
                 let dx = self.velocity.x * dt;
+                let before = self.position;
                 self.position.x += dx;
                 if self.last_perch.is_some() {
                     self.hold_offset_x += dx;
                 }
-
-                // A walk beside the Dock stops clear of its side once, then
-                // climbs; a per-tick step back stutters under a held walk. The
-                // assembler caps `elapsed_ms`, or a long step crosses the Dock.
-                if let Some(x) = dock_side_reached(self.position, self.velocity.x, snapshot) {
-                    let side = self.velocity.x.signum();
-                    self.position.x = x;
-                    self.velocity = Point::default();
-                    return Some(Contact::Wall { side });
+                // The Dock's side stops a floor walk. A sprite's own walk turns
+                // there; a possessed one stands, as at a display edge.
+                let reach = dock_reach(before, snapshot).filter(|_| state == State::Grounded);
+                if let Some(x) = reach.map(|reach| reach.clamp(self.position.x)) {
+                    if x != self.position.x {
+                        self.position.x = x;
+                        self.velocity.x = if self.possessed {
+                            0.0
+                        } else {
+                            -self.velocity.x
+                        };
+                    }
                 }
 
                 let fresh = snapshot.poll_generation == 0
@@ -1679,29 +2379,95 @@ impl Engine {
         self.playing.last().copied()
     }
 
+    /// The idle-gesture animation a Behavior is mid-pass on, if any.
+    fn playing_gesture(&self) -> Option<&str> {
+        self.playing_animation.as_deref()
+    }
+
+    /// Own-idle gesture or a Behavior animation still in its one pass.
+    fn gesture_mid_pass(&self) -> bool {
+        matches!(self.own_idle, OwnIdle::Gesture { .. }) || self.playing_animation.is_some()
+    }
+
+    /// How long one pass of `animation` holds the screen.
+    fn animation_duration_ms(&self, animation: &str) -> u32 {
+        self.idle_gestures
+            .iter()
+            .chain(&self.digits)
+            .find(|member| member.name == animation)
+            .map(|member| one_pass_ms(member.frames, member.fps))
+            .unwrap_or(PRIMITIVE_MS)
+    }
+
+    /// How long `primitive` holds the screen. `react` and `possessed` play
+    /// their art through once, even art that loops forever, and never for
+    /// less than the turn every other Primitive gets.
+    fn turn_ms(&self, primitive: Primitive) -> u32 {
+        let art = match primitive {
+            Primitive::React => self.react_art,
+            Primitive::Possessed => self.possessed_art,
+            _ => None,
+        };
+        art.map_or(PRIMITIVE_MS, |pass| {
+            one_pass_ms(pass.frames, pass.fps).max(PRIMITIVE_MS)
+        })
+    }
+
+    /// Stop the walk under way. Its owner ends with it, so a later stride
+    /// set going by physics or a new owner never inherits it.
+    fn end_walk(&mut self) {
+        self.velocity.x = 0.0;
+        self.motion_source = None;
+    }
+
     /// Under way on foot, rather than in the air with the same speed on it.
     fn is_walking(&self) -> bool {
         matches!(self.state, State::Grounded | State::Perched) && self.velocity.x != 0.0
     }
 
-    /// True when the Primitive on screen changed.
+    /// True when the Primitive on screen changed, or an animation pass ended.
     fn advance(&mut self, elapsed_ms: u32) -> bool {
+        if self.playing_animation.is_some() {
+            if elapsed_ms >= self.primitive_ms {
+                self.playing_animation = None;
+                self.primitive_ms = 0;
+                let finished = self.playing_owner.take();
+                self.moment_holding = false;
+                self.complete_pass(finished);
+                return true;
+            }
+            self.primitive_ms -= elapsed_ms;
+            return false;
+        }
+
+        // An own-idle gesture owns the screen until its pass ends: the
+        // Primitive clock runs, but every boundary it reaches waits for it.
+        if matches!(self.own_idle, OwnIdle::Gesture { .. }) {
+            self.primitive_ms = self.primitive_ms.saturating_sub(elapsed_ms);
+            return false;
+        }
         let mut left = elapsed_ms;
         let mut moved_on = false;
 
         while !self.playing.is_empty() && left >= self.primitive_ms {
             left -= self.primitive_ms;
             self.playing.pop();
-            self.primitive_ms = PRIMITIVE_MS;
+            self.primitive_ms = match self.playing.last() {
+                Some(next) => self.turn_ms(*next),
+                None => 0,
+            };
             moved_on = true;
+            if self.playing.is_empty() {
+                break;
+            }
         }
         if self.playing.is_empty() {
-            // Draining is the ordinary end of a Behavior and the only one that
-            // is not an abort, so it drops the name here rather than through
-            // `stop_playing` like every other clear site.
             self.primitive_ms = 0;
-            self.playing_behavior = None;
+            let finished = self.playing_owner.take();
             self.moment_holding = false;
+            if self.complete_pass(finished) {
+                moved_on = true;
+            }
         } else {
             self.primitive_ms -= left;
         }
@@ -1713,93 +2479,294 @@ impl Engine {
     /// go together, or the Engine reports a Behavior that stopped ticks ago.
     fn stop_playing(&mut self) {
         self.playing.clear();
-        self.playing_behavior = None;
+        self.playing_animation = None;
+        self.playing_owner = None;
         self.primitive_ms = 0;
         self.moment_holding = false;
     }
 
+    fn react_to_cursor(&mut self, reaction: CursorReaction, cursor: Point) -> bool {
+        let facing = |right: bool| if right { 1.0 } else { -1.0 };
+        match reaction {
+            CursorReaction::Indifferent => false,
+            CursorReaction::Speak => self.play(&[Primitive::Talk], AnimationSource::UserInvoked),
+            CursorReaction::Face => {
+                self.facing = facing(cursor.x > self.position.x);
+                false
+            }
+            CursorReaction::Toward => {
+                self.facing = facing(cursor.x > self.position.x);
+                // A one-shot walk; Chase is what follows.
+                self.play(&[Primitive::Walk], AnimationSource::UserInvoked)
+            }
+            CursorReaction::Away => {
+                self.facing = facing(cursor.x < self.position.x);
+                self.play(&[Primitive::Walk], AnimationSource::UserInvoked)
+            }
+            CursorReaction::React => self.play(&[Primitive::React], AnimationSource::UserInvoked),
+        }
+    }
+
+    /// The Animation this tick shows, before the idle machine advances.
+    fn animation_name(&self, snapshot: &WorldSnapshot) -> &'static str {
+        self.select_animation(snapshot).0
+    }
+
+    /// The Animation this tick shows and who owns the art drawn for it. One
+    /// match, so the owner cannot drift from the branch that chose the art.
+    fn select_animation(&self, snapshot: &WorldSnapshot) -> (&'static str, AnimationSource) {
+        let (family, source) = self.select_family(snapshot);
+        // A named pass draws over the family token, so the art on screen is
+        // its owner's even while the family still says walk.
+        if self.playing_animation.is_some() {
+            return (family, self.playing_source());
+        }
+        (family, source)
+    }
+
+    fn select_family(&self, snapshot: &WorldSnapshot) -> (&'static str, AnimationSource) {
+        match self.on_screen() {
+            // A possessed walk is the user's stride: it shows over a landing or a
+            // startle rather than sliding under them.
+            _ if self.possessed && self.is_walking() => ("walk", AnimationSource::UserInvoked),
+            // So does a move's, over a line or a startle.
+            _ if self.feet_owned() && self.is_walking() => ("walk", self.destination_source()),
+            Some(primitive) => (animation_of(primitive), self.playing_source()),
+            // A walk outlasts the Primitive that starts it: the velocity holds
+            // until the sprite runs out of Perch, so the Animation has to hold
+            // with it rather than dropping back to standing mid-stride.
+            None if self.is_walking() => (
+                "walk",
+                self.motion_source.unwrap_or(AnimationSource::Engine),
+            ),
+            // The bubble is the sprite speaking, so its feet held, it says so.
+            None if matches!(self.state, State::Grounded | State::Perched) => {
+                match snapshot.speaking_for {
+                    Some(speaker) => ("talk", speaker),
+                    None => self.resting_family(),
+                }
+            }
+            None => self.resting_family(),
+        }
+    }
+
+    /// Nothing playing, walking or held: what the State itself shows.
+    fn resting_family(&self) -> (&'static str, AnimationSource) {
+        // A sprite that rests quietly on a Perch idles in place: still
+        // Perched, same edge, idle art and idle life. Before that, its sit
+        // is the Engine settling it.
+        if self.state == State::Perched && self.perched_rest_ms >= PERCHED_IDLE_AFTER_MS {
+            return ("idle", AnimationSource::IdleLoop);
+        }
+        let source = match self.state {
+            State::Grounded => AnimationSource::IdleLoop,
+            // The hand is the user's; the fall it lets go into is not.
+            State::Dragged => AnimationSource::UserInvoked,
+            _ => AnimationSource::Engine,
+        };
+        (animation_for(self.state), source)
+    }
+
+    /// Engine idle, or a Behavior declared `type = "idle"` on an idle Primitive.
+    /// A named gesture plays its own animation and does not enter this.
+    fn uses_own_idle(&self) -> bool {
+        if self.playing_gesture().is_some() {
+            return false;
+        }
+        self.on_screen() != Some(Primitive::Idle) || self.idle_typed()
+    }
+
+    fn idle_typed(&self) -> bool {
+        self.on_screen() == Some(Primitive::Idle)
+            && self.playing_behavior().is_some_and(|name| {
+                self.behaviors
+                    .get(name)
+                    .is_some_and(|behavior| behavior.idle_type)
+            })
+    }
+
+    /// Left the Engine's idle. A proposal held for an own-idle gesture dies with
+    /// the cut, since what took the screen is what plays. A Behavior animation
+    /// mid-pass keeps the deferred slot until its pass ends or is cleared.
+    fn leave_own_idle(&mut self) {
+        if self.playing_animation.is_none() {
+            self.deferred = None;
+        }
+        self.own_idle = OwnIdle::Off;
+    }
+
+    /// Play `proposal` the way a tick does. The heading lands now: the walk's
+    /// velocity was read before the proposal arrived.
+    fn take_proposal(&mut self, proposal: &BehaviorProposal) -> Taken {
+        match self.start_behavior(&proposal.behavior, proposal.source) {
+            Some(true) => {
+                if let Some(direction) = proposal.direction {
+                    if self
+                        .walk(&proposal.behavior)
+                        .is_some_and(|(primitives, _)| primitives.contains(&Primitive::Walk))
+                    {
+                        self.facing = direction.facing();
+                    }
+                }
+                Taken::Started(proposal.behavior.clone())
+            }
+            // Mid-cooldown, `play` refuses a moving chain whole, greeting
+            // included. A lone line or gesture plays. After the cooldown the
+            // Director calls afresh; nothing resumes.
+            Some(false) => Taken::Refused(proposal.behavior.clone()),
+            None if proposal.behavior.is_empty()
+                && proposal.dialogue.is_some()
+                && self.play(&[Primitive::Talk], proposal.source) =>
+            {
+                Taken::Talk
+            }
+            None => Taken::Ignored,
+        }
+    }
+
+    /// Start `name` through `permitted`. `None` means the Character does not
+    /// declare it. `play` clears the Behavior name, so only this puts it back.
+    fn start_behavior(&mut self, name: &str, source: AnimationSource) -> Option<bool> {
+        let behavior = self.behaviors.get(name)?;
+        let started = match behavior.animation.clone() {
+            Some(animation) => self.play_animation(&animation, source),
+            None => {
+                let (primitives, _) = self.walk(name)?;
+                self.play(&primitives, source)
+            }
+        };
+        if started {
+            self.playing_owner = Some(PlaybackOwner {
+                source,
+                behavior: Some(name.to_string()),
+            });
+        }
+        Some(started)
+    }
+
+    /// The Behavior whose Primitives or pass are on screen, if one is.
+    fn playing_behavior(&self) -> Option<&str> {
+        self.playing_owner.as_ref()?.behavior.as_deref()
+    }
+
+    /// Who owns what `playing` / `playing_animation` holds. Every `play` names
+    /// one, so the fallback only covers a list emptied without `stop_playing`.
+    fn playing_source(&self) -> AnimationSource {
+        self.playing_owner
+            .as_ref()
+            .map_or(AnimationSource::Engine, |owner| owner.source)
+    }
+
+    /// The Animation digit `play` names, or nothing past the list.
+    fn animation_for_digit(&self, play: Option<u8>) -> Option<String> {
+        let index = usize::from(play?).checked_sub(1)?;
+        self.digits.get(index).map(|clip| clip.name.clone())
+    }
+
     /// Start `primitives` unless the State forbids any of them. True when it
     /// started. All or nothing: half a Behavior stops the sprite mid-thought.
-    fn play(&mut self, primitives: &[Primitive]) -> bool {
+    fn play(&mut self, primitives: &[Primitive], source: AnimationSource) -> bool {
         if primitives.is_empty() || !self.permitted(primitives) {
             return false;
         }
 
+        self.playing_animation = None;
         self.playing = primitives.iter().rev().copied().collect();
         // Nameless until a caller says otherwise. Most callers are the Engine
         // playing a moment of its own — a Land, a Hold, a startle — and the
         // name of the Behavior they interrupted is not theirs to keep.
-        self.playing_behavior = None;
+        self.playing_owner = Some(PlaybackOwner {
+            source,
+            behavior: None,
+        });
 
         // A new Chase is a new pursuit; leftover ms from the last one would
         // time out mid-stride.
         if primitives.contains(&Primitive::Chase) {
             self.chase_ms = 0;
         }
-        self.primitive_ms = PRIMITIVE_MS;
+        self.primitive_ms = self.turn_ms(primitives[0]);
         // A chain is a Behavior. Holding that would make the next turn beat
-        // wait out every Primitive in it, not the one-shot it replaced.
+        // wait out every step in it, not the one-shot it replaced.
         self.moment_holding = primitives.len() == 1;
         true
     }
 
-    /// Whether the sprite's State permits every one of `primitives`. Motion
-    /// waits out the post-Poke cooldown. Walk and chase also wait out a
-    /// quick message or a bubble; a jump still may.
-    fn permitted(&self, primitives: &[Primitive]) -> bool {
+    /// One pass of a named Animation: a Behavior's idle-gesture, or a digit's
+    /// pick. True when it started.
+    fn play_animation(&mut self, animation: &str, source: AnimationSource) -> bool {
         let on_feet = matches!(self.state, State::Grounded | State::Perched);
-        primitives.iter().all(|primitive| match primitive {
-            Primitive::React | Primitive::Talk => true,
-            Primitive::Walk | Primitive::Chase => {
-                on_feet && self.poke_cooldown_ms == 0 && !self.feet_held
-            }
-            Primitive::Jump => on_feet && self.poke_cooldown_ms == 0,
-            _ => on_feet,
-        })
+        if !(on_feet && !self.feet_owned()) {
+            return false;
+        }
+        self.playing.clear();
+        self.playing_animation = Some(animation.to_string());
+        self.playing_owner = Some(PlaybackOwner {
+            source,
+            behavior: None,
+        });
+        self.primitive_ms = self.animation_duration_ms(animation);
+        self.moment_holding = true;
+        true
     }
 
-    /// Every Primitive a named Behavior plays, chained ones included, or `None`
-    /// when undeclared. It stops cycles: Behaviors arrive unvalidated, and
-    /// ADR-0002 promises no package can hang the frame loop.
-    fn chain(&self, behavior: &str) -> Option<Vec<Primitive>> {
+    /// Whether the sprite's State permits every Primitive. Motion waits out
+    /// the post-Poke cooldown. Walk and chase also wait out a quick message or
+    /// a bubble; a jump still may.
+    fn permitted(&self, primitives: &[Primitive]) -> bool {
+        primitives
+            .iter()
+            .all(|primitive| self.permitted_primitive(*primitive))
+    }
+
+    fn permitted_primitive(&self, primitive: Primitive) -> bool {
+        let on_feet = matches!(self.state, State::Grounded | State::Perched);
+        match primitive {
+            Primitive::React | Primitive::Talk | Primitive::Possessed => true,
+            _ if self.feet_owned() => false,
+            Primitive::Walk | Primitive::Chase => {
+                footing_refusal(self.state, self.poke_cooldown_ms).is_none() && !self.feet_held
+            }
+            Primitive::Jump => {
+                let off_a_wall = self.possessed && self.state == State::Climbing;
+                (on_feet || off_a_wall) && self.poke_cooldown_ms == 0
+            }
+            _ => on_feet,
+        }
+    }
+
+    /// A named Behavior's `then` chain, or `None` when undeclared: the Primitives
+    /// that play as one queue, and the first non-flattened Behavior after that
+    /// pass. Stops at cycles: ADR-0002 promises no package can hang the frame loop.
+    fn walk(&self, behavior: &str) -> Option<(Vec<Primitive>, Option<String>)> {
         let mut primitives = Vec::new();
         let mut walked: BTreeSet<&str> = BTreeSet::new();
         let mut current = self.behaviors.get_key_value(behavior)?;
-
         while walked.insert(current.0.as_str()) {
-            primitives.extend(current.1.primitives.iter().copied());
-            match current.1.then.as_deref() {
-                Some(next) => match self.behaviors.get_key_value(next) {
-                    Some(next) => current = next,
-                    None => break,
-                },
-                None => break,
+            if current.1.animation.is_none() {
+                primitives.extend(current.1.primitives.iter().copied());
             }
+            let Some(next) = current
+                .1
+                .then
+                .as_deref()
+                .and_then(|next| self.behaviors.get_key_value(next))
+            else {
+                break;
+            };
+            if !flattens(current.1, next.1) {
+                return Some((primitives, Some(next.0.clone())));
+            }
+            current = next;
         }
-
-        Some(primitives)
+        Some((primitives, None))
     }
 }
 
-/// Which of the Required Animation Set a Primitive plays.
-fn animation_of(primitive: Primitive) -> &'static str {
-    match primitive {
-        Primitive::Idle => "idle",
-        // The Animation only. The motion belongs to the walk a proposal starts,
-        // which outlives this Primitive's turn and stops when Perch runs out.
-        Primitive::Walk => "walk",
-        Primitive::Land => "land",
-        Primitive::Sit => "sit",
-        Primitive::Sleep => "sleep",
-        Primitive::React => "react",
-        Primitive::Talk => "talk",
-        Primitive::Hold => "hold",
-        // No chase Animation in the required set; walk is the motion.
-        Primitive::Chase => "walk",
-        // Optional art: the renderer resolves it to `fall` when a package
-        // draws none, so the required set stays at nine (ADR-0007).
-        Primitive::Jump => "jump",
-    }
+/// Whether `next` joins `current`'s Primitive queue. An Animation, or a change
+/// of `type`, waits for the pass boundary so the right Behavior owns its idle.
+fn flattens(current: &Behavior, next: &Behavior) -> bool {
+    current.animation.is_none() && next.animation.is_none() && current.idle_type == next.idle_type
 }
 
 /// Where a Poke stops the sprite for the cooldown: on its feet or on a wall.
@@ -1997,7 +2964,9 @@ mod tests {
     }
 
     fn play(script: &[WorldSnapshot]) -> Vec<Frame> {
-        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 })
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((600, 600));
         script.iter().map(|s| engine.tick(s)).collect()
     }
 
@@ -2039,36 +3008,48 @@ mod tests {
                 "walk".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Walk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "greet".to_string(),
                 Behavior {
                     primitives: vec![Primitive::React, Primitive::Talk],
+                    animation: None,
                     then: Some("settle".to_string()),
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "settle".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Sit, Primitive::Sleep],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
                 "jump".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Jump],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
         ])
@@ -2078,7 +3059,7 @@ mod tests {
         Engine::new(position).with_behaviors(declared_behaviors())
     }
 
-    /// A held walk drives the sprite at the display edge on purpose: that is
+    /// A held walk carries the sprite to the display edge on purpose: that is
     /// how it reaches the wall. Correcting a moving sprite teleports it back
     /// a step each time it closes the gap, and the wall becomes unreachable.
     #[test]
@@ -2137,28 +3118,13 @@ mod tests {
         }
     }
 
-    /// Where a climb up the Dock's left side comes to rest, and where one up
-    /// its right side does: a half sprite in from the corner, on the top.
-    fn on_the_dock_from_the_left() -> Point {
-        Point {
-            x: dock().x + EDGE_CLEARANCE,
-            y: dock().y,
-        }
-    }
-
-    fn on_the_dock_from_the_right() -> Point {
-        Point {
-            x: dock().x + dock().width - EDGE_CLEARANCE,
-            y: dock().y,
-        }
-    }
-
-    /// The Dock is the one thing on screen drawn in front of the sprite, so a
-    /// walk that carries on under it puts the sprite where nobody can see or
-    /// grab it. Its side is a wall.
+    /// The Dock is drawn in front of the sprite, so its side is a wall to a
+    /// floor walk: the walk turns half a sprite out from it, and never climbs
+    /// it onto the top.
     #[test]
-    fn a_walk_into_the_dock_climbs_onto_it_rather_than_behind_it() {
+    fn a_walk_into_the_dock_turns_at_its_side() {
         let dock = dock();
+        let wall = dock.x - EDGE_CLEARANCE;
         let mut engine = a_character_at(Point { x: 300.0, y: 0.0 });
         settle(&mut engine, &dock_snapshot(100));
         engine.tick(&WorldSnapshot {
@@ -2166,79 +3132,49 @@ mod tests {
             ..dock_snapshot(16)
         });
 
-        let mut previous = engine.tick(&dock_snapshot(16));
-        let mut climbed = false;
         for _ in 0..400 {
             let frame = engine.tick(&dock_snapshot(16));
-            let behind = frame.position.y > dock.y
-                && frame.position.x > dock.x
-                && frame.position.x < dock.x + dock.width;
-            assert!(!behind, "behind the Dock: {:?}", frame.position);
-            if frame.state == State::Grounded {
-                assert!(
-                    frame.position.x >= previous.position.x,
-                    "walking right never sets the sprite back: {} -> {}",
-                    previous.position.x,
-                    frame.position.x
-                );
-            }
-            climbed |= frame.state == State::Climbing;
-            if frame.state == State::Perched {
-                assert!(climbed, "on the Dock's top without climbing its side");
-                assert_eq!(frame.position, on_the_dock_from_the_left(), "{frame:?}");
+            assert_eq!(frame.state, State::Grounded, "{frame:?}");
+            assert!(frame.position.x <= wall, "behind the Dock: {frame:?}");
+            if frame.velocity.x < 0.0 {
+                assert_eq!(frame.position.x, wall, "turned at the side: {frame:?}");
+                assert_eq!(frame.facing, -1.0, "{frame:?}");
                 return;
             }
-            previous = frame;
         }
-        panic!("the walk never reached the Dock's top: {previous:?}");
+        panic!("the walk never turned at the Dock");
     }
 
-    /// The Dock's side is a wall for a sprite walking into it, and not for one
-    /// that has just walked off the top. Catching that one puts it back on the
-    /// top to walk off again, and everything past the Dock stays unreachable.
+    /// The wall is the floor's. A walk along a window whose top is lower than
+    /// the Dock's goes on past the line a floor walk turns at.
     #[test]
-    fn a_walk_off_the_dock_top_carries_on_past_it_rather_than_climbing_back() {
-        let dock = dock();
-        let mut engine = a_character_at(Point { x: 700.0, y: 0.0 });
-        settle(&mut engine, &dock_snapshot(100));
-
-        // Thrown leftwards into the Dock's right side, which it climbs, leaving
-        // it on the top facing left with the far edge ahead of it.
-        carry(
-            &mut engine,
-            Point { x: 700.0, y: 760.0 },
-            &dock_snapshot(16),
-        );
+    fn a_perched_walk_below_the_dock_top_goes_past_its_side() {
+        let low = Rect {
+            x: 100.0,
+            y: 750.0,
+            width: 600.0,
+            height: 50.0,
+        };
+        let world = |elapsed_ms| WorldSnapshot {
+            windows: vec![window(DOCK_PERCH_ID, dock()), window(1, low)],
+            ..snapshot(elapsed_ms)
+        };
+        let mut engine = a_character_at(Point { x: 200.0, y: 0.0 });
+        let landed = settle(&mut engine, &world(100));
+        assert_eq!((landed.state, landed.position.y), (State::Perched, low.y));
         engine.tick(&WorldSnapshot {
-            verbs: vec![Verb::Throw {
-                velocity: Point { x: -400.0, y: 0.0 },
-            }],
-            ..dock_snapshot(16)
+            proposal: walk(),
+            ..world(16)
         });
-        let on_top = settle(&mut engine, &dock_snapshot(16));
-        assert_eq!(
-            (on_top.state, on_top.position.y),
-            (State::Perched, dock.y),
-            "the throw is meant to leave it on the Dock: {on_top:?}"
-        );
 
-        let mut stepped_off = false;
         for _ in 0..400 {
-            let frame = engine.tick(&WorldSnapshot {
-                proposal: walk(),
-                ..dock_snapshot(16)
-            });
-            let on_dock = frame.state == State::Perched && frame.position.y == dock.y;
-            stepped_off |= !on_dock;
-            assert!(
-                !(stepped_off && on_dock),
-                "put back on the Dock it had just walked off: {frame:?}"
-            );
-            if frame.state == State::Climbing && frame.position.x == one_display().x {
-                return; // the far wall, which is what walking that way is for
+            let frame = engine.tick(&world(16));
+            assert!(frame.velocity.x >= 0.0, "turned on the window: {frame:?}");
+            if frame.state == State::Perched && frame.position.x > dock().x - EDGE_CLEARANCE {
+                return;
             }
         }
-        panic!("the walk never got past the Dock to the display edge");
+        panic!("the walk never went past the Dock's side");
     }
 
     /// Standing on the Dock's top is standing above its side, not behind it.
@@ -2262,11 +3198,11 @@ mod tests {
         }
     }
 
-    /// Let go with the cursor over the Dock and the sprite falls behind it.
-    /// It climbs the nearer side out: a real Dock is wide, and the way out
-    /// from the middle of one is a long way sideways.
+    /// Let go over the Dock below its top, the sprite falls behind it. Once it
+    /// comes to rest there it stands on the Dock's top at the same x, where it
+    /// can be seen and grabbed, rather than being pulled out sideways.
     #[test]
-    fn a_sprite_dropped_behind_the_dock_climbs_out_onto_it() {
+    fn a_sprite_let_go_behind_the_dock_comes_to_rest_on_its_top() {
         let mut engine = a_character_at(Point { x: 300.0, y: 0.0 });
         settle(&mut engine, &dock_snapshot(100));
         carry(
@@ -2277,45 +3213,43 @@ mod tests {
 
         let frame = settle(&mut engine, &dock_snapshot(16));
         assert_eq!(frame.state, State::Perched, "{frame:?}");
-        assert_eq!(frame.position, on_the_dock_from_the_left());
-    }
-
-    /// The nearer side is whichever one it is. Dropped in the right-hand half,
-    /// the sprite climbs out to the right, not back across everything it was
-    /// hidden behind.
-    #[test]
-    fn a_sprite_dropped_near_the_docks_right_end_climbs_out_that_side() {
-        let mut engine = a_character_at(Point { x: 300.0, y: 0.0 });
-        settle(&mut engine, &dock_snapshot(100));
-        carry(
-            &mut engine,
-            Point { x: 560.0, y: 760.0 },
-            &dock_snapshot(16),
+        assert_eq!(
+            frame.position,
+            Point {
+                x: 480.0,
+                y: dock().y
+            }
         );
-
-        let frame = settle(&mut engine, &dock_snapshot(16));
-        assert_eq!(frame.state, State::Perched, "{frame:?}");
-        assert_eq!(frame.position, on_the_dock_from_the_right());
     }
 
-    /// An autohidden Dock slides out around whatever is standing there, asleep
-    /// included. The sprite that was resting in front of nothing is now behind
-    /// something, and climbs out the same way.
+    /// An autohidden Dock slides out around whatever stands there, asleep
+    /// included. The sprite now behind it ends up on its top, awake or not.
     #[test]
-    fn a_dock_that_unhides_around_a_sleeping_sprite_wakes_it_onto_the_top() {
-        let mut engine = a_character_at(Point { x: 450.0, y: 0.0 });
+    fn a_dock_that_slides_out_around_a_sleeping_sprite_puts_it_on_the_top() {
+        let mut engine = Engine::new(Point { x: 450.0, y: 0.0 })
+            .with_behaviors(declared_behaviors())
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((30, 30));
         settle(&mut engine, &snapshot(100));
-        let asleep = engine.tick(&snapshot(SLEEP_AFTER_MS));
+        let asleep = engine.tick(&snapshot(1_000));
         assert_eq!(asleep.state, State::Asleep, "{asleep:?}");
 
         let frame = settle(&mut engine, &dock_snapshot(16));
-        assert_eq!(frame.state, State::Perched, "{frame:?}");
-        assert_eq!(frame.position, on_the_dock_from_the_left());
+        assert!(
+            matches!(frame.state, State::Perched | State::Asleep),
+            "{frame:?}"
+        );
+        assert_eq!(
+            frame.position,
+            Point {
+                x: 450.0,
+                y: dock().y
+            }
+        );
     }
 
-    /// Behind the Dock means behind the Dock's own display. A display below
-    /// this one shares its x-range: a sprite on that floor is under the Dock's
-    /// columns and behind none of it. Treating it as hidden loops it for ever.
+    /// Behind the Dock means on the Dock's own display. A display stacked below
+    /// shares its x-range, and a sprite on that floor is behind none of it.
     #[test]
     fn a_sprite_on_a_display_below_the_docks_is_not_behind_the_dock() {
         let below = Rect {
@@ -2336,9 +3270,120 @@ mod tests {
         let mut engine = a_character_at(standing);
         for _ in 0..80 {
             let frame = engine.tick(&stacked);
-            assert_ne!(frame.state, State::Climbing, "{frame:?}");
+            assert_eq!(frame.state, State::Grounded, "{frame:?}");
             assert_eq!(frame.position, standing, "{frame:?}");
         }
+    }
+
+    /// A Dock whose side is less than a sprite from a display edge, either
+    /// side, and a sprite in the gap between them.
+    fn docks_near_an_edge() -> [(WorldSnapshot, f64, Direction, f64); 2] {
+        let near = |x: f64| WorldSnapshot {
+            windows: vec![window(
+                DOCK_PERCH_ID,
+                Rect {
+                    x,
+                    y: 740.0,
+                    width: 220.0,
+                    height: 60.0,
+                },
+            )],
+            ..snapshot(16)
+        };
+        [
+            (near(700.0), 960.0, Direction::Right, 1000.0),
+            (near(80.0), 40.0, Direction::Left, 0.0),
+        ]
+    }
+
+    /// Walking away from the Dock is not walking into it. From the gap beside
+    /// it the walk reaches the display edge and climbs it past the Dock's top,
+    /// with nothing pulling it back or stepping it onto the Dock.
+    #[test]
+    fn a_walk_from_beside_the_dock_reaches_the_display_edge() {
+        for (world, start, heading, edge) in docks_near_an_edge() {
+            let dock = dock_in(&world).unwrap();
+            let mut engine = a_character_at(Point { x: start, y: 0.0 });
+            let landed = settle(
+                &mut engine,
+                &WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                },
+            );
+            assert_eq!(landed.state, State::Grounded, "{landed:?}");
+            engine.tick(&WorldSnapshot {
+                proposal: Some(BehaviorProposal {
+                    behavior: "walk".to_string(),
+                    dialogue: None,
+                    direction: Some(heading),
+                    source: AnimationSource::LocalDirector,
+                }),
+                ..world.clone()
+            });
+
+            let mut climbed_past_the_top = false;
+            for _ in 0..400 {
+                let frame = engine.tick(&world);
+                assert_ne!(frame.state, State::Perched, "on the Dock: {frame:?}");
+                if frame.state == State::Climbing {
+                    assert_eq!(frame.position.x, edge, "{frame:?}");
+                    climbed_past_the_top |= frame.position.y < dock.y;
+                }
+                if climbed_past_the_top {
+                    break;
+                }
+            }
+            assert!(climbed_past_the_top, "never climbed the edge past the Dock");
+        }
+    }
+
+    /// Let go beside the Dock, in the gap, in the half sprite just out from
+    /// its side, or level with the side itself, the sprite lands where it was
+    /// let go and stays there.
+    #[test]
+    fn a_sprite_let_go_beside_the_dock_stays_where_it_lands() {
+        for (world, start, ..) in docks_near_an_edge() {
+            let dock = dock_in(&world).unwrap();
+            let side = if start > dock.x {
+                dock.x + dock.width
+            } else {
+                dock.x
+            };
+            let margin = side + (start - side).signum() * 10.0;
+            for x in [start, margin, side] {
+                let mut engine = a_character_at(Point { x: 500.0, y: 0.0 });
+                settle(&mut engine, &world);
+                carry(&mut engine, Point { x, y: 770.0 }, &world);
+
+                let frame = settle(&mut engine, &world);
+                assert_eq!(frame.state, State::Grounded, "{frame:?}");
+                assert_eq!(frame.position, Point { x, y: 800.0 }, "{frame:?}");
+            }
+        }
+    }
+
+    /// A move sent behind the Dock arrives where a walk would turn, half a
+    /// sprite out from its side, as it would at a display edge.
+    #[test]
+    fn a_move_to_behind_the_dock_stops_at_its_side() {
+        let mut engine = a_character_at(Point { x: 200.0, y: 0.0 });
+        settle(&mut engine, &dock_snapshot(100));
+        engine
+            .start_move(
+                MoveRequest::To(GlobalX::new(500.0).unwrap()),
+                AnimationSource::AiMcp,
+            )
+            .expect("a grounded sprite takes a move");
+
+        let frame = settle(&mut engine, &dock_snapshot(100));
+        assert_eq!(frame.state, State::Grounded, "{frame:?}");
+        let wall = dock().x - EDGE_CLEARANCE;
+        assert!(
+            (wall - ARRIVAL_THRESHOLD..=wall).contains(&frame.position.x),
+            "arrived short of the side: {frame:?}"
+        );
+        assert_eq!(frame.velocity.x, 0.0, "{frame:?}");
     }
 
     fn a_resting_sprite() -> Engine {
@@ -2352,6 +3397,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: behavior.to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         }
@@ -2487,8 +3534,8 @@ mod tests {
     /// than a fall. `settle` opens on `sit`, which neither draws.
     #[test]
     fn a_behavior_that_settles_is_refused_asleep_and_mid_climb() {
-        let mut engine = a_resting_sprite();
-        assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
         let asleep = engine.tick(&proposing("settle"));
         assert_eq!(asleep.state, State::Asleep);
@@ -2527,9 +3574,12 @@ mod tests {
                 "chatter".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Talk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             )]));
 
@@ -2545,9 +3595,12 @@ mod tests {
     fn a_behavior_that_chains_back_to_itself_still_ends() {
         let pacing = |then: &str| Behavior {
             primitives: vec![Primitive::Idle],
+            animation: None,
             then: Some(then.to_string()),
             weight: DEFAULT_WEIGHT,
             trigger: None,
+            not_in_manifest: false,
+            idle_type: false,
         };
         let mut engine = Engine::new(Point { x: 100.0, y: 0.0 }).with_behaviors(BTreeMap::from([
             ("here".to_string(), pacing("there")),
@@ -2828,10 +3881,15 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: Some("morning".to_string()),
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
-        assert_eq!(spoken.dialogue.as_deref(), Some("morning"));
+        assert_eq!(
+            spoken.dialogue.as_ref().map(|line| line.text.as_str()),
+            Some("morning")
+        );
 
         let quiet = engine.tick(&snapshot(100));
         assert_eq!(quiet.dialogue, None, "a line is said once, not held");
@@ -2933,9 +3991,68 @@ mod tests {
         );
     }
 
-    /// `PRIMITIVE_MS` is how long the Engine gives a Primitive, not how long
-    /// the art runs. Every base `idle` is longer (750ms to twelve seconds), so
-    /// a restarted clock would draw only the opening of the strip.
+    /// An Engine whose `react` art is `pass`, and nothing else in its plan.
+    fn reacting_in(pass: OnePass) -> Engine {
+        let mut engine = Engine::new(Point { x: 500.0, y: 100.0 });
+        engine.set_idle_plan(IdlePlan {
+            loops: Vec::new(),
+            gestures: Vec::new(),
+            digits: Vec::new(),
+            react: Some(pass),
+            possessed: None,
+            idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        });
+        settle(&mut engine, &snapshot(100));
+        engine
+    }
+
+    /// How long `react` holds the screen after a Poke, in 100ms ticks.
+    fn reaction_ms(engine: &mut Engine) -> u32 {
+        engine.tick(&WorldSnapshot {
+            verbs: vec![Verb::Poke],
+            ..snapshot(100)
+        });
+        let ticks = (0..100)
+            .take_while(|_| engine.tick(&snapshot(100)).animation == "react")
+            .count() as u32;
+        (ticks + 1) * 100
+    }
+
+    /// `react` plays its art through once, like an idle-gesture, rather than
+    /// for a fixed turn that cuts a long wave short. Art that loops forever
+    /// ends at its wrap, and a second Poke plays it again from frame 0.
+    #[test]
+    fn a_poke_plays_one_pass_of_the_react_art_then_idles() {
+        let mut engine = reacting_in(OnePass { frames: 6, fps: 4 });
+        assert_eq!(reaction_ms(&mut engine), 1_500, "six frames at 4 fps");
+        assert_eq!(engine.tick(&snapshot(100)).animation, "idle");
+
+        engine.tick(&WorldSnapshot {
+            verbs: vec![Verb::Poke],
+            ..snapshot(100)
+        });
+        let again = engine.tick(&WorldSnapshot {
+            verbs: vec![Verb::Poke],
+            ..snapshot(100)
+        });
+        assert_eq!((again.animation, again.animation_ms), ("react", 0));
+    }
+
+    /// Art longer than a Primitive's turn plays to its end. Shorter art still
+    /// gets the turn, as every Primitive's art does.
+    #[test]
+    fn react_art_plays_to_its_end_and_never_for_less_than_a_turn() {
+        let long = OnePass { frames: 6, fps: 6 };
+        assert_eq!(reaction_ms(&mut reacting_in(long)), 1_000);
+        let short = OnePass { frames: 2, fps: 8 };
+        assert_eq!(reaction_ms(&mut reacting_in(short)), PRIMITIVE_MS);
+    }
+
+    /// `PRIMITIVE_MS` is the Primitive's turn, not the art's length, so the
+    /// clock runs across Idle turns instead of restarting on each. Landing
+    /// rests at 0, and the Engine's own idle after the Behavior rests again.
     #[test]
     fn a_behaviors_idle_keeps_one_clock_across_its_primitive_turns() {
         let mut engine =
@@ -2943,13 +4060,16 @@ mod tests {
                 "ponder".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Idle, Primitive::Idle, Primitive::Idle],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             )]));
         let base = settle(&mut engine, &snapshot(100)).animation_ms;
-        assert!(base > 0, "the sprite has been idling since it landed");
+        assert!(base > 0, "the idle loop's clock runs, landed at {base}ms");
 
         let started = engine.tick(&proposing("ponder"));
         assert_eq!(started.behavior.as_deref(), Some("ponder"), "it plays");
@@ -2962,10 +4082,16 @@ mod tests {
         }
 
         assert_eq!(
-            clock,
-            (1..=19).map(|tick| base + tick * 100).collect::<Vec<u32>>(),
-            "three Primitive turns of the same Animation are one loop, and the \
-             idle it interrupted was already that Animation"
+            &clock[..18],
+            (1..=18)
+                .map(|tick| tick * 100)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            "three Primitive turns of the same Animation are one loop"
+        );
+        assert_eq!(
+            clock[18], 100,
+            "once the Behavior ends, the next idle loop starts its own clock"
         );
     }
 
@@ -3111,7 +4237,9 @@ mod tests {
         ] {
             // Replay the day only as far as the first tick in this State, so
             // the Grab lands on a sprite that is genuinely in it.
-            let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+            let mut engine = Engine::new(Point { x: 100.0, y: 0.0 })
+                .with_sleep_after_s((1, 1))
+                .with_sleep_for_s((600, 600));
             assert!(
                 day.iter().any(|s| engine.tick(s).state == state),
                 "{state:?} is never reached, so the Grab is untested from it"
@@ -3135,18 +4263,18 @@ mod tests {
         }
     }
 
-    /// Summon opens the chat surface and Menu opens the tray's menu; neither
-    /// moves the sprite. They are still the user reaching for it, so a sleeping
-    /// one wakes, and the Director hears it.
+    /// Summon opens chat and Menu opens the tray. Neither moves the sprite.
+    /// Summon wakes a sleeper. Menu does not. Both address the Director.
     #[test]
-    fn a_summon_or_a_menu_wakes_the_sprite_and_addresses_the_director() {
+    fn a_summon_wakes_a_sleeper_and_a_menu_does_not() {
         for verb in [Verb::Summon, Verb::Menu] {
             let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
             let resting = settle(&mut engine, &snapshot(100));
             assert_eq!(resting.state, State::Grounded);
+            engine.set_sleep_after_s((1, 1));
+            engine.set_sleep_for_s((600, 600));
 
-            // A full minute of nobody touching it.
-            assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+            assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
             let addressed = engine.tick(&WorldSnapshot {
                 cursor: Point { x: 900.0, y: 700.0 },
@@ -3154,7 +4282,8 @@ mod tests {
                 ..snapshot(100)
             });
 
-            assert_eq!(addressed.state, State::Grounded, "awake, after {verb:?}");
+            let awake = verb == Verb::Summon;
+            assert_eq!(addressed.state == State::Grounded, awake, "after {verb:?}");
             assert_eq!(
                 addressed.position, resting.position,
                 "{verb:?} does not walk the sprite to the cursor"
@@ -3233,7 +4362,7 @@ mod tests {
 
     /// `Verb::Grab` is present on every tick the sprite is held, so a cue
     /// keyed on the verb would sound sixty times a second for as long as the
-    /// drag lasts. The pickup cue keys on entering `Dragged`.
+    /// drag lasts. The pickup cue is the pick-up edge, once.
     #[test]
     fn the_pickup_cue_fires_on_the_transition_and_not_every_held_tick() {
         let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
@@ -3255,6 +4384,64 @@ mod tests {
             carried.iter().all(Option::is_none),
             "held, and cued once: {carried:?}"
         );
+    }
+
+    /// A possession edge on the tick of a pickup waits for the next free tick
+    /// rather than take the pickup's place.
+    #[test]
+    fn a_possession_edge_yields_the_tick_to_a_hand_cue() {
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let world = snapshot(100);
+        settle(&mut engine, &world);
+
+        engine.set_possessed(true);
+        let press = WorldSnapshot {
+            cursor: engine.feet(),
+            verbs: vec![Verb::Grab],
+            ..world
+        };
+        let cues: Vec<Option<Cue>> = (0..3).map(|_| engine.tick(&press).cue).collect();
+        assert_eq!(cues, vec![Some(Cue::Pickup), Some(Cue::Possess), None]);
+    }
+
+    /// Pickup is the edge `on_verbs` reports for the grab that takes hold.
+    /// A Grab that continues is not an edge. Letting go is, and the drop
+    /// sounds on landing rather than on that edge's own tick.
+    #[test]
+    fn the_pickup_and_release_cues_read_the_dragged_edge() {
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let world = snapshot(100);
+        settle(&mut engine, &world);
+
+        let press = WorldSnapshot {
+            cursor: engine.feet(),
+            verbs: vec![Verb::Grab],
+            ..world.clone()
+        };
+        let (_, _, picked_up) = transition::on_verbs(engine.state, &press.verbs, engine.possessed);
+        assert_eq!(picked_up, Some(transition::Edge::PickedUp));
+        assert_eq!(engine.tick(&press).cue, Some(Cue::Pickup));
+
+        let at = Point { x: 200.0, y: 200.0 };
+        let held = WorldSnapshot {
+            cursor: at,
+            verbs: vec![Verb::Grab],
+            ..world.clone()
+        };
+        let (_, _, held_edge) = transition::on_verbs(engine.state, &held.verbs, engine.possessed);
+        assert_eq!(held_edge, None);
+        assert_eq!(engine.tick(&held).cue, None);
+
+        let release = WorldSnapshot {
+            cursor: at,
+            ..world.clone()
+        };
+        let (_, _, let_go) = transition::on_verbs(engine.state, &release.verbs, engine.possessed);
+        assert_eq!(let_go, Some(transition::Edge::LetGo));
+        assert_eq!(engine.tick(&release).cue, None, "silent until it lands");
+
+        let landed: Vec<Cue> = (0..60).filter_map(|_| engine.tick(&world).cue).collect();
+        assert_eq!(landed, vec![Cue::Drop]);
     }
 
     /// Release from `at` with `verbs`, then tick until the sprite rests.
@@ -3422,6 +4609,25 @@ mod tests {
         assert_eq!(cues, vec![Cue::Drop], "startup fall plays Drop");
     }
 
+    /// The Shell holds a launch fall by giving the Engine no time. That must
+    /// leave the spawn pose where it is, and the fall must still play its Drop.
+    #[test]
+    fn a_tick_with_no_time_holds_a_startup_fall_at_its_spawn_point() {
+        let spawn = Point { x: 300.0, y: 200.0 };
+        let mut engine = Engine::new(spawn);
+        for _ in 0..30 {
+            let frame = engine.tick(&snapshot(0));
+            assert_eq!(frame.position, spawn, "no time, no motion");
+            assert_eq!(frame.state, State::Falling, "still about to drop");
+            assert_eq!(frame.cue, None, "nothing plays yet");
+            assert_eq!(frame.animation_ms, 0, "the pose does not advance");
+        }
+        let cues: Vec<Cue> = (0..200)
+            .filter_map(|_| engine.tick(&snapshot(100)).cue)
+            .collect();
+        assert_eq!(cues, vec![Cue::Drop], "the held fall still lands with Drop");
+    }
+
     #[test]
     fn wall_ripple_on_negative_origin_display_left_wall() {
         let display = Rect {
@@ -3544,175 +4750,6 @@ mod tests {
                 normal: Point { x: 1.0, y: 0.0 },
             }],
             "ripple centered in work area (y=30+770/2=415), not full display (y=0+800/2=400)"
-        );
-    }
-
-    /// The ripple centers vertically on the work area: the Dock beside it does
-    /// not occlude that height.
-    #[test]
-    fn dock_side_catch_positions_ripple_at_dock_not_display_edge() {
-        let mut engine = Engine::new(Point { x: 700.0, y: 0.0 });
-
-        let work_area_with_menu_bar = Rect {
-            x: 0.0,
-            y: 30.0,
-            width: 1000.0,
-            height: 770.0,
-        };
-        let world = WorldSnapshot {
-            displays: vec![work_area_with_menu_bar],
-            windows: vec![window(DOCK_PERCH_ID, dock())],
-            elapsed_ms: 100,
-            ..WorldSnapshot::default()
-        };
-
-        settle(&mut engine, &world);
-        let at = Point { x: 700.0, y: 760.0 };
-        carry(&mut engine, at, &world);
-        let frame = engine.tick(&WorldSnapshot {
-            cursor: at,
-            verbs: vec![Verb::Throw {
-                velocity: Point { x: -400.0, y: 0.0 },
-            }],
-            ..world.clone()
-        });
-
-        let dock = dock();
-        assert_eq!(
-            frame.contact,
-            Some(RippleContact {
-                point: Point {
-                    x: dock.x + dock.width + EDGE_CLEARANCE,
-                    y: 415.0,
-                },
-                normal: Point { x: 1.0, y: 0.0 },
-            }),
-            "ripple at the Dock's right side, not the display edge, centred in the work area: (30 + 770) / 2 = 415, not 400"
-        );
-    }
-
-    /// At dock.x ± EDGE_CLEARANCE in mid-air, falling without wall contact,
-    /// the sprite reports no Dock-side ripple. Only a wall contact does.
-    #[test]
-    fn sprite_at_dock_side_without_contact_reports_no_dock_ripple() {
-        let mut engine = Engine::new(Point { x: 700.0, y: 0.0 });
-        let world = WorldSnapshot {
-            displays: vec![one_display()],
-            windows: vec![window(DOCK_PERCH_ID, dock())],
-            elapsed_ms: 100,
-            ..WorldSnapshot::default()
-        };
-
-        settle(&mut engine, &world);
-        let dock = dock();
-        let dock_right_side = dock.x + dock.width + EDGE_CLEARANCE;
-
-        carry(
-            &mut engine,
-            Point {
-                x: dock_right_side,
-                y: 200.0,
-            },
-            &world,
-        );
-
-        let mut frame = engine.tick(&WorldSnapshot {
-            cursor: Point {
-                x: dock_right_side,
-                y: 200.0,
-            },
-            verbs: vec![],
-            ..world.clone()
-        });
-
-        for _ in 0..200 {
-            if frame.state != State::Falling {
-                break;
-            }
-            if frame.contact.is_some() {
-                panic!(
-                    "No Dock ripple expected during fall at dock_right_side without wall contact, but got one at state {:?}",
-                    frame.state
-                );
-            }
-            frame = engine.tick(&world);
-        }
-
-        assert!(
-            [State::Grounded, State::Perched].contains(&frame.state),
-            "sprite eventually lands"
-        );
-    }
-
-    #[test]
-    fn dock_left_side_catch_positions_ripple_at_dock() {
-        let mut engine = Engine::new(Point { x: 300.0, y: 0.0 });
-
-        let world = WorldSnapshot {
-            displays: vec![one_display()],
-            windows: vec![window(DOCK_PERCH_ID, dock())],
-            elapsed_ms: 100,
-            ..WorldSnapshot::default()
-        };
-
-        settle(&mut engine, &world);
-        let at = Point { x: 300.0, y: 760.0 };
-        carry(&mut engine, at, &world);
-        let frame = engine.tick(&WorldSnapshot {
-            cursor: at,
-            verbs: vec![Verb::Throw {
-                velocity: Point { x: 400.0, y: 0.0 },
-            }],
-            ..world.clone()
-        });
-
-        let dock = dock();
-        assert_eq!(
-            frame.contact,
-            Some(RippleContact {
-                point: Point {
-                    x: dock.x - EDGE_CLEARANCE,
-                    y: 400.0,
-                },
-                normal: Point { x: -1.0, y: 0.0 },
-            }),
-            "ripple at the Dock's left side, not the display edge, facing left"
-        );
-    }
-
-    #[test]
-    fn dock_right_side_catch_positions_ripple_at_contact_x() {
-        let mut engine = Engine::new(Point { x: 700.0, y: 0.0 });
-
-        let world = WorldSnapshot {
-            displays: vec![one_display()],
-            windows: vec![window(DOCK_PERCH_ID, dock())],
-            elapsed_ms: 100,
-            ..WorldSnapshot::default()
-        };
-
-        settle(&mut engine, &world);
-        let at = Point { x: 700.0, y: 760.0 };
-        carry(&mut engine, at, &world);
-        let frame = engine.tick(&WorldSnapshot {
-            cursor: at,
-            verbs: vec![Verb::Throw {
-                velocity: Point { x: -400.0, y: 0.0 },
-            }],
-            ..world.clone()
-        });
-
-        let dock = dock();
-        assert_eq!(
-            frame.contact,
-            Some(RippleContact {
-                point: Point {
-                    x: dock.x + dock.width + EDGE_CLEARANCE,
-                    y: 400.0,
-                },
-                normal: Point { x: 1.0, y: 0.0 },
-            }),
-            "ripple at the Dock's right side contact x, facing right"
         );
     }
 
@@ -4237,6 +5274,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "jump".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..a_long_perch()
         });
@@ -4295,7 +5334,7 @@ mod tests {
     fn a_menu_during_a_chase_aborts_the_chase() {
         let mut engine = a_character_at(Point { x: 200.0, y: 0.0 });
         settle(&mut engine, &a_long_perch());
-        engine.play(&[Primitive::Chase]);
+        engine.play(&[Primitive::Chase], AnimationSource::LocalDirector);
 
         let chasing = engine.tick(&WorldSnapshot {
             cursor: Point {
@@ -4348,10 +5387,12 @@ mod tests {
         };
         let mut engine = Engine::new(Point { x: 500.0, y: 0.0 });
         assert_eq!(settle(&mut engine, &resting).state, State::Perched);
+        engine.set_sleep_after_s((1, 1));
+        engine.set_sleep_for_s((600, 600));
         assert_eq!(
             engine
                 .tick(&WorldSnapshot {
-                    elapsed_ms: 60_000,
+                    elapsed_ms: 1_000,
                     ..resting
                 })
                 .state,
@@ -4393,6 +5434,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "settle".to_string(),
                 dialogue: Some("off we go".to_string()),
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..held.clone()
         });
@@ -4408,7 +5451,7 @@ mod tests {
             "it hangs from the cursor rather than sitting down in mid-air"
         );
         assert_eq!(
-            proposed.dialogue.as_deref(),
+            proposed.dialogue.as_ref().map(|line| line.text.as_str()),
             Some("off we go"),
             "it may still speak, which moves nothing"
         );
@@ -4698,7 +5741,7 @@ mod tests {
         );
 
         let bubble = WorldSnapshot {
-            locomotion_frozen: true,
+            speaking_for: Some(AnimationSource::AiRequested),
             ..snapshot(100)
         };
         let held: Vec<Frame> = (0..10).map(|_| engine.tick(&bubble)).collect();
@@ -4742,7 +5785,7 @@ mod tests {
 
         for held in [
             WorldSnapshot {
-                locomotion_frozen: true,
+                speaking_for: Some(AnimationSource::AiRequested),
                 ..snapshot(100)
             },
             WorldSnapshot {
@@ -4771,9 +5814,9 @@ mod tests {
     fn a_sprite_left_alone_falls_asleep_and_a_poke_wakes_it() {
         let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
         assert_eq!(settle(&mut engine, &snapshot(100)).state, State::Grounded);
+        engine.set_sleep_after_s((1, 1));
 
-        // A full minute of nobody touching it.
-        let asleep = engine.tick(&snapshot(60_000));
+        let asleep = engine.tick(&snapshot(1_000));
         assert_eq!(asleep.state, State::Asleep);
 
         let woken = engine.tick(&WorldSnapshot {
@@ -4902,7 +5945,44 @@ mod tests {
         Some(BehaviorProposal {
             behavior: "walk".to_string(),
             dialogue: None,
+            direction: None,
+            source: AnimationSource::LocalDirector,
         })
+    }
+
+    /// A walk the caller aims. The heading is set before the first step, so
+    /// the ask wins over whichever way the sprite last faced.
+    #[test]
+    fn a_proposed_walk_goes_the_way_it_was_asked_not_the_way_it_faced() {
+        let mut engine = a_resting_sprite();
+        engine.facing = 1.0;
+        engine.tick(&WorldSnapshot {
+            proposal: Some(BehaviorProposal {
+                behavior: "walk".to_string(),
+                dialogue: None,
+                direction: Some(Direction::Left),
+                source: AnimationSource::LocalDirector,
+            }),
+            ..snapshot(100)
+        });
+        let left = engine.tick(&snapshot(100));
+        assert!(left.position.x < 100.0, "asked to walk left: {left:?}");
+        assert_eq!(left.velocity.x, -WALK_SPEED);
+
+        let mut engine = a_resting_sprite();
+        engine.facing = -1.0;
+        engine.tick(&WorldSnapshot {
+            proposal: Some(BehaviorProposal {
+                behavior: "walk".to_string(),
+                dialogue: None,
+                direction: Some(Direction::Right),
+                source: AnimationSource::LocalDirector,
+            }),
+            ..snapshot(100)
+        });
+        let right = engine.tick(&snapshot(100));
+        assert!(right.position.x > 100.0, "asked to walk right: {right:?}");
+        assert_eq!(right.velocity.x, WALK_SPEED);
     }
 
     /// The art has one heading, so the renderer mirrors it by `facing`. Only
@@ -4956,9 +6036,12 @@ mod tests {
                 "amble".to_string(),
                 Behavior {
                     primitives: vec![Primitive::React, Primitive::Walk],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
             (
@@ -4968,9 +6051,12 @@ mod tests {
                 "walk".to_string(),
                 Behavior {
                     primitives: vec![Primitive::Sit],
+                    animation: None,
                     then: None,
                     weight: DEFAULT_WEIGHT,
                     trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
                 },
             ),
         ]));
@@ -4980,6 +6066,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "amble".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..a_long_perch()
         });
@@ -5015,14 +6103,16 @@ mod tests {
     /// standing on the floor whether it is in mid-air.
     #[test]
     fn a_proposal_is_gated_on_the_state_the_tick_ends_in() {
-        let mut engine = a_resting_sprite();
-        assert_eq!(engine.tick(&snapshot(60_000)).state, State::Asleep);
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        assert_eq!(engine.tick(&snapshot(1_000)).state, State::Asleep);
 
         let woken = engine.tick(&WorldSnapshot {
             verbs: vec![Verb::Summon],
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
@@ -5124,6 +6214,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..a_long_perch()
         });
@@ -5395,7 +6487,7 @@ mod tests {
         let mut halted = started;
         for _ in 0..halt_ticks {
             halted = engine.tick(&WorldSnapshot {
-                locomotion_frozen: true,
+                speaking_for: Some(AnimationSource::AiRequested),
                 ..a_long_perch()
             });
         }
@@ -5413,7 +6505,7 @@ mod tests {
         );
 
         let refused = engine.tick(&WorldSnapshot {
-            locomotion_frozen: true,
+            speaking_for: Some(AnimationSource::AiRequested),
             proposal: walk(),
             ..a_long_perch()
         });
@@ -5496,14 +6588,16 @@ mod tests {
     fn a_walking_sprite_does_not_nod_off_mid_stride() {
         let mut engine = a_character_at(Point { x: 200.0, y: 0.0 });
         settle(&mut engine, &a_long_perch());
+        engine.set_sleep_after_s((3, 3));
 
         // Poked, then left alone until it is one tick short of nodding off.
+        // The wait also outlasts the post-poke cooldown, so the walk may start.
         engine.tick(&WorldSnapshot {
             verbs: vec![Verb::Poke],
             ..a_long_perch()
         });
         let nearly_asleep = engine.tick(&WorldSnapshot {
-            elapsed_ms: SLEEP_AFTER_MS - 100,
+            elapsed_ms: 2_900,
             ..a_long_perch()
         });
         assert_eq!(nearly_asleep.state, State::Perched, "not asleep yet");
@@ -5879,6 +6973,379 @@ mod tests {
         assert_eq!(idling_again.animation, "idle", "idle after rest again");
     }
 
+    /// Ticks through the rest of `groom`'s one `grooming` pass (6 frames at
+    /// 6 fps), then asserts `behavior` starts on `primitive`, drawn as `drawn`, the
+    /// tick it ends.
+    fn groom_pass_then(
+        engine: &mut Engine,
+        mut ms: u32,
+        behavior: &str,
+        primitive: Primitive,
+        drawn: &str,
+        proposed: bool,
+    ) {
+        loop {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_gesture.is_some() {
+                ms += 100;
+                assert_eq!(frame.playing_gesture.as_deref(), Some("grooming"));
+                assert_eq!(frame.playing_behavior.as_deref(), Some("groom"));
+                assert_eq!(frame.playing_primitive, None);
+                assert_eq!(frame.art_name(), "grooming");
+                assert_eq!(frame.animation_ms, ms, "one unbroken pass: {frame:?}");
+                assert!(ms < 1_000, "the pass ends at 1000 ms: {frame:?}");
+                continue;
+            }
+            assert_eq!(ms, 900, "the whole pass played first: {frame:?}");
+            assert_eq!(frame.playing_behavior.as_deref(), Some(behavior));
+            assert_eq!(frame.behavior.as_deref(), proposed.then_some(behavior));
+            assert_eq!(frame.playing_primitive, Some(primitive));
+            assert_eq!(frame.art_name(), drawn, "{frame:?}");
+            assert_eq!(frame.animation_ms, 0, "{frame:?}");
+            return;
+        }
+    }
+
+    /// A Director proposal waits out a Behavior animation mid-pass and starts when
+    /// the pass ends — the same deferred slot own-idle gestures use. A poke
+    /// cancels the hold; asleep refuses; a later proposal replaces the slot.
+    #[test]
+    fn director_proposal_defers_during_behavior_animation_mid_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let animation_behaviors = || {
+            let mut behaviors = BTreeMap::new();
+            behaviors.insert(
+                "groom".to_string(),
+                Behavior {
+                    primitives: vec![],
+                    animation: Some("grooming".to_string()),
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors.insert(
+                "greet".to_string(),
+                Behavior {
+                    primitives: vec![Primitive::React],
+                    animation: None,
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors.insert(
+                "wave".to_string(),
+                Behavior {
+                    primitives: vec![Primitive::Talk],
+                    animation: None,
+                    then: None,
+                    weight: DEFAULT_WEIGHT,
+                    trigger: None,
+                    not_in_manifest: false,
+                    idle_type: false,
+                },
+            );
+            behaviors
+        };
+        let plan = IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            digits: Vec::new(),
+            react: None,
+            possessed: None,
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        };
+
+        // Mid-pass proposal is held, then greet actually starts and draws.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        let started = engine.tick(&proposing("groom"));
+        assert_eq!(
+            started.playing_gesture.as_deref(),
+            Some("grooming"),
+            "{started:?}"
+        );
+        let mid = engine.tick(&proposing("greet"));
+        assert_eq!(
+            mid.playing_gesture.as_deref(),
+            Some("grooming"),
+            "animation continues: {mid:?}"
+        );
+        assert_ne!(
+            mid.playing_behavior.as_deref(),
+            Some("greet"),
+            "greet not yet: {mid:?}"
+        );
+        // One pass of 6 frames at 6 fps is 1000 ms; greet starts on the tick it ends.
+        groom_pass_then(
+            &mut engine,
+            mid.animation_ms,
+            "greet",
+            Primitive::React,
+            "react",
+            true,
+        );
+
+        // One-slot: a later mid-pass proposal replaces the held one.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        engine.tick(&proposing("groom"));
+        engine.tick(&proposing("greet"));
+        let latest = engine.tick(&proposing("wave"));
+        groom_pass_then(
+            &mut engine,
+            latest.animation_ms,
+            "wave",
+            Primitive::Talk,
+            "talk",
+            true,
+        );
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            assert_ne!(
+                frame.playing_behavior.as_deref(),
+                Some("greet"),
+                "replaced greet must not start after wave won: {frame:?}"
+            );
+        }
+
+        // User poke cancels the held proposal and wins the screen.
+        let mut engine = a_resting_sprite().with_behaviors(animation_behaviors());
+        engine.set_idle_plan(plan.clone());
+        engine.tick(&proposing("groom"));
+        engine.tick(&proposing("greet"));
+        let poked = engine.tick(&WorldSnapshot {
+            verbs: vec![Verb::Poke],
+            ..snapshot(100)
+        });
+        assert_eq!(
+            poked.animation, "react",
+            "poke cuts the animation: {poked:?}"
+        );
+        let mut saw_greet_after_poke = false;
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_behavior.as_deref() == Some("greet")
+                || frame.behavior.as_deref() == Some("greet")
+            {
+                saw_greet_after_poke = true;
+                break;
+            }
+        }
+        assert!(
+            !saw_greet_after_poke,
+            "poke must cancel the held greet proposal"
+        );
+
+        // Asleep refuses rather than deferring into a later wake.
+        let mut engine = a_resting_sprite()
+            .with_behaviors(animation_behaviors())
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((30, 30));
+        engine.set_idle_plan(IdlePlan {
+            sleep_after_s: (1, 1),
+            sleep_for_s: (30, 30),
+            ..plan.clone()
+        });
+        settle(&mut engine, &snapshot(100));
+        let asleep = engine.tick(&WorldSnapshot {
+            elapsed_ms: 1_000,
+            ..snapshot(100)
+        });
+        assert_eq!(asleep.state, State::Asleep, "asleep first: {asleep:?}");
+        let refused = engine.tick(&proposing("greet"));
+        assert_eq!(
+            refused.refused.as_deref(),
+            Some("greet"),
+            "asleep refuses greet: {refused:?}"
+        );
+        assert_ne!(refused.animation, "react", "greet must not start asleep");
+    }
+
+    /// A Primitive Behavior continues into a Behavior playing an Animation
+    /// after its Primitives finish (shipped cat prowl → groom).
+    #[test]
+    fn primitive_then_animation_starts_the_animation_after_the_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let mut behaviors = BTreeMap::new();
+        behaviors.insert(
+            "prowl".to_string(),
+            Behavior {
+                primitives: vec![Primitive::Walk],
+                animation: None,
+                then: Some("groom".to_string()),
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        behaviors.insert(
+            "groom".to_string(),
+            Behavior {
+                primitives: vec![],
+                animation: Some("grooming".to_string()),
+                then: None,
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        let mut engine = a_resting_sprite().with_behaviors(behaviors);
+        engine.set_idle_plan(IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            digits: Vec::new(),
+            react: None,
+            possessed: None,
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        });
+        let started = engine.tick(&proposing("prowl"));
+        assert_eq!(
+            started.playing_behavior.as_deref(),
+            Some("prowl"),
+            "{started:?}"
+        );
+        // Walk is PRIMITIVE_MS (600). Drain it and the following ticks.
+        let mut saw_groom = false;
+        for _ in 0..20 {
+            let frame = engine.tick(&snapshot(100));
+            if frame.playing_gesture.as_deref() == Some("grooming")
+                || frame.playing_behavior.as_deref() == Some("groom")
+            {
+                saw_groom = true;
+                break;
+            }
+        }
+        assert!(
+            saw_groom,
+            "prowl then=groom must start the grooming animation"
+        );
+    }
+
+    /// A Behavior playing an Animation continues into Primitives after one pass.
+    #[test]
+    fn animation_then_primitive_starts_after_the_animation_pass() {
+        use crate::character::{Behavior, IdleMember, IdlePlan, DEFAULT_WEIGHT};
+        let mut behaviors = BTreeMap::new();
+        behaviors.insert(
+            "groom".to_string(),
+            Behavior {
+                primitives: vec![],
+                animation: Some("grooming".to_string()),
+                then: Some("greet".to_string()),
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        behaviors.insert(
+            "greet".to_string(),
+            Behavior {
+                primitives: vec![Primitive::React],
+                animation: None,
+                then: None,
+                weight: DEFAULT_WEIGHT,
+                trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
+            },
+        );
+        let mut engine = a_resting_sprite().with_behaviors(behaviors);
+        engine.set_idle_plan(IdlePlan {
+            loops: vec![IdleMember {
+                name: "idle".into(),
+                weight: 1,
+                frames: 1,
+                fps: 1,
+            }],
+            gestures: vec![IdleMember {
+                name: "grooming".into(),
+                weight: 1,
+                frames: 6,
+                fps: 6,
+            }],
+            digits: Vec::new(),
+            react: None,
+            possessed: None,
+            idle_gesture_every_s: (10, 30),
+            sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+            sleep_for_s: DEFAULT_SLEEP_FOR_S,
+        });
+        let started = engine.tick(&proposing("groom"));
+        assert_eq!(
+            started.playing_gesture.as_deref(),
+            Some("grooming"),
+            "{started:?}"
+        );
+        // A `then` start is not a proposal, so the frame reports no new Behavior.
+        groom_pass_then(
+            &mut engine,
+            started.animation_ms,
+            "greet",
+            Primitive::React,
+            "react",
+            false,
+        );
+    }
+
+    /// A moving perch under an asleep sprite does not wake it. Sleep
+    /// countdown keeps running; window motion is not a user interaction.
+    #[test]
+    fn asleep_sprite_stays_asleep_while_its_perch_moves() {
+        let mut engine = a_resting_sprite()
+            .with_sleep_after_s((1, 1))
+            .with_sleep_for_s((30, 30));
+        settle(&mut engine, &perch(50.0, 400.0));
+        let asleep = engine.tick(&WorldSnapshot {
+            elapsed_ms: 1_000,
+            ..perch(50.0, 400.0)
+        });
+        assert_eq!(asleep.state, State::Asleep, "asleep first: {asleep:?}");
+        let riding = engine.tick(&WorldSnapshot {
+            elapsed_ms: 100,
+            poll_generation: 1,
+            ..perch(90.0, 400.0)
+        });
+        assert_eq!(
+            riding.state,
+            State::Asleep,
+            "window motion must not wake: {riding:?}"
+        );
+        assert_ne!(riding.animation, "hold", "no Hold over sleep: {riding:?}");
+    }
+
     /// The timer resets when riding a moving Perch, so a sprite that
     /// lands from a ride shows sit first.
     #[test]
@@ -5966,7 +7433,7 @@ mod tests {
     /// and sleeps later.
     #[test]
     fn a_perched_sprite_idles_then_sleeps_if_left_alone() {
-        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 });
+        let mut engine = Engine::new(Point { x: 100.0, y: 0.0 }).with_sleep_after_s((10, 10));
         settle(&mut engine, &perch(50.0, 400.0));
 
         let idling = engine.tick(&WorldSnapshot {
@@ -5977,7 +7444,7 @@ mod tests {
         assert_eq!(idling.animation, "idle", "idle before sleep");
 
         let asleep = engine.tick(&WorldSnapshot {
-            elapsed_ms: SLEEP_AFTER_MS,
+            elapsed_ms: 10_000,
             ..perch(50.0, 400.0)
         });
         assert_eq!(asleep.state, State::Asleep, "then sleep");
@@ -7870,12 +9337,14 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: Some("hello there".to_string()),
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
 
         assert_eq!(
-            frame.dialogue,
+            frame.dialogue.map(|line| line.text),
             Some("hello there".to_string()),
             "Engine passes dialogue through; DND blocking happens at Director level"
         );
@@ -7884,7 +9353,7 @@ mod tests {
 
     #[test]
     fn idle_behaviors_do_not_start_and_the_buddy_settles_to_sleep() {
-        let mut engine = a_resting_sprite();
+        let mut engine = a_resting_sprite().with_sleep_after_s((5, 5));
         engine.set_do_not_disturb(true);
 
         let quietening: Vec<Frame> = (0..20)
@@ -7893,6 +9362,8 @@ mod tests {
                     proposal: Some(BehaviorProposal {
                         behavior: "greet".to_string(),
                         dialogue: None,
+                        direction: None,
+                        source: AnimationSource::LocalDirector,
                     }),
                     ..snapshot(100)
                 })
@@ -8189,6 +9660,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: String::new(),
                 dialogue: Some("hello there".to_string()),
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
@@ -8197,7 +9670,10 @@ mod tests {
             spoken.animation, "talk",
             "dialogue with no Behavior plays talk"
         );
-        assert_eq!(spoken.dialogue.as_deref(), Some("hello there"));
+        assert_eq!(
+            spoken.dialogue.as_ref().map(|line| line.text.as_str()),
+            Some("hello there")
+        );
 
         let playing: Vec<&'static str> = (0..10)
             .map(|_| engine.tick(&snapshot(100)).animation)
@@ -8219,6 +9695,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: Some("hi".to_string()),
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
@@ -8227,7 +9705,10 @@ mod tests {
             spoken.animation, "react",
             "greet plays its own animation, not talk"
         );
-        assert_eq!(spoken.dialogue.as_deref(), Some("hi"));
+        assert_eq!(
+            spoken.dialogue.as_ref().map(|line| line.text.as_str()),
+            Some("hi")
+        );
         assert_eq!(spoken.behavior, Some("greet".to_string()));
     }
 
@@ -8239,6 +9720,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "greet".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             ..snapshot(100)
         });
@@ -8430,11 +9913,11 @@ mod tests {
 
         // Start chase with cursor close by (just outside arrival threshold), so
         // the first tick is pursuit and not a swat.
-        engine.play(&[Primitive::Chase]);
+        engine.play(&[Primitive::Chase], AnimationSource::LocalDirector);
 
         let chasing = engine.tick(&WorldSnapshot {
             cursor: Point {
-                x: sprite_x + CHASE_ARRIVAL_THRESHOLD + 10.0,
+                x: sprite_x + ARRIVAL_THRESHOLD + 10.0,
                 y: engine.position.y,
             },
             ..snapshot(100)
@@ -8464,11 +9947,38 @@ mod tests {
     }
 
     #[test]
+    fn a_move_ends_the_chase_it_interrupts() {
+        let mut engine = a_resting_sprite();
+        let sprite_x = engine.position.x;
+        engine.play(&[Primitive::Chase], AnimationSource::LocalDirector);
+        engine.tick(&WorldSnapshot {
+            cursor: Point {
+                x: sprite_x + 300.0,
+                y: engine.position.y,
+            },
+            ..snapshot(100)
+        });
+
+        let heading = Extent::Distance(Distance::new(200.0).unwrap());
+        engine
+            .start_move(
+                MoveRequest::Along {
+                    heading: Direction::Left,
+                    extent: heading,
+                },
+                AnimationSource::AiMcp,
+            )
+            .expect("a grounded sprite takes a move");
+
+        assert!(engine.playing.is_empty(), "{:?}", engine.playing);
+    }
+
+    #[test]
     fn chase_times_out_if_cursor_escapes() {
         let mut engine = a_resting_sprite();
         let sprite_x = engine.position.x;
 
-        engine.play(&[Primitive::Chase]);
+        engine.play(&[Primitive::Chase], AnimationSource::LocalDirector);
 
         // Chase a cursor that keeps escaping (moving away).
         let mut cursor_x = sprite_x + 300.0;
@@ -8495,7 +10005,7 @@ mod tests {
     #[test]
     fn chase_aborts_on_any_verb() {
         let mut engine = a_resting_sprite();
-        engine.play(&[Primitive::Chase]);
+        engine.play(&[Primitive::Chase], AnimationSource::LocalDirector);
 
         let poked = engine.tick(&WorldSnapshot {
             verbs: vec![Verb::Poke],
@@ -8525,6 +10035,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "chase-test".to_string(),
                 dialogue: None,
+                direction: None,
+                source: AnimationSource::LocalDirector,
             }),
             cursor: Point {
                 x: engine.position.x + 200.0,
@@ -8661,6 +10173,29 @@ mod tests {
         );
     }
 
+    /// Driving the sprite under a resting cursor is not a dwell.
+    #[test]
+    fn a_possessed_sprite_under_a_resting_cursor_does_not_address() {
+        let mut engine = a_resting_sprite();
+        let on_sprite = WorldSnapshot {
+            cursor: Point {
+                x: engine.position.x,
+                y: engine.position.y,
+            },
+            elapsed_ms: DWELL_MS + 1,
+            ..snapshot(16)
+        };
+        engine.set_possessed(true);
+        for _ in 0..2 {
+            let possessed = engine.tick(&on_sprite);
+            assert!(!possessed.addressed, "a possessed dwell stays quiet");
+        }
+
+        engine.set_possessed(false);
+        let released = engine.tick(&on_sprite);
+        assert!(released.addressed, "the same dwell addresses once released");
+    }
+
     #[test]
     fn passing_cursor_does_not_address() {
         let mut engine = a_resting_sprite();
@@ -8786,8 +10321,8 @@ mod tests {
     /// The Frame reports the refusal instead of dropping it.
     #[test]
     fn a_jump_is_refused_while_asleep_and_says_it_was() {
-        let mut engine = a_resting_sprite();
-        let asleep = engine.tick(&snapshot(SLEEP_AFTER_MS));
+        let mut engine = a_resting_sprite().with_sleep_after_s((1, 1));
+        let asleep = engine.tick(&snapshot(1_000));
         assert_eq!(asleep.state, State::Asleep, "asleep to begin with");
         let resting_at = engine.position;
 
@@ -9217,5 +10752,1440 @@ mod tests {
         assert_eq!(frame.velocity, Point::default());
         let again = engine.tick(&world);
         assert_eq!(again.position, there, "the next tick does not hop");
+    }
+
+    mod source;
+
+    /// A possessed sprite and the keys the Shell feeds it.
+    mod possession {
+        use super::*;
+        use crate::possession::{Charge, Intent, Key, Possession, Walk};
+
+        const FRAME_MS: u32 = 16;
+
+        /// The charge a Space held for `held_ms` releases with.
+        fn released_after(held_ms: u32) -> Charge {
+            let mut keys = Possession::default();
+            keys.key(Key::Space, true);
+            keys.tick(held_ms);
+            keys.key(Key::Space, false);
+            keys.tick(FRAME_MS).launch.expect("a keyup launches")
+        }
+
+        fn holding(walk: Walk) -> Intent {
+            Intent {
+                walk: Some(walk),
+                ..Intent::default()
+            }
+        }
+
+        fn launching(charge: Charge) -> Intent {
+            Intent {
+                launch: Some(charge),
+                ..Intent::default()
+            }
+        }
+
+        fn playing(digit: u8) -> Intent {
+            Intent {
+                play: Some(digit),
+                ..Intent::default()
+            }
+        }
+
+        fn on(display: Rect) -> WorldSnapshot {
+            WorldSnapshot {
+                displays: vec![display],
+                elapsed_ms: FRAME_MS,
+                ..WorldSnapshot::default()
+            }
+        }
+
+        fn with_possession(intent: Intent, world: &WorldSnapshot) -> WorldSnapshot {
+            WorldSnapshot {
+                possession: intent,
+                ..world.clone()
+            }
+        }
+
+        /// Standing at `x` on `world`'s floor, its landing played out.
+        fn resting_at(x: f64, world: &WorldSnapshot) -> Engine {
+            let mut engine = a_character_at(Point { x, y: 0.0 });
+            settle(
+                &mut engine,
+                &WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                },
+            );
+            engine
+        }
+
+        fn possessed_at(x: f64, world: &WorldSnapshot) -> Engine {
+            let mut engine = resting_at(x, world);
+            engine.set_possessed(true);
+            engine
+        }
+
+        /// Ticks with nothing held until the sprite stands again, and the
+        /// frames on the way, the landing last.
+        fn flight(engine: &mut Engine, world: &WorldSnapshot) -> Vec<Frame> {
+            let mut frames = Vec::new();
+            for _ in 0..400 {
+                let frame = engine.tick(world);
+                let landed = matches!(frame.state, State::Grounded | State::Perched);
+                frames.push(frame);
+                if landed {
+                    return frames;
+                }
+            }
+            panic!("the jump never came down: {:?}", frames.last());
+        }
+
+        fn peak(frames: &[Frame]) -> f64 {
+            frames
+                .iter()
+                .map(|frame| frame.position.y)
+                .fold(f64::INFINITY, f64::min)
+        }
+
+        #[test]
+        fn a_held_arrow_walks_a_possessed_sprite_and_letting_go_stops_it() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+
+            let walking = engine.tick(&with_possession(holding(Walk::Left), &world));
+            assert_eq!(
+                walking.velocity.x, -180.0,
+                "half again the idle walk: {walking:?}"
+            );
+            assert_eq!(walking.facing, -1.0);
+            assert_eq!(walking.animation, "walk");
+            assert!(walking.position.x < 500.0, "it moved: {walking:?}");
+
+            let stopped = engine.tick(&world);
+            assert_eq!(stopped.velocity.x, 0.0, "{stopped:?}");
+            assert_eq!(stopped.facing, -1.0, "it keeps the heading it walked");
+            let there = stopped.position.x;
+            assert_eq!(engine.tick(&world).position.x, there, "and stays put");
+        }
+
+        /// What the Shell remembers in `recent:` is `Frame::behavior`, so a
+        /// drive that plays none leaves the Behavior history as it was.
+        #[test]
+        fn a_drive_hands_the_director_no_behavior_to_remember() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let mut played = Vec::new();
+            for lap in 0..20 {
+                let walk = [Walk::Left, Walk::Right][lap % 2];
+                for intent in [holding(walk), launching(released_after(0))] {
+                    played.extend(engine.tick(&with_possession(intent, &world)).behavior);
+                }
+                played.extend(
+                    flight(&mut engine, &world)
+                        .into_iter()
+                        .filter_map(|f| f.behavior),
+                );
+            }
+            assert_eq!(played, Vec::<String>::new());
+        }
+
+        #[test]
+        fn possession_moves_nothing_until_the_sprite_is_possessed() {
+            let world = on(one_display());
+            let mut engine = resting_at(500.0, &world);
+            let resting = engine.tick(&world);
+
+            let frame = engine.tick(&with_possession(holding(Walk::Right), &world));
+            assert_eq!(frame.position, resting.position, "{frame:?}");
+            assert_eq!(frame.charge, None);
+        }
+
+        #[test]
+        fn the_frame_carries_the_charge_while_space_is_held() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let mut keys = Possession::default();
+            keys.key(Key::Space, true);
+
+            let charging = engine.tick(&with_possession(keys.tick(250), &world));
+            assert_eq!(charging.charge, Some(0.25), "{charging:?}");
+            assert_eq!(charging.state, State::Grounded, "charging is not jumping");
+
+            keys.key(Key::Space, false);
+            let launched = engine.tick(&with_possession(keys.tick(FRAME_MS), &world));
+            assert_eq!(launched.charge, None, "the bar empties on release");
+        }
+
+        /// A full bar aims at the height of the display under the feet. The
+        /// ceiling still stops them where a climb lets go.
+        #[test]
+        fn a_full_bar_reaches_the_usable_top_of_displays_of_two_heights() {
+            let short = monitor(0.0, 0.0, 1000.0, 800.0);
+            let tall = monitor(0.0, 0.0, 1000.0, 1600.0);
+            let mut launch_speeds = Vec::new();
+            let half_step = GRAVITY * f64::from(FRAME_MS) / 1000.0 / 2.0;
+            let for_height =
+                |height: f64| half_step + (half_step * half_step + 2.0 * GRAVITY * height).sqrt();
+
+            for display in [short, tall] {
+                let world = on(display);
+                let mut engine = possessed_at(500.0, &world);
+                let floor = engine.position.y;
+                let usable_top = ceiling_over(500.0, &world, engine.ceiling_clearance())
+                    .expect("over a display");
+
+                let launched =
+                    engine.tick(&with_possession(launching(released_after(1_000)), &world));
+                launch_speeds.push(-launched.velocity.y);
+                assert!(
+                    (-launched.velocity.y - for_height(display.height)).abs() < 0.01,
+                    "a full bar asks for the display height {}: {launched:?}",
+                    display.height
+                );
+                let frames = flight(&mut engine, &world);
+
+                assert!(
+                    (peak(&frames) - usable_top).abs() < 1.0,
+                    "feet at {} reach the usable top {usable_top} from {floor}",
+                    peak(&frames)
+                );
+            }
+            assert!(
+                launch_speeds[1] > launch_speeds[0],
+                "a taller display launches harder: {launch_speeds:?}"
+            );
+        }
+
+        /// A full bar is the display's height wherever the feet stand, not
+        /// the room left above them: from a window Perch halfway up it
+        /// launches as hard as from the floor, and the ceiling still stops it.
+        #[test]
+        fn a_full_bar_from_a_high_perch_launches_as_hard_as_from_the_floor() {
+            let ledge = window(
+                1,
+                Rect {
+                    x: 300.0,
+                    y: 400.0,
+                    width: 400.0,
+                    height: 200.0,
+                },
+            );
+            let floor = on(one_display());
+            let perch = WorldSnapshot {
+                windows: vec![ledge],
+                ..floor.clone()
+            };
+            // The display is 800 tall. The bar asks for that whole height.
+            let half_step = GRAVITY * f64::from(FRAME_MS) / 1000.0 / 2.0;
+            let full_speed =
+                half_step + (half_step * half_step + 2.0 * GRAVITY * one_display().height).sqrt();
+
+            for (world, feet) in [(&floor, 800.0), (&perch, 400.0)] {
+                let mut engine = possessed_at(500.0, world);
+                assert_eq!(engine.position.y, feet, "standing where expected");
+
+                let launched =
+                    engine.tick(&with_possession(launching(released_after(1_000)), world));
+                assert!(
+                    (-launched.velocity.y - full_speed).abs() < 0.01,
+                    "from {feet}: {launched:?}"
+                );
+                let frames = flight(&mut engine, world);
+                assert!(
+                    (peak(&frames) - 128.0).abs() < 1.0,
+                    "from {feet} the usable top stops it: peak {}",
+                    peak(&frames)
+                );
+            }
+        }
+
+        #[test]
+        fn a_tap_hops_and_a_half_bar_rises_halfway_to_the_full_height() {
+            let world = on(one_display());
+            let height = |held_ms| {
+                let mut engine = possessed_at(500.0, &world);
+                let floor = engine.position.y;
+                engine.tick(&with_possession(launching(released_after(held_ms)), &world));
+                floor - peak(&flight(&mut engine, &world))
+            };
+            let hop = JUMP_SPEED * JUMP_SPEED / (2.0 * GRAVITY);
+            let full = one_display().height;
+
+            assert!((height(0) - hop).abs() < 1.0, "a tap is the hop");
+            assert!(
+                (height(500) - (hop + full) / 2.0).abs() < 1.0,
+                "linear in the bar: half {} between {hop} and {full}",
+                height(500)
+            );
+        }
+
+        /// The jump goes through the one landing path a proposed Jump uses.
+        #[test]
+        fn a_possessed_jump_rises_as_jump_falls_as_fall_and_lands_with_the_drop_cue() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let floor = engine.position.y;
+
+            let launched = engine.tick(&with_possession(launching(released_after(500)), &world));
+            assert_eq!(launched.state, State::Falling, "{launched:?}");
+            assert!(launched.velocity.y < 0.0, "going up: {launched:?}");
+            assert_eq!(launched.animation, "jump");
+            assert_eq!(launched.velocity.x, 0.0, "no arrow, straight up");
+
+            let frames = flight(&mut engine, &world);
+            let (landing, air) = frames.split_last().unwrap();
+            let step = GRAVITY * f64::from(FRAME_MS) / 1000.0;
+            for frame in air {
+                if frame.velocity.y < -step {
+                    assert_eq!(frame.animation, "jump", "rising: {frame:?}");
+                } else if frame.velocity.y > step {
+                    assert_eq!(frame.animation, "fall", "past the apex: {frame:?}");
+                }
+                assert_eq!(frame.cue, None, "no cue in the air: {frame:?}");
+            }
+            assert_eq!(landing.position, Point { x: 500.0, y: floor });
+            assert_eq!(landing.animation, "land", "{landing:?}");
+            assert_eq!(landing.cue, Some(Cue::Drop), "{landing:?}");
+        }
+
+        #[test]
+        fn a_held_arrow_steers_a_jump_and_letting_go_stops_the_drift() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            engine.tick(&with_possession(launching(released_after(1_000)), &world));
+
+            let steered = engine.tick(&with_possession(holding(Walk::Right), &world));
+            assert_eq!(steered.state, State::Falling);
+            assert_eq!(steered.velocity.x, POSSESSED_WALK_SPEED, "{steered:?}");
+            assert_eq!(steered.facing, 1.0);
+
+            let let_go = engine.tick(&world);
+            assert_eq!(let_go.state, State::Falling);
+            assert_eq!(let_go.velocity.x, 0.0, "the drift stops: {let_go:?}");
+            let x = let_go.position.x;
+            let landed = flight(&mut engine, &world);
+            assert_eq!(landed.last().unwrap().position.x, x, "straight down");
+        }
+
+        #[test]
+        fn an_arrow_held_at_launch_jumps_forward() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let launched = engine.tick(&with_possession(
+                Intent {
+                    walk: Some(Walk::Left),
+                    launch: Some(released_after(0)),
+                    ..Intent::default()
+                },
+                &world,
+            ));
+            assert_eq!(launched.velocity.x, -POSSESSED_WALK_SPEED, "{launched:?}");
+            assert!(launched.velocity.y < 0.0, "{launched:?}");
+        }
+
+        /// A jump faces the way the sprite last went: the walk before it, or an
+        /// arrow held mid-flight.
+        #[test]
+        fn a_jump_keeps_the_last_heading_through_the_flight() {
+            let world = on(one_display());
+            for (walk, turn, heading) in [
+                (Walk::Right, Walk::Left, 1.0),
+                (Walk::Left, Walk::Right, -1.0),
+            ] {
+                let mut engine = possessed_at(500.0, &world);
+                for _ in 0..5 {
+                    engine.tick(&with_possession(holding(walk), &world));
+                }
+                engine.tick(&world);
+                engine.tick(&with_possession(launching(released_after(500)), &world));
+                for frame in flight(&mut engine, &world) {
+                    assert_eq!(frame.facing, heading, "walked {walk:?}: {frame:?}");
+                }
+
+                engine.tick(&with_possession(launching(released_after(500)), &world));
+                engine.tick(&with_possession(holding(turn), &world));
+                for frame in flight(&mut engine, &world) {
+                    assert_eq!(frame.facing, -heading, "turned {turn:?}: {frame:?}");
+                }
+            }
+        }
+
+        /// A Grab wins: the keys move nothing in hand, the release falls and
+        /// lands as usual, and the sprite is still possessed after.
+        #[test]
+        fn a_grab_while_possessed_wins_and_the_release_lands_as_usual() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            engine.tick(&with_possession(holding(Walk::Right), &world));
+
+            let feet = engine.feet();
+            let grabbed = engine.tick(&WorldSnapshot {
+                cursor: feet,
+                verbs: vec![Verb::Grab],
+                ..with_possession(holding(Walk::Right), &world)
+            });
+            assert_eq!(grabbed.state, State::Dragged);
+            let held = engine.tick(&WorldSnapshot {
+                cursor: Point { x: 300.0, y: 300.0 },
+                verbs: vec![Verb::Grab],
+                ..with_possession(
+                    Intent {
+                        walk: Some(Walk::Right),
+                        launch: Some(released_after(1_000)),
+                        ..Intent::default()
+                    },
+                    &world,
+                )
+            });
+            assert_eq!(held.state, State::Dragged, "{held:?}");
+            assert_eq!(held.velocity, Point::default(), "{held:?}");
+            let in_hand = held.position;
+
+            let released = engine.tick(&WorldSnapshot {
+                cursor: Point { x: 300.0, y: 300.0 },
+                ..world.clone()
+            });
+            assert_eq!(released.state, State::Falling);
+            let frames = flight(&mut engine, &world);
+            let landing = frames.last().unwrap();
+            assert_eq!(landing.position.x, in_hand.x, "dropped straight down");
+            assert_eq!(landing.cue, Some(Cue::Drop), "{landing:?}");
+            assert!(engine.possessed(), "the Grab did not end the possession");
+        }
+
+        #[test]
+        fn a_thrown_possessed_sprite_flies_as_thrown() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            carry(&mut engine, Point { x: 500.0, y: 300.0 }, &world);
+            let thrown = engine.tick(&WorldSnapshot {
+                cursor: Point { x: 500.0, y: 300.0 },
+                verbs: vec![Verb::Throw {
+                    velocity: Point { x: 400.0, y: 0.0 },
+                }],
+                ..world.clone()
+            });
+            assert_eq!(thrown.velocity.x, 400.0, "{thrown:?}");
+            let flying = engine.tick(&world);
+            assert_eq!(
+                flying.velocity.x, 400.0,
+                "no arrow held does not stop a throw: {flying:?}"
+            );
+        }
+
+        /// A frozen bubble or a quick message holds an autonomous walk, not a
+        /// possessed walk.
+        #[test]
+        fn a_possessed_walk_strides_through_frozen_locomotion() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+
+            for frozen in [
+                WorldSnapshot {
+                    speaking_for: Some(AnimationSource::AiRequested),
+                    ..world.clone()
+                },
+                WorldSnapshot {
+                    composing: true,
+                    ..world.clone()
+                },
+            ] {
+                let frame = engine.tick(&with_possession(holding(Walk::Right), &frozen));
+                assert_eq!(frame.velocity.x, POSSESSED_WALK_SPEED, "{frame:?}");
+                assert_eq!(frame.animation, "walk", "{frame:?}");
+            }
+        }
+
+        #[test]
+        fn a_possessed_sprite_refuses_proposals_but_shows_their_speech() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+
+            let frame = engine.tick(&WorldSnapshot {
+                proposal: Some(BehaviorProposal {
+                    behavior: "walk".to_string(),
+                    dialogue: Some("hands off the wheel".to_string()),
+                    direction: None,
+                    source: AnimationSource::LocalDirector,
+                }),
+                ..world.clone()
+            });
+            assert_eq!(frame.behavior, None, "{frame:?}");
+            assert_eq!(
+                frame.playing_primitive,
+                Some(Primitive::Possessed),
+                "the start's own moment, not the walk: {frame:?}"
+            );
+            assert_eq!(
+                frame.dialogue.as_ref().map(|line| line.text.as_str()),
+                Some("hands off the wheel")
+            );
+            assert_eq!(engine.tick(&world).velocity.x, 0.0, "no walk follows");
+        }
+
+        /// Possessed, with digits for `react`, `sleep`, and a four-frame
+        /// `wave` at 8 fps: half a second a pass. `greet` still plays
+        /// react and then talk, and follows with `settle`.
+        fn possessed_with_digits(x: f64, world: &WorldSnapshot) -> Engine {
+            let clip = |name: &str, frames| IdleMember {
+                name: name.to_string(),
+                weight: DEFAULT_WEIGHT,
+                frames,
+                fps: 8,
+            };
+            let mut engine = possessed_at(x, world);
+            engine.set_idle_plan(IdlePlan {
+                loops: Vec::new(),
+                gestures: Vec::new(),
+                digits: vec![clip("react", 1), clip("sleep", 1), clip("wave", 4)],
+                react: None,
+                possessed: None,
+                idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+                sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+                sleep_for_s: DEFAULT_SLEEP_FOR_S,
+            });
+            engine
+        }
+
+        #[test]
+        fn a_digit_plays_one_pass_of_its_animation_then_idles() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            engine.set_do_not_disturb(true);
+
+            let played = engine.tick(&with_possession(playing(3), &world));
+            assert_eq!(
+                played.playing_gesture.as_deref(),
+                Some("wave"),
+                "{played:?}"
+            );
+            assert_eq!(played.digit, Some(DigitAnimation::Played("wave".into())));
+            assert_eq!(played.refused, None);
+
+            let mid = engine.tick(&WorldSnapshot {
+                elapsed_ms: 400,
+                ..world.clone()
+            });
+            assert_eq!(mid.playing_gesture.as_deref(), Some("wave"), "{mid:?}");
+            let over = engine.tick(&WorldSnapshot {
+                elapsed_ms: 200,
+                ..world.clone()
+            });
+            assert_eq!(over.playing_gesture, None, "{over:?}");
+            assert_eq!(over.animation, "idle");
+        }
+
+        /// The engine plays the Animation alone: `react` is not `greet`,
+        /// so no talk joins it and no `settle` follows.
+        #[test]
+        fn a_digit_plays_its_animation_and_no_behavior_chain() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            engine.set_do_not_disturb(true);
+
+            let played = engine.tick(&with_possession(playing(1), &world));
+            assert_eq!(played.art_name(), "react", "{played:?}");
+            assert_eq!(played.digit, Some(DigitAnimation::Played("react".into())));
+            assert_eq!(played.playing_behavior, None, "no Behavior to continue");
+            assert_eq!(played.playing_primitive, None, "react alone, no talk");
+            assert_eq!(played.state, State::Grounded, "{played:?}");
+
+            for _ in 0..20 {
+                let after = engine.tick(&WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                });
+                assert!(
+                    !["talk", "sit", "sleep"].contains(&after.art_name()),
+                    "nothing chains after the digit: {after:?}"
+                );
+            }
+        }
+
+        /// A `sleep` digit is one pass of the clip, not a nap: the sprite
+        /// never falls Asleep and is back to idle once the pass is done.
+        #[test]
+        fn a_sleep_digit_plays_one_pass_and_never_falls_asleep() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            engine.set_do_not_disturb(true);
+
+            let played = engine.tick(&with_possession(playing(2), &world));
+            assert_eq!(played.art_name(), "sleep", "{played:?}");
+            assert_eq!(played.digit, Some(DigitAnimation::Played("sleep".into())));
+            assert_eq!(played.playing_behavior, None, "no Behavior plays it");
+            assert_ne!(played.state, State::Asleep);
+
+            let mut last = played;
+            for _ in 0..20 {
+                last = engine.tick(&WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                });
+                assert_ne!(last.state, State::Asleep, "{last:?}");
+            }
+            assert_eq!(last.playing_gesture, None, "{last:?}");
+            assert_eq!(last.animation, "idle");
+        }
+
+        /// A `sit` digit is one pass of the clip, not a perch: the sprite
+        /// stays Grounded and is back to idle once the pass is done.
+        #[test]
+        fn a_sit_digit_plays_one_pass_while_grounded_and_never_perches() {
+            let world = on(one_display());
+            let clip = |name: &str, frames| IdleMember {
+                name: name.to_string(),
+                weight: DEFAULT_WEIGHT,
+                frames,
+                fps: 8,
+            };
+            let mut engine = possessed_at(500.0, &world);
+            engine.set_idle_plan(IdlePlan {
+                loops: Vec::new(),
+                gestures: Vec::new(),
+                digits: vec![clip("sit", 1)],
+                react: None,
+                possessed: None,
+                idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+                sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+                sleep_for_s: DEFAULT_SLEEP_FOR_S,
+            });
+            engine.set_do_not_disturb(true);
+
+            let played = engine.tick(&with_possession(playing(1), &world));
+            assert_eq!(played.art_name(), "sit", "{played:?}");
+            assert_eq!(played.digit, Some(DigitAnimation::Played("sit".into())));
+            assert_eq!(played.playing_behavior, None, "no Behavior plays it");
+            assert_eq!(played.state, State::Grounded, "{played:?}");
+
+            let mut last = played;
+            for _ in 0..20 {
+                last = engine.tick(&WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                });
+                assert_eq!(last.state, State::Grounded, "{last:?}");
+            }
+            assert_eq!(last.playing_gesture, None, "{last:?}");
+            assert_eq!(last.animation, "idle");
+        }
+
+        /// A `talk` digit is one pass of the clip, not a line: no Dialogue
+        /// is spoken, the sprite stays Grounded, and it idles once the pass
+        /// is done.
+        #[test]
+        fn a_talk_digit_plays_one_pass_and_never_opens_dialogue() {
+            let world = on(one_display());
+            let clip = |name: &str, frames| IdleMember {
+                name: name.to_string(),
+                weight: DEFAULT_WEIGHT,
+                frames,
+                fps: 8,
+            };
+            let mut engine = possessed_at(500.0, &world);
+            engine.set_idle_plan(IdlePlan {
+                loops: Vec::new(),
+                gestures: Vec::new(),
+                digits: vec![clip("talk", 1)],
+                react: None,
+                possessed: None,
+                idle_gesture_every_s: DEFAULT_IDLE_GESTURE_EVERY_S,
+                sleep_after_s: DEFAULT_SLEEP_AFTER_S,
+                sleep_for_s: DEFAULT_SLEEP_FOR_S,
+            });
+            engine.set_do_not_disturb(true);
+
+            let played = engine.tick(&with_possession(playing(1), &world));
+            assert_eq!(played.art_name(), "talk", "{played:?}");
+            assert_eq!(played.digit, Some(DigitAnimation::Played("talk".into())));
+            assert_eq!(played.playing_behavior, None, "no Behavior plays it");
+            assert_eq!(played.dialogue, None, "a digit speaks no line");
+            assert_eq!(played.state, State::Grounded, "{played:?}");
+
+            let mut last = played;
+            for _ in 0..20 {
+                last = engine.tick(&WorldSnapshot {
+                    elapsed_ms: 100,
+                    ..world.clone()
+                });
+                assert_eq!(last.state, State::Grounded, "{last:?}");
+                assert_eq!(last.dialogue, None, "{last:?}");
+            }
+            assert_eq!(last.playing_gesture, None, "{last:?}");
+            assert_eq!(last.animation, "idle");
+        }
+
+        /// The Shell remembers `Frame::behavior` in `recent:`, a list of
+        /// Behaviors the Director may propose. A digit names an Animation,
+        /// so `wave` from a key leaves a Behavior called `wave` free, and
+        /// three presses push no real Behavior out of the memory.
+        #[test]
+        fn a_digit_hands_the_director_no_behavior_to_remember() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            let mut remembered = Vec::new();
+            let mut played = Vec::new();
+            for digit in [3, 1, 3] {
+                let frame = engine.tick(&with_possession(playing(digit), &world));
+                remembered.extend(frame.behavior);
+                played.extend(frame.digit);
+                for _ in 0..20 {
+                    let frame = engine.tick(&WorldSnapshot {
+                        elapsed_ms: 100,
+                        ..world.clone()
+                    });
+                    remembered.extend(frame.behavior);
+                }
+            }
+            assert_eq!(remembered, Vec::<String>::new());
+            assert_eq!(
+                played,
+                ["wave", "react", "wave"].map(|name| DigitAnimation::Played(name.into()))
+            );
+        }
+
+        #[test]
+        fn a_digit_past_the_list_does_nothing() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            let unbound = engine.tick(&with_possession(playing(4), &world));
+            assert_eq!(unbound.behavior, None, "{unbound:?}");
+            assert_eq!(unbound.digit, None, "{unbound:?}");
+            assert_eq!(
+                unbound.refused, None,
+                "a digit past the list is not a proposal that missed: {unbound:?}"
+            );
+            assert_eq!(unbound.playing_primitive, Some(Primitive::Possessed));
+        }
+
+        /// The Poke takes the tick, so the pending possession edge slips one.
+        #[test]
+        fn a_digit_that_starts_its_animation_cues_a_poke() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+
+            let cues: Vec<Option<Cue>> = [playing(1), Intent::default()]
+                .into_iter()
+                .map(|intent| engine.tick(&with_possession(intent, &world)).cue)
+                .collect();
+            assert_eq!(cues, vec![Some(Cue::Poke), Some(Cue::Possess)]);
+        }
+
+        #[test]
+        fn a_digit_the_state_forbids_is_refused_like_a_proposal() {
+            let world = on(one_display());
+            let mut engine = possessed_with_digits(500.0, &world);
+            let launched = engine.tick(&with_possession(launching(released_after(0)), &world));
+            assert_eq!(launched.state, State::Falling, "{launched:?}");
+
+            let refused = engine.tick(&with_possession(playing(2), &world));
+            assert_eq!(refused.behavior, None, "{refused:?}");
+            assert_eq!(refused.digit, Some(DigitAnimation::Refused("sleep".into())));
+            assert_eq!(refused.refused, None, "no Behavior was proposed");
+            assert_eq!(refused.cue, None, "a refusal plays no Poke");
+            assert_eq!(
+                refused.animation, "jump",
+                "the refusal does not replace the flight"
+            );
+        }
+
+        /// Every variant of `$enum`. The match has no wildcard, so a new
+        /// variant fails to compile until it is added to this same list,
+        /// which is also the array the test walks.
+        macro_rules! every_variant {
+            ($enum:ident, $($variant:ident),+ $(,)?) => {{
+                let _: fn($enum) = |value| match value {
+                    $($enum::$variant => {})+
+                };
+                [$($enum::$variant),+]
+            }};
+        }
+
+        fn every_state() -> [State; 6] {
+            every_variant!(State, Grounded, Falling, Dragged, Perched, Climbing, Asleep)
+        }
+
+        fn every_primitive() -> [Primitive; 11] {
+            every_variant!(
+                Primitive, Idle, Walk, Land, Sit, Sleep, React, Talk, Hold, Chase, Jump, Possessed
+            )
+        }
+
+        /// Whether possession's controls drive this State. No `_` arm: a new
+        /// State fails to compile here until it picks a side.
+        fn state_driven(state: State) -> bool {
+            match state {
+                // The rest between keys, a fall, a drag, a Perch, Up at a wall.
+                State::Grounded
+                | State::Falling
+                | State::Dragged
+                | State::Perched
+                | State::Climbing => true,
+                // The sprite's own, and possession wakes it.
+                State::Asleep => false,
+            }
+        }
+
+        /// Whether a control plays this Primitive. No `_` arm, as in
+        /// `state_driven`.
+        fn primitive_driven(primitive: Primitive) -> bool {
+            match primitive {
+                // Idle between keys; Left, Right and Chase; Space and Land;
+                // a moving Perch; taking control.
+                Primitive::Idle
+                | Primitive::Walk
+                | Primitive::Chase
+                | Primitive::Jump
+                | Primitive::Land
+                | Primitive::Hold
+                | Primitive::Possessed => true,
+                // A Behavior composes Sit and Sleep; React and Talk answer a
+                // poke and a line, not a key.
+                Primitive::Sit | Primitive::Sleep | Primitive::React | Primitive::Talk => false,
+            }
+        }
+
+        /// Every Animation a driven State or a control's Primitive draws is
+        /// in `DRIVEN_ANIMATIONS`, and digits drop each of those except the
+        /// ones also in `DIGIT_PLAYABLE_ENGINE_ANIMATIONS`. Today that
+        /// overlap is only `sit`: a Perch draws it, and a digit still plays
+        /// one pass. `react`, `sleep` and `talk` are playable too, but no
+        /// control draws them.
+        #[test]
+        fn digits_drop_every_animation_the_controls_draw() {
+            use crate::possession::{DIGIT_PLAYABLE_ENGINE_ANIMATIONS, DRIVEN_ANIMATIONS};
+
+            let drawn: BTreeSet<&str> = every_state()
+                .into_iter()
+                .filter(|state| state_driven(*state))
+                .map(animation_for)
+                .chain(
+                    every_primitive()
+                        .into_iter()
+                        .filter(|primitive| primitive_driven(*primitive))
+                        .map(animation_of),
+                )
+                .collect();
+            assert_eq!(drawn, BTreeSet::from(DRIVEN_ANIMATIONS));
+            let playable_driven: BTreeSet<&str> = drawn
+                .intersection(&BTreeSet::from(DIGIT_PLAYABLE_ENGINE_ANIMATIONS))
+                .copied()
+                .collect();
+            assert_eq!(playable_driven, BTreeSet::from(["sit"]));
+        }
+
+        #[test]
+        fn a_possessed_sprite_never_falls_asleep() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world).with_sleep_after_s((1, 1));
+
+            let frame = engine.tick(&WorldSnapshot {
+                elapsed_ms: 5_000,
+                ..world.clone()
+            });
+            assert_eq!(frame.state, State::Grounded, "{frame:?}");
+            let frame = engine.tick(&world);
+            assert_ne!(frame.state, State::Asleep, "{frame:?}");
+        }
+
+        #[test]
+        fn possessing_a_sleeping_sprite_wakes_it() {
+            let world = on(one_display());
+            let mut engine = resting_at(500.0, &world).with_sleep_after_s((1, 1));
+            let asleep = engine.tick(&WorldSnapshot {
+                elapsed_ms: 1_000,
+                ..world.clone()
+            });
+            assert_eq!(asleep.state, State::Asleep);
+
+            engine.set_possessed(true);
+            settle(&mut engine, &world);
+            let walking = engine.tick(&with_possession(holding(Walk::Left), &world));
+            assert_eq!(walking.velocity.x, -POSSESSED_WALK_SPEED, "{walking:?}");
+        }
+
+        /// The screen edge and the Dock's side stop a possessed walk; neither is
+        /// climbed while the user steers. The Dock's side stops it half a
+        /// sprite out, before any of the sprite is behind the Dock.
+        #[test]
+        fn a_possessed_walk_into_a_wall_stops_rather_than_climbs() {
+            let worlds = [
+                (on(one_display()), None),
+                (
+                    WorldSnapshot {
+                        windows: vec![window(
+                            DOCK_PERCH_ID,
+                            Rect {
+                                x: 700.0,
+                                y: 740.0,
+                                width: 200.0,
+                                height: 60.0,
+                            },
+                        )],
+                        ..on(one_display())
+                    },
+                    Some(700.0 - EDGE_CLEARANCE),
+                ),
+            ];
+            for (world, dock_wall) in worlds {
+                let mut engine = possessed_at(500.0, &world);
+                let mut last = None;
+                for _ in 0..400 {
+                    let frame = engine.tick(&with_possession(holding(Walk::Right), &world));
+                    assert_ne!(frame.state, State::Climbing, "{frame:?}");
+                    assert_eq!(frame.state, State::Grounded, "{frame:?}");
+                    last = Some(frame);
+                }
+                let last = last.unwrap();
+                assert_eq!(last.velocity.x, 0.0, "stopped at the wall: {last:?}");
+                assert_eq!(last.animation, "idle", "standing, not striding: {last:?}");
+                if let Some(x) = dock_wall {
+                    assert_eq!(last.position.x, x, "{last:?}");
+                }
+            }
+        }
+
+        /// Each edge cues once, on the next tick. A repeat of the same switch,
+        /// which the menu sends to every other Instance, cues nothing.
+        #[test]
+        fn possession_edges_cue_possess_and_unpossess_once() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let cues: Vec<Option<Cue>> = (0..2).map(|_| engine.tick(&world).cue).collect();
+            assert_eq!(cues, vec![Some(Cue::Possess), None]);
+
+            engine.set_possessed(true);
+            assert_eq!(engine.tick(&world).cue, None, "already possessed");
+
+            engine.set_possessed(false);
+            engine.set_possessed(false);
+            let cues: Vec<Option<Cue>> = (0..2).map(|_| engine.tick(&world).cue).collect();
+            assert_eq!(cues, vec![Some(Cue::Unpossess), None]);
+        }
+
+        /// Possession start plays `possessed`, which a package without that art
+        /// draws as its `react`. Only the start plays it, not a repeat or the end.
+        #[test]
+        fn possession_start_plays_possessed_art_or_react() {
+            use crate::character::tests::{declaring, load_manifest};
+            use crate::character::REQUIRED_ANIMATIONS;
+
+            let without = load_manifest(&declaring(&REQUIRED_ANIMATIONS)).expect("loads");
+            let with = load_manifest(&format!(
+                "{}[animations.possessed]\nframes = [\"idle-0.png\"]\n",
+                declaring(&REQUIRED_ANIMATIONS)
+            ))
+            .expect("loads");
+
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let started = engine.tick(&world);
+            assert_eq!(started.animation, "possessed", "{started:?}");
+            let drawn = |character: &crate::character::Character| {
+                character
+                    .draw(started.animation, started.animation_ms, 0, 1.0)
+                    .expect("draws")
+                    .animation
+                    .to_string()
+            };
+            assert_eq!(drawn(&with), "possessed");
+            assert_eq!(drawn(&without), "react");
+
+            for _ in 0..60 {
+                engine.tick(&world);
+            }
+            engine.set_possessed(true);
+            let again = engine.tick(&world);
+            assert_ne!(again.animation, "possessed", "already possessed: {again:?}");
+
+            engine.set_possessed(false);
+            let released = engine.tick(&world);
+            assert_ne!(released.animation, "possessed", "{released:?}");
+        }
+
+        /// Nothing held, spelled out because `Intent::default()` is not `const`.
+        const NO_KEYS: Intent = Intent {
+            walk: None,
+            climb: false,
+            up: false,
+            down: false,
+            drop: false,
+            charging: None,
+            launch: None,
+            end_possession: false,
+            play: None,
+        };
+
+        /// The tick Up goes down.
+        const UP: Intent = Intent {
+            climb: true,
+            ..HELD_UP
+        };
+
+        /// The ticks Up stays down after its press.
+        const HELD_UP: Intent = Intent {
+            up: true,
+            ..NO_KEYS
+        };
+
+        /// The tick Down goes down.
+        const DOWN: Intent = Intent {
+            drop: true,
+            ..HELD_DOWN
+        };
+
+        /// The ticks Down stays down after its press.
+        const HELD_DOWN: Intent = Intent {
+            down: true,
+            ..NO_KEYS
+        };
+
+        /// Up climbs where a possessed walk stops: the screen edge, from the
+        /// floor or a Perch, and the outermost edge when a display above juts
+        /// out past it. From the gap beside a Dock near the edge, the climb is
+        /// the screen edge's and never steps onto the Dock's top.
+        #[test]
+        fn up_against_a_wall_climbs_it() {
+            let dock = window(
+                DOCK_PERCH_ID,
+                Rect {
+                    x: 700.0,
+                    y: 740.0,
+                    width: 220.0,
+                    height: 60.0,
+                },
+            );
+            let ledge = window(
+                1,
+                Rect {
+                    x: 300.0,
+                    y: 400.0,
+                    width: 700.0,
+                    height: 200.0,
+                },
+            );
+            let jutting = Rect {
+                x: 0.0,
+                y: -600.0,
+                width: 1020.0,
+                height: 600.0,
+            };
+            let worlds = [
+                (on(one_display()), 500.0, 1000.0),
+                (
+                    WorldSnapshot {
+                        windows: vec![ledge],
+                        ..on(one_display())
+                    },
+                    500.0,
+                    1000.0,
+                ),
+                (
+                    WorldSnapshot {
+                        displays: vec![one_display(), jutting],
+                        ..on(one_display())
+                    },
+                    500.0,
+                    1020.0,
+                ),
+                (
+                    WorldSnapshot {
+                        windows: vec![dock],
+                        ..on(one_display())
+                    },
+                    960.0,
+                    1000.0,
+                ),
+            ];
+            for (world, start, wall) in worlds {
+                let mut engine = possessed_at(start, &world);
+                for _ in 0..400 {
+                    engine.tick(&with_possession(holding(Walk::Right), &world));
+                }
+                let against = engine.tick(&world);
+                assert_eq!(against.velocity.x, 0.0, "stopped: {against:?}");
+
+                let climbing = engine.tick(&with_possession(UP, &world));
+                assert_eq!(climbing.state, State::Climbing, "{climbing:?}");
+                assert_eq!(climbing.position.x, wall, "{climbing:?}");
+                assert_eq!(climbing.facing, 1.0, "it faces the wall: {climbing:?}");
+                let mut below = climbing;
+                for _ in 0..30 {
+                    let higher = engine.tick(&with_possession(HELD_UP, &world));
+                    assert_eq!(higher.state, State::Climbing, "{higher:?}");
+                    assert!(higher.position.y < below.position.y, "{higher:?}");
+                    below = higher;
+                }
+            }
+        }
+
+        /// A sprite standing at the left edge, still facing right, turns to the
+        /// wall it climbs.
+        #[test]
+        fn up_climbs_a_left_wall_facing_it() {
+            let world = on(one_display());
+            let mut engine = possessed_at(EDGE_CLEARANCE, &world);
+            let standing = engine.tick(&world);
+            assert_eq!(standing.facing, 1.0, "{standing:?}");
+
+            let climbing = engine.tick(&with_possession(UP, &world));
+            assert_eq!(climbing.state, State::Climbing, "{climbing:?}");
+            assert_eq!(climbing.position.x, 0.0, "{climbing:?}");
+            assert_eq!(climbing.facing, -1.0, "{climbing:?}");
+        }
+
+        /// Climbing the right wall, Left lets go and Space jumps off it. Both
+        /// carry the sprite away from the wall and land it on the floor.
+        #[test]
+        fn an_arrow_away_or_space_takes_a_climber_off_the_wall() {
+            let world = on(one_display());
+            let floor = one_display().bottom();
+            let climbing = || {
+                let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+                engine.tick(&world);
+                let climbing = engine.tick(&with_possession(UP, &world));
+                assert_eq!(climbing.state, State::Climbing, "{climbing:?}");
+                for _ in 0..20 {
+                    engine.tick(&world);
+                }
+                engine
+            };
+
+            let mut engine = climbing();
+            let into = engine.tick(&with_possession(holding(Walk::Right), &world));
+            assert_eq!(into.state, State::Climbing, "into the wall: {into:?}");
+
+            let mut engine = climbing();
+            let let_go = engine.tick(&with_possession(holding(Walk::Left), &world));
+            assert_eq!(let_go.state, State::Falling, "{let_go:?}");
+            assert_eq!(let_go.facing, -1.0, "{let_go:?}");
+            assert_eq!(let_go.velocity.x, -POSSESSED_WALK_SPEED, "{let_go:?}");
+            let landed = flight(&mut engine, &world).pop().unwrap();
+            assert_eq!(landed.position.y, floor, "{landed:?}");
+            assert!(landed.position.x < 1000.0, "off the wall: {landed:?}");
+
+            let mut engine = climbing();
+            let jumped = engine.tick(&with_possession(launching(released_after(500)), &world));
+            assert_eq!(jumped.state, State::Falling, "{jumped:?}");
+            assert!(jumped.velocity.y < 0.0, "it jumps up: {jumped:?}");
+            assert_eq!(jumped.facing, -1.0, "{jumped:?}");
+            assert_eq!(jumped.velocity.x, -POSSESSED_WALK_SPEED, "{jumped:?}");
+            let frames = flight(&mut engine, &world);
+            assert!(peak(&frames) < jumped.position.y, "it rose: {jumped:?}");
+            let landed = frames.last().unwrap();
+            assert_eq!(landed.position.y, floor, "{landed:?}");
+            assert!(
+                landed.position.x < 1000.0 - POSSESSED_WALK_SPEED / 4.0,
+                "{landed:?}"
+            );
+        }
+
+        /// A climb is steered as a walk is: it moves under a held key and
+        /// keeps its hold of the wall, still, under none or both.
+        #[test]
+        fn a_possessed_climber_moves_only_while_up_or_down_is_held() {
+            let world = on(one_display());
+            let both = Intent {
+                up: true,
+                ..HELD_DOWN
+            };
+            let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+            engine.tick(&world);
+            let mut last = engine.tick(&with_possession(UP, &world));
+            assert_eq!(last.state, State::Climbing, "{last:?}");
+
+            let steps = [
+                (HELD_UP, -1.0),
+                (HELD_UP, -1.0),
+                (Intent::default(), 0.0),
+                (HELD_DOWN, 1.0),
+                (both, 0.0),
+                (HELD_UP, -1.0),
+            ];
+            for (keys, direction) in steps {
+                for _ in 0..10 {
+                    let frame = engine.tick(&with_possession(keys, &world));
+                    assert_eq!(frame.state, State::Climbing, "{keys:?} {frame:?}");
+                    let moved = frame.position.y - last.position.y;
+                    let went = if moved == 0.0 { 0.0 } else { moved.signum() };
+                    assert_eq!(went, direction, "{keys:?} {frame:?}");
+                    last = frame;
+                }
+            }
+        }
+
+        /// Handed back mid-wall with nothing held, it climbs on by itself.
+        #[test]
+        fn a_climber_let_out_of_possession_climbs_on() {
+            let world = on(one_display());
+            let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+            engine.tick(&world);
+            engine.tick(&with_possession(UP, &world));
+            let held = engine.tick(&world);
+            assert_eq!(engine.tick(&world).position, held.position, "possessed");
+            engine.set_possessed(false);
+            let mut below = held;
+            for _ in 0..10 {
+                let higher = engine.tick(&world);
+                assert_eq!(higher.state, State::Climbing, "{higher:?}");
+                assert!(higher.position.y < below.position.y, "{higher:?}");
+                below = higher;
+            }
+        }
+
+        /// The art holds its frame with the climber, as it does under a Poke.
+        #[test]
+        fn a_possessed_climber_holding_still_holds_its_frame() {
+            let world = on(one_display());
+            let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+            settle(&mut engine, &world);
+            engine.tick(&with_possession(UP, &world));
+            let moving = engine.tick(&with_possession(HELD_UP, &world));
+            let still = engine.tick(&world);
+            let stiller = engine.tick(&world);
+            assert_eq!(moving.animation, "climb", "{moving:?}");
+            assert_eq!(still.animation_ms, moving.animation_ms, "{still:?}");
+            assert_eq!(stiller.animation_ms, moving.animation_ms, "{stiller:?}");
+            let resumed = engine.tick(&with_possession(HELD_UP, &world));
+            assert!(resumed.animation_ms > moving.animation_ms, "{resumed:?}");
+        }
+
+        /// Up held to the top of the display stops there, still on the wall:
+        /// letting go would drop the sprite to the floor under the user's key.
+        #[test]
+        fn a_possessed_climber_holds_at_the_top_of_the_display() {
+            let world = on(one_display());
+            let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+            engine.tick(&world);
+            let start = engine.tick(&with_possession(UP, &world));
+            let mut top = start.clone();
+            for _ in 0..400 {
+                top = engine.tick(&with_possession(HELD_UP, &world));
+                assert_eq!(top.state, State::Climbing, "{top:?}");
+            }
+            assert!(top.position.y < start.position.y - 500.0, "{top:?}");
+            let held = engine.tick(&with_possession(HELD_UP, &world));
+            assert_eq!(held.position, top.position, "{held:?}");
+            assert_eq!(held.animation_ms, top.animation_ms, "{held:?}");
+
+            let mut above = held;
+            for _ in 0..10 {
+                let lower = engine.tick(&with_possession(HELD_DOWN, &world));
+                assert_eq!(lower.state, State::Climbing, "{lower:?}");
+                assert!(lower.position.y > above.position.y, "{lower:?}");
+                above = lower;
+            }
+        }
+
+        /// Possession that finds the sprite already climbing takes the climb
+        /// over: still under no key, and up under a held Up with no press.
+        #[test]
+        fn possessing_a_climber_holds_it_until_up_is_held() {
+            let world = on(one_display());
+            let mut engine = a_character_at(Point { x: 900.0, y: 400.0 });
+            engine.tick(&WorldSnapshot {
+                cursor: Point { x: 900.0, y: 400.0 },
+                verbs: vec![Verb::Grab],
+                ..world.clone()
+            });
+            engine.tick(&WorldSnapshot {
+                verbs: vec![Verb::Throw {
+                    velocity: Point { x: 2000.0, y: 0.0 },
+                }],
+                ..world.clone()
+            });
+            let mut climbing = engine.tick(&world);
+            while climbing.state == State::Falling {
+                climbing = engine.tick(&world);
+            }
+            assert_eq!(climbing.state, State::Climbing, "{climbing:?}");
+
+            engine.set_possessed(true);
+            let held = engine.tick(&world);
+            assert_eq!(held.state, State::Climbing, "{held:?}");
+            assert_eq!(engine.tick(&world).position, held.position);
+            let higher = engine.tick(&with_possession(HELD_UP, &world));
+            assert_eq!(higher.state, State::Climbing, "{higher:?}");
+            assert!(higher.position.y < held.position.y, "{higher:?}");
+        }
+
+        /// Down the wall ends on what is under it, the floor or a Perch, and a
+        /// Down still held there neither pushes on nor drops through.
+        #[test]
+        fn climbing_down_steps_onto_what_is_under_the_wall() {
+            let ledge = window(
+                1,
+                Rect {
+                    x: 300.0,
+                    y: 400.0,
+                    width: 700.0,
+                    height: 200.0,
+                },
+            );
+            let perched = WorldSnapshot {
+                windows: vec![ledge],
+                ..on(one_display())
+            };
+            let worlds = [
+                (on(one_display()), State::Grounded, 800.0),
+                (perched, State::Perched, 400.0),
+            ];
+            for (world, standing, y) in worlds {
+                let mut engine = possessed_at(1000.0 - EDGE_CLEARANCE, &world);
+                engine.tick(&world);
+                engine.tick(&with_possession(UP, &world));
+                for _ in 0..30 {
+                    engine.tick(&with_possession(HELD_UP, &world));
+                }
+                let mut frame = engine.tick(&with_possession(DOWN, &world));
+                assert_eq!(frame.state, State::Climbing, "{frame:?}");
+                for _ in 0..60 {
+                    frame = engine.tick(&with_possession(HELD_DOWN, &world));
+                }
+                assert_eq!(frame.state, standing, "{frame:?}");
+                assert_eq!(frame.position.y, y, "{frame:?}");
+            }
+        }
+
+        #[test]
+        fn up_with_no_wall_beside_does_nothing() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            let standing = engine.tick(&world);
+            let frame = engine.tick(&with_possession(UP, &world));
+            assert_eq!(frame.state, State::Grounded, "{frame:?}");
+            assert_eq!(frame.position, standing.position, "{frame:?}");
+        }
+
+        /// Down drops through the Perch underfoot, and the fall lands as any
+        /// fall does, on the floor below.
+        #[test]
+        fn down_on_a_perch_drops_through_it() {
+            let world = WorldSnapshot {
+                windows: vec![window(
+                    1,
+                    Rect {
+                        x: 300.0,
+                        y: 400.0,
+                        width: 400.0,
+                        height: 200.0,
+                    },
+                )],
+                ..on(one_display())
+            };
+            let mut engine = possessed_at(500.0, &world);
+            let perched = engine.tick(&world);
+            assert_eq!(perched.state, State::Perched, "{perched:?}");
+
+            let dropped = engine.tick(&with_possession(DOWN, &world));
+            assert_eq!(dropped.state, State::Falling, "{dropped:?}");
+            let landed = flight(&mut engine, &world).pop().unwrap();
+            assert_eq!(landed.state, State::Grounded, "{landed:?}");
+            assert_eq!(landed.position.y, one_display().height, "{landed:?}");
+            assert_eq!(landed.animation, "land", "{landed:?}");
+        }
+
+        /// A Down held through the fall stops on the next Perch: only a press
+        /// drops, or one hold would go through every Perch to the floor.
+        #[test]
+        fn a_held_down_drops_through_one_perch_only() {
+            let ledge = |id, y| {
+                window(
+                    id,
+                    Rect {
+                        x: 300.0,
+                        y,
+                        width: 400.0,
+                        height: 100.0,
+                    },
+                )
+            };
+            let world = WorldSnapshot {
+                windows: vec![ledge(1, 300.0), ledge(2, 500.0)],
+                ..on(one_display())
+            };
+            let mut engine = possessed_at(500.0, &world);
+            let perched = engine.tick(&world);
+            assert_eq!(perched.position.y, 300.0, "{perched:?}");
+
+            let dropped = engine.tick(&with_possession(DOWN, &world));
+            assert_eq!(dropped.state, State::Falling, "{dropped:?}");
+            let held = with_possession(HELD_DOWN, &world);
+            flight(&mut engine, &held);
+            for _ in 0..30 {
+                let frame = engine.tick(&held);
+                assert_eq!(frame.state, State::Perched, "{frame:?}");
+                assert_eq!(frame.position.y, 500.0, "{frame:?}");
+            }
+        }
+
+        /// Down on the floor or the Dock does nothing: the Dock hides what
+        /// falls behind it.
+        #[test]
+        fn down_on_the_floor_or_the_dock_does_nothing() {
+            let dock = WorldSnapshot {
+                windows: vec![window(DOCK_PERCH_ID, dock())],
+                ..on(one_display())
+            };
+            for world in [on(one_display()), dock] {
+                let mut engine = possessed_at(500.0, &world);
+                let standing = engine.tick(&world);
+                let frame = engine.tick(&with_possession(DOWN, &world));
+                assert_eq!(frame.state, standing.state, "{frame:?}");
+                assert_eq!(frame.position, standing.position, "{frame:?}");
+            }
+        }
+
+        #[test]
+        fn ending_the_possession_hands_the_sprite_back() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            engine.set_possessed(false);
+            assert!(!engine.possessed());
+            let frame = engine.tick(&with_possession(holding(Walk::Right), &world));
+            assert_eq!(frame.velocity.x, 0.0, "keys move it no more: {frame:?}");
+        }
+
+        /// Ending the possession lets go of every key, so a possessed walk stops
+        /// where it is rather than striding on to the edge and climbing it.
+        #[test]
+        fn ending_the_possession_mid_walk_stands_the_sprite_still() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            for _ in 0..5 {
+                engine.tick(&with_possession(holding(Walk::Right), &world));
+            }
+            engine.set_possessed(false);
+
+            let x = engine.feet().x;
+            for _ in 0..300 {
+                let frame = engine.tick(&with_possession(holding(Walk::Right), &world));
+                assert_eq!(frame.velocity.x, 0.0, "{frame:?}");
+                assert_eq!(frame.position.x, x, "{frame:?}");
+                assert_eq!(frame.state, State::Grounded, "{frame:?}");
+                assert_ne!(frame.animation, "walk", "{frame:?}");
+            }
+        }
+
+        /// Mid-air, the drift stops as letting go of the arrow stops it, and
+        /// the fall lands straight down.
+        #[test]
+        fn ending_the_possession_mid_jump_stops_the_drift() {
+            let world = on(one_display());
+            let mut engine = possessed_at(500.0, &world);
+            engine.tick(&with_possession(launching(released_after(1_000)), &world));
+            let steered = engine.tick(&with_possession(holding(Walk::Right), &world));
+            assert_eq!(steered.velocity.x, POSSESSED_WALK_SPEED, "{steered:?}");
+            engine.set_possessed(false);
+
+            let x = engine.feet().x;
+            let frames = flight(&mut engine, &world);
+            let drifting = frames.iter().find(|frame| frame.velocity.x != 0.0);
+            assert_eq!(drifting, None);
+            assert_eq!(frames.last().unwrap().position.x, x, "straight down");
+            assert_eq!(engine.tick(&world).velocity.x, 0.0);
+        }
     }
 }

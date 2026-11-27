@@ -71,7 +71,7 @@ else
   trap 'stop_fidget' EXIT INT TERM
 
   # The launch gets its own wait, so the first check keeps its whole budget.
-  wait_for_up 3 "$log" || fail "Fidget never wrote its overlay line; see $log"
+  wait_for_up "$log" || fail "Fidget never wrote its overlay line; see $log"
   wait_for_rest "$log" || fail "the sprite never came to rest; see $log"
   size=$(sed -nE 's/^overlay: .* sprite ([0-9]+)x[0-9]+;.*/\1/p' "$log" | head -1)
   [ -n "$size" ] || fail "no sprite size in $log"
@@ -111,8 +111,11 @@ else
 
     # Only the half on the display's side of the edge is drawn. Each click is
     # its own Poke: a double-click interval apart, stopping at the first that
-    # lands. Aim near the top, since it rises; never into the menu bar above.
-    if [ "$sx" -lt "$edge" ]; then px=$((edge + half / 2)); else px=$((edge - half / 2)); fi
+    # lands. Aim a quarter of the sprite in from the edge, where Buddy Bot is
+    # solid from row 15 to 59: halfway in crosses its eye and misses. It climbs
+    # 27-65 px before the press lands, so aim 10 px above its top; `sy > size`
+    # keeps that below the menu bar.
+    if [ "$sx" -lt "$edge" ]; then px=$((edge + half / 4)); else px=$((edge - half / 4)); fi
     # Further into this display than the click, and not past it. The pill
     # opens after a dwell on the sprite and then holds the climb. Leave with
     # the click: a silent warp keeps :hover, and the gaps add up past that dwell.
@@ -130,7 +133,7 @@ else
       in_state Climbing || break
       read -r sx sy < <(sprite_xy)
       [ "$sy" -gt "$size" ] || break
-      "$tools/click-cursor" "$px" "$((sy + half / 9))" 1 >> "$out/input.txt" 2>&1 || fail "could not click the sprite; see $out/input.txt"
+      "$tools/click-cursor" "$px" "$((sy - 10))" 1 >> "$out/input.txt" 2>&1 || fail "could not click the sprite; see $out/input.txt"
       "$tools/warp-cursor" "$away" "$sy" --event >> "$out/input.txt" 2>&1 || fail "could not move the pointer off the sprite; see $out/input.txt"
       if wait_for_count "$click_gap" "$log" '^verbs: .*Poke' "$before"; then
         poked=1

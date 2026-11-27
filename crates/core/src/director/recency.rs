@@ -81,7 +81,7 @@ impl Recency {
             *age += elapsed;
         }
 
-        if !verbs.is_empty() && !self.gesturing {
+        if !frame.possessed && !verbs.is_empty() && !self.gesturing {
             self.was = self.last.clone().map(|found| (found, Duration::ZERO));
         }
         self.gesturing = !verbs.is_empty();
@@ -91,6 +91,11 @@ impl Recency {
             behavior: frame.playing_behavior.clone(),
         };
         let before = self.last.replace(now.clone());
+        // The Director hears a possession start and end, never the moves
+        // between; earlier steps still age out through the usual window.
+        if frame.possessed {
+            return;
+        }
         if before.as_ref().map(|doing| doing.state) != Some(now.state) {
             self.step(Step::State(now.state));
         }
@@ -147,6 +152,7 @@ mod tests {
     use crate::character::{Behavior, Primitive};
     use crate::director::{follow_up, Context};
     use crate::engine::{BehaviorProposal, Engine, Point, Rect, WorldSnapshot};
+    use crate::possession::{Intent, Key, Possession, Walk};
 
     /// An Instance as the frame loop runs one: the Engine ticks, `Recency`
     /// hears every tick, and a wake reads it.
@@ -160,9 +166,12 @@ mod tests {
         fn at(x: f64, y: f64) -> Self {
             let walk = Behavior {
                 primitives: vec![Primitive::Walk],
+                animation: None,
                 then: None,
                 weight: 1,
                 trigger: None,
+                not_in_manifest: false,
+                idle_type: false,
             };
             let mut engine = Engine::new(Point { x, y })
                 .with_behaviors(BTreeMap::from([("walk".to_string(), walk)]));
@@ -205,6 +214,7 @@ mod tests {
         fn wake(&mut self, happened: Happened) -> String {
             follow_up(&Context {
                 state: self.frame.state,
+                possessed: self.frame.possessed,
                 lately: self.recency.take(&happened),
                 happened,
                 ..Context::quiet()
@@ -233,6 +243,7 @@ mod tests {
     #[test]
     fn poked_awake_the_wake_says_it_was_asleep() {
         let mut sprite = Instance::at(100.0, 0.0);
+        sprite.engine.set_sleep_after_s((1, 1));
         sprite.tick(snapshot(60_000, vec![]));
         sprite.wait(30_000);
 
@@ -300,6 +311,8 @@ mod tests {
             proposal: Some(BehaviorProposal {
                 behavior: "walk".to_string(),
                 dialogue: None,
+                direction: None,
+                source: crate::engine::AnimationSource::LocalDirector,
             }),
             ..snapshot(100, vec![])
         });
@@ -361,6 +374,97 @@ mod tests {
             format!(
                 "{}state: climbing\nlately: climbing → held → climbing → held → climbing\nstanding on: nothing\n",
                 floor("what just happened: time passed\n")
+            )
+        );
+    }
+
+    #[test]
+    fn the_possessed_wake_remembers_the_fall_before_possession() {
+        let mut engine = Engine::new(Point { x: 500.0, y: 100.0 });
+        let mut sprite = Instance {
+            frame: engine.tick(&snapshot(0, vec![])),
+            engine,
+            recency: Recency::default(),
+        };
+        sprite.wait(1_500);
+        sprite.engine.set_possessed(true);
+        sprite.wait(100);
+
+        assert_eq!(
+            sprite.wake(Happened::PossessionStart),
+            format!(
+                "{}state: idle\npossessed: yes\nlately: falling → idle\nstanding on: nothing\n",
+                floor("what just happened: possessed\n")
+            )
+        );
+
+        sprite.wait(13_000);
+        assert_eq!(
+            sprite.wake(Happened::PossessionStart),
+            format!(
+                "{}state: idle\npossessed: yes\nstanding on: nothing\n",
+                floor("what just happened: possessed\n")
+            )
+        );
+    }
+
+    #[test]
+    fn possession_preserves_the_gesture_snapshot_from_before_it() {
+        let mut sprite = Instance::at(500.0, 0.0);
+        sprite.engine.set_sleep_after_s((1, 1));
+        sprite.tick(snapshot(60_000, vec![]));
+        sprite.wait(30_000);
+        sprite.verb(Verb::Poke);
+        sprite.wait(100);
+        sprite.engine.set_possessed(true);
+        sprite.verb(Verb::Grab);
+
+        assert_eq!(
+            sprite.wake(Happened::PossessionStart),
+            format!(
+                "{}state: held\npossessed: yes\nstanding on: nothing\n",
+                floor("what just happened: possessed\nwas: asleep\n")
+            )
+        );
+    }
+
+    /// Minutes of driving reach the Director as the release alone: no step
+    /// the keys caused, however many there were.
+    #[test]
+    fn a_long_drive_reaches_the_release_wake_as_the_release_alone() {
+        let mut sprite = Instance::at(500.0, 0.0);
+        let keys = |walk, launch| WorldSnapshot {
+            possession: Intent {
+                walk,
+                launch,
+                ..Intent::default()
+            },
+            ..snapshot(100, vec![])
+        };
+        let tap = {
+            let mut space = Possession::default();
+            space.key(Key::Space, true);
+            space.key(Key::Space, false);
+            space.tick(0).launch
+        };
+        sprite.engine.set_possessed(true);
+        for lap in 0..120 {
+            let walk = [Walk::Left, Walk::Right][lap % 2];
+            for _ in 0..5 {
+                sprite.tick(keys(Some(walk), None));
+            }
+            sprite.tick(keys(None, tap));
+            sprite.wait(1_500);
+        }
+        sprite.engine.set_possessed(false);
+        sprite.wait(100);
+
+        assert_eq!(
+            sprite.wake(Happened::PossessionEnd),
+            format!(
+                "{}state: idle\nfeeling: dazed and confused, not sure how you got here\n\
+                 standing on: nothing\n",
+                floor("what just happened: released from possession\n")
             )
         );
     }
